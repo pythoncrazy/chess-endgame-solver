@@ -5,7 +5,7 @@ use tablebase_core::packed::{self, Canonical, Codec, PackedTable, RankSides, Wri
 
 fn main() -> Result<(), String> {
     let usage = "usage: tb_pack [--level L] [--wdl-codec zstd|lzma|cm] [--rank-codec zstd|lzma|cm] \
-                 [--ranks both|white] [--threads T] [--check] [--probes N] OUTPUT_DIRECTORY TABLE...";
+                 [--ranks both|white] [--cm-wdl-words N] [--cm-rank-words N] [--threads T] [--check] [--probes N] OUTPUT_DIRECTORY TABLE...";
     let mut args = std::env::args().skip(1).peekable();
     let (mut options, mut threads, mut check, mut probes) =
         (WriteOptions::default(), 24, false, 0usize);
@@ -24,6 +24,17 @@ fn main() -> Result<(), String> {
                     Some("both") => RankSides::Both,
                     Some("white") => RankSides::White,
                     _ => return Err(usage.into()),
+                }
+            }
+            "--cm-wdl-words" | "--cm-rank-words" => {
+                let n = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| usage.to_string())?;
+                if flag == "--cm-wdl-words" {
+                    options.cm_wdl_words = n;
+                } else {
+                    options.cm_rank_words = n;
                 }
             }
             "--level" => {

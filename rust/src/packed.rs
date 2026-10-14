@@ -345,9 +345,11 @@ pub enum Codec {
     Cm,
 }
 
-/// Stored words in each block of a `cm` WDL section.
+/// Most stored words in one `cm` block.
+pub const CM_MAX_WORDS: usize = 1 << 16;
+/// Default stored words in each block of a `cm` WDL section.
 pub const CM_WDL_WORDS: usize = 256;
-/// Stored words in each block of a `cm` rank section.
+/// Default stored words in each block of a `cm` rank section.
 pub const CM_RANK_WORDS: usize = 64;
 
 /// Sides to move whose proof ranks are stored.
@@ -368,6 +370,10 @@ pub struct WriteOptions {
     pub wdl_codec: Codec,
     pub rank_codec: Codec,
     pub rank_sides: RankSides,
+    /// Stored words in each block of a `cm` WDL section.
+    pub cm_wdl_words: usize,
+    /// Stored words in each block of a `cm` rank section.
+    pub cm_rank_words: usize,
 }
 
 impl Default for WriteOptions {
@@ -377,6 +383,8 @@ impl Default for WriteOptions {
             wdl_codec: Codec::Zstd,
             rank_codec: Codec::Zstd,
             rank_sides: RankSides::White,
+            cm_wdl_words: CM_WDL_WORDS,
+            cm_rank_words: CM_RANK_WORDS,
         }
     }
 }
@@ -394,9 +402,12 @@ pub struct Section {
     /// `cm` only: stored words in each block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_words: Option<u64>,
-    /// `cm` only: bytes of the model blob at `offset`, before the block index.
+    /// `cm` only: bytes of the model blob at `offset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_bytes: Option<u64>,
+    /// `cm` only: bytes of the frame lengths after the model blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -616,6 +627,7 @@ struct CmWdl<'a> {
     geometry: &'a Geometry,
     c: &'a Canonical,
     mark_rank1: bool,
+    block_words: usize,
 }
 
 impl cm::Blocks for CmWdl<'_> {
@@ -626,10 +638,11 @@ impl cm::Blocks for CmWdl<'_> {
         cm::WDL_SETS
     }
     fn blocks(&self) -> usize {
-        self.c.records.len().div_ceil(CM_WDL_WORDS)
+        self.c.records.len().div_ceil(self.block_words)
     }
     fn walk<D: cm::Decide>(&self, b: usize, d: &mut D) {
-        let range = b * CM_WDL_WORDS..((b + 1) * CM_WDL_WORDS).min(self.c.records.len());
+        let bw = self.block_words;
+        let range = b * bw..((b + 1) * bw).min(self.c.records.len());
         let words = cm_words(self.layout, self.geometry, range.clone());
         let mut values = vec![cm::UNKNOWN; words.len() * 64];
         let black = black_start(self.layout);
@@ -663,6 +676,7 @@ struct CmRank<'a> {
     c: &'a Canonical,
     width: usize,
     words: usize,
+    block_words: usize,
 }
 
 impl cm::Blocks for CmRank<'_> {
@@ -673,10 +687,11 @@ impl cm::Blocks for CmRank<'_> {
         cm::rank_sets(self.width)
     }
     fn blocks(&self) -> usize {
-        self.words.div_ceil(CM_RANK_WORDS)
+        self.words.div_ceil(self.block_words)
     }
     fn walk<D: cm::Decide>(&self, b: usize, d: &mut D) {
-        let range = b * CM_RANK_WORDS..((b + 1) * CM_RANK_WORDS).min(self.words);
+        let bw = self.block_words;
+        let range = b * bw..((b + 1) * bw).min(self.words);
         let words = cm_words(self.layout, self.geometry, range.clone());
         let mut codes = vec![0u8; words.len() * 64];
         let mut ranks = vec![cm::NO_RANK; words.len() * 64];
@@ -775,6 +790,11 @@ pub fn write(
             }
         };
         let (model, block_words, frames) = if codec == Codec::Cm {
+            if !(1..=CM_MAX_WORDS).contains(&options.cm_wdl_words)
+                || !(1..=CM_MAX_WORDS).contains(&options.cm_rank_words)
+            {
+                return Err("cm block words out of range".into());
+            }
             let settings = cm::Settings::default();
             let (model, frames, block_words) = if name == "wdl" {
                 let blocks = CmWdl {
@@ -782,9 +802,10 @@ pub fn write(
                     geometry: &geometry,
                     c,
                     mark_rank1: sides == RankSides::White && width > 0,
+                    block_words: options.cm_wdl_words,
                 };
                 let (m, f) = cm::encode(&blocks, settings, threads)?;
-                (m, f, CM_WDL_WORDS)
+                (m, f, options.cm_wdl_words)
             } else {
                 if sides != RankSides::White {
                     return Err("a cm rank section needs white-only ranks".into());
@@ -795,9 +816,10 @@ pub fn write(
                     c,
                     width,
                     words: rank_words,
+                    block_words: options.cm_rank_words,
                 };
                 let (m, f) = cm::encode(&blocks, settings, threads)?;
-                (m, f, CM_RANK_WORDS)
+                (m, f, options.cm_rank_words)
             };
             let digests = parallel(raw_bytes.div_ceil(BLOCK), threads, |b| {
                 Ok(<[u8; 32]>::from(Sha256::digest(raw_block(b))))
@@ -820,16 +842,26 @@ pub fn write(
             (None, None, frames.into_iter().map(|(_, f)| f).collect())
         };
         let offset = payload.len() as u64;
-        let model_bytes = model.as_ref().map(|m| m.len() as u64);
+        let (mut model_bytes, mut index_bytes) = (None, None);
         if let Some(m) = &model {
+            let lengths: Vec<u8> = frames
+                .iter()
+                .flat_map(|f| (f.len() as u32).to_le_bytes())
+                .collect();
+            let index = zstd::bulk::compress(&lengths, 19).map_err(|e| e.to_string())?;
             payload.extend_from_slice(m);
-        }
-        let mut at = 0u64;
-        for frame in &frames {
+            payload.extend_from_slice(&index);
+            model_bytes = Some(m.len() as u64);
+            index_bytes = Some(index.len() as u64);
+        } else {
+            let mut at = 0u64;
+            for frame in &frames {
+                payload.extend_from_slice(&at.to_le_bytes());
+                at += frame.len() as u64;
+            }
             payload.extend_from_slice(&at.to_le_bytes());
-            at += frame.len() as u64;
         }
-        payload.extend_from_slice(&at.to_le_bytes());
+        let frame_bytes: u64 = frames.iter().map(|f| f.len() as u64).sum();
         for frame in &frames {
             payload.extend_from_slice(frame);
         }
@@ -838,10 +870,11 @@ pub fn write(
             offset,
             blocks: frames.len() as u64,
             raw_bytes: raw_bytes as u64,
-            compressed_bytes: at + model_bytes.unwrap_or(0),
+            compressed_bytes: frame_bytes + model_bytes.unwrap_or(0) + index_bytes.unwrap_or(0),
             codec,
             block_words,
             model_bytes,
+            index_bytes,
         });
     }
     let header = PackedHeader {
@@ -1148,21 +1181,37 @@ impl PackedTable {
             }
         }
         let index = |s: &Section| -> Result<SectionIndex> {
-            let model_len = if s.codec == Codec::Cm {
-                s.model_bytes.ok_or("cm section lacks model_bytes")?
+            let (model_len, offsets, frames) = if s.codec == Codec::Cm {
+                let model_len = s.model_bytes.ok_or("cm section lacks model_bytes")?;
+                let index_len = s.index_bytes.ok_or("cm section lacks index_bytes")?;
+                if index_len > 1 << 30 || s.blocks > 1 << 30 {
+                    return Err("cm index too large".into());
+                }
+                let mut blob = vec![0u8; index_len as usize];
+                file.read_exact_at(&mut blob, start + s.offset + model_len)
+                    .map_err(err)?;
+                let lengths = zstd::bulk::decompress(&blob, 4 * s.blocks as usize)
+                    .map_err(|e| e.to_string())?;
+                if lengths.len() != 4 * s.blocks as usize {
+                    return Err("cm index has the wrong length".into());
+                }
+                let mut offsets = vec![0u64];
+                for l in lengths.as_chunks::<4>().0 {
+                    offsets.push(offsets[offsets.len() - 1] + u64::from(u32::from_le_bytes(*l)));
+                }
+                (model_len, offsets, start + s.offset + model_len + index_len)
             } else {
-                0
+                let mut raw = vec![0u8; 8 * (s.blocks as usize + 1)];
+                file.read_exact_at(&mut raw, start + s.offset)
+                    .map_err(err)?;
+                let offsets: Vec<u64> = raw
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect();
+                (0, offsets, start + s.offset + raw.len() as u64)
             };
-            let mut raw = vec![0u8; 8 * (s.blocks as usize + 1)];
-            file.read_exact_at(&mut raw, start + s.offset + model_len)
-                .map_err(err)?;
-            let offsets: Vec<u64> = raw
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|b| u64::from_le_bytes(*b))
-                .collect();
-            let frames = start + s.offset + model_len + raw.len() as u64;
             if offsets.windows(2).any(|w| w[0] > w[1]) || frames + offsets[offsets.len() - 1] > size
             {
                 return Err("v3 block index out of range".into());
@@ -1174,7 +1223,7 @@ impl PackedTable {
             };
             let cm = if s.codec == Codec::Cm {
                 let block_words = s.block_words.ok_or("cm section lacks block_words")? as usize;
-                if !(1..=1 << 16).contains(&block_words)
+                if !(1..=CM_MAX_WORDS).contains(&block_words)
                     || offsets.len() as u64 - 1
                         != (s.raw_bytes / unit as u64).div_ceil(block_words as u64)
                 {
