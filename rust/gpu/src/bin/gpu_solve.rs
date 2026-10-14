@@ -12,10 +12,13 @@ use cutile::jit_cache::{self, FileSystemJitStore};
 use cutile::prelude::*;
 use serde_json::json;
 use std::{fs::File, io::BufWriter, path::PathBuf, sync::Arc, time::Instant};
+use tablebase_core::packed::{self, Canonical, Layout, PackedTable};
 use tablebase_core::pawnless::{self, Material, Solved, Table, UNRESOLVED, solve_tree};
 
 /// Program and git revision recorded in table headers (see build.rs).
 const GENERATOR: &str = concat!("gpu_solve git:", env!("TB_SOURCE_REVISION"));
+/// Host threads converting downloaded records (the v3 writer runs beside it).
+const CONVERT_THREADS: usize = 8;
 /// Lanes (words) per tile block.
 const BLOCK: usize = 64;
 /// i32 metadata: m at 0; piece i at 8 + 4i (role, white, directions, slides);
@@ -96,6 +99,81 @@ mod kernel {
             )
         };
         tile_to_scalar(loaded.0)
+    }
+
+    /// Lane mask (all ones or zero) of the nonzero flags `table[index[lane]]`.
+    unsafe fn load_lanes(table: *const i32, index: Tile<i64, { [64] }>) -> Tile<u64, { [64] }> {
+        let base: PointerTile<*const i32, { [] }> = pointer_to_tile(table);
+        let base: PointerTile<*const i32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const i32, { [64] }> = base.broadcast(shape![64]);
+        let ptrs: PointerTile<*const i32, { [64] }> = base.offset_tile(index);
+        let loaded: (Tile<i32, { [64] }>, Token) = unsafe {
+            load_ptr_tko(
+                ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+        let zero: Tile<i32, { [64] }> = constant(0i32, shape![64]);
+        lanes(ne_tile(loaded.0, zero))
+    }
+
+    /// Store one or zero to `table[index[lane]]` as `mask` is nonzero or zero.
+    unsafe fn store_lanes(table: *mut i32, index: Tile<i64, { [64] }>, mask: Tile<u64, { [64] }>) {
+        let zero: Tile<u64, { [64] }> = constant(0u64, shape![64]);
+        let one: Tile<i32, { [64] }> = constant(1i32, shape![64]);
+        let none: Tile<i32, { [64] }> = constant(0i32, shape![64]);
+        let value: Tile<i32, { [64] }> = select(ne_tile(mask, zero), one, none);
+        let base: PointerTile<*mut i32, { [] }> = pointer_to_tile(table);
+        let base: PointerTile<*mut i32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*mut i32, { [64] }> = base.broadcast(shape![64]);
+        let ptrs: PointerTile<*mut i32, { [64] }> = base.offset_tile(index);
+        unsafe {
+            store_ptr_tko(
+                ptrs,
+                value,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+    }
+
+    /// Number of lanes whose mask is nonzero.
+    fn count_lanes(mask: Tile<u64, { [64] }>) -> i64 {
+        let zero: Tile<u64, { [64] }> = constant(0u64, shape![64]);
+        let one_i: Tile<i64, { [64] }> = constant(1i64, shape![64]);
+        let zero_i: Tile<i64, { [64] }> = constant(0i64, shape![64]);
+        let n: Tile<i64, { [] }> = reduce_sum(select(ne_tile(mask, zero), one_i, zero_i), 0);
+        tile_to_scalar(n)
+    }
+
+    /// Set flag `index[lane]` to one for lanes where `mask` is nonzero.
+    unsafe fn mark_flags(table: *mut i32, index: Tile<i64, { [64] }>, mask: Tile<u64, { [64] }>) {
+        let zero: Tile<u64, { [64] }> = constant(0u64, shape![64]);
+        let keep: Tile<bool, { [64] }> = ne_tile(mask, zero);
+        let base: PointerTile<*mut i32, { [] }> = pointer_to_tile(table);
+        let base: PointerTile<*mut i32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*mut i32, { [64] }> = base.broadcast(shape![64]);
+        let ptrs: PointerTile<*mut i32, { [64] }> = base.offset_tile(index);
+        let ones: Tile<i32, { [64] }> = constant(1i32, shape![64]);
+        unsafe {
+            store_ptr_tko(
+                ptrs,
+                ones,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(keep),
+                None,
+                Latency::<0>,
+            )
+        };
     }
 
     /// Masked gather of records `[win | illegal, loss | illegal]`; masked lanes
@@ -292,8 +370,82 @@ mod kernel {
         unsafe { scatter(check_out, w, check) };
     }
 
+    /// Frontier: flag every word that must be evaluated next round because
+    /// it, or one of its children, changed in the round that set `changed`.
+    /// Parents of a word come from un-moves of the side that just moved
+    /// (sliders stop at skeleton pieces; the black king's square is ignored,
+    /// a superset).
+    #[cutile::entry()]
+    unsafe fn mark(dirty: *mut i32, changed: *const i32, meta: *const i32) {
+        let m: i32 = unsafe { scalar_at(meta, 0i32) };
+        let blk: i32 = block_id();
+        let w: Tile<i64, { [64] }> = word_index(blk);
+        let fresh: Tile<u64, { [64] }> = unsafe { load_lanes(changed, w) };
+        if count_lanes(fresh) > 0i64 {
+            let zero: Tile<u64, { [64] }> = constant(0u64, shape![64]);
+            let one: Tile<u64, { [64] }> = constant(1u64, shape![64]);
+            let ones: Tile<u64, { [64] }> = zero - one;
+            let zero_i: Tile<i64, { [64] }> = constant(0i64, shape![64]);
+            let one_i: Tile<i64, { [64] }> = constant(1i64, shape![64]);
+            let three_i: Tile<i64, { [64] }> = constant(3i64, shape![64]);
+            let six_i: Tile<i64, { [64] }> = constant(6i64, shape![64]);
+            let seven_i: Tile<i64, { [64] }> = constant(7i64, shape![64]);
+            let eight_i: Tile<i64, { [64] }> = constant(8i64, shape![64]);
+            let sixty_three: Tile<i64, { [64] }> = constant(63i64, shape![64]);
+            let stm_bit: Tile<i64, { [64] }> = one_i << (six_i * i64s(m));
+            let black_to_move: i32 = (blk >> (6i32 * m - 6i32)) & 1i32;
+            unsafe { mark_flags(dirty, w, fresh) };
+            if black_to_move == 0i32 {
+                // The black king just moved: same skeleton, black to move.
+                unsafe { mark_flags(dirty, w ^ stm_bit, fresh) };
+            }
+            let mut occ: Tile<u64, { [64] }> = zero;
+            for i in 0i32..m {
+                let sq: Tile<i64, { [64] }> = (w >> i64s(6i32 * (m - 1i32 - i))) & sixty_three;
+                occ = occ | (one << bitcast(sq));
+            }
+            for i in 0i32..m {
+                let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
+                if white == black_to_move {
+                    let role: i32 = unsafe { scalar_at(meta, 8i32 + 4i32 * i) };
+                    let dirs: i32 = unsafe { scalar_at(meta, 10i32 + 4i32 * i) };
+                    let slides: i32 = unsafe { scalar_at(meta, 11i32 + 4i32 * i) };
+                    let shift: Tile<i64, { [64] }> = i64s(6i32 * (m - 1i32 - i));
+                    let sq: Tile<i64, { [64] }> = (w >> shift) & sixty_three;
+                    let file: Tile<i64, { [64] }> = sq & seven_i;
+                    let rank: Tile<i64, { [64] }> = sq >> three_i;
+                    for d in 0i32..dirs {
+                        let df: Tile<i64, { [64] }> =
+                            i64s(unsafe { scalar_at(meta, 64i32 + 16i32 * role + 2i32 * d) });
+                        let dr: Tile<i64, { [64] }> =
+                            i64s(unsafe { scalar_at(meta, 65i32 + 16i32 * role + 2i32 * d) });
+                        let mut alive: Tile<u64, { [64] }> = ones;
+                        for k in 1i32..(2i32 + 6i32 * slides) {
+                            let kt: Tile<i64, { [64] }> = i64s(k);
+                            let tf: Tile<i64, { [64] }> = file + df * kt;
+                            let tr: Tile<i64, { [64] }> = rank + dr * kt;
+                            alive = alive
+                                & lanes(ge_tile(tf, zero_i))
+                                & lanes(lt_tile(tf, eight_i))
+                                & lanes(ge_tile(tr, zero_i))
+                                & lanes(lt_tile(tr, eight_i));
+                            let t: Tile<i64, { [64] }> = (tr * eight_i + tf) & sixty_three;
+                            let tbit: Tile<u64, { [64] }> = one << bitcast(t);
+                            alive = alive & (lanes(ne_tile(occ & tbit, zero)) ^ ones);
+                            let parent: Tile<i64, { [64] }> = (w + ((t - sq) << shift)) ^ stm_bit;
+                            unsafe { mark_flags(dirty, parent, alive & fresh) };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// One round. MODE 0 seeds checkmates; MODE 1 commits wins and losses
     /// derived from `input` into `output` (the same buffer when in place).
+    /// MODE 1 evaluates only blocks flagged in `dirty` and records in
+    /// `changed` which blocks changed; skipped blocks keep both buffers
+    /// valid because neither they nor their children changed last round.
     // Occupancy 8 measured fastest on the H100 NVL (4: 50.6 ms, 8: 42.5 ms,
     // 16: 53.1 ms, 32: 75.5 ms per KQBvKR sweep).
     #[cutile::entry(optimization_hints = (sm_90 = (occupancy = 8,),))]
@@ -306,6 +458,8 @@ mod kernel {
         lower: *const u64,
         meta: *const i32,
         round: *const u16,
+        dirty: *const i32,
+        changed_out: *mut i32,
     ) {
         let m: i32 = unsafe { scalar_at(meta, 0i32) };
         let blk: i32 = block_id();
@@ -364,6 +518,13 @@ mod kernel {
         if MODE == 0 {
             pending = 1i64;
         }
+        // Off the frontier nothing a word reads changed: its lanes gather
+        // nothing and the word is copied; a block with no such word skips
+        // move generation. The seed round flags every word.
+        let active: Tile<u64, { [64] }> = unsafe { load_lanes(dirty, w) };
+        if count_lanes(active) == 0i64 {
+            pending = 0i64;
+        }
         if pending > 0i64 {
             // Skeleton moves: only the side to move's pieces, each role's own rays.
             for i in 0i32..m {
@@ -402,7 +563,7 @@ mod kernel {
                             let capture: Tile<u64, { [64] }> = moving & hit_enemy;
                             let moved: Tile<i64, { [64] }> = w + ((t - sq) << shift);
                             let qp: Tile<u64, { [64, 2] }> =
-                                unsafe { gather_pair(input, moved ^ stm_bit, quiet) };
+                                unsafe { gather_pair(input, moved ^ stm_bit, quiet & active) };
                             let mut cw: Tile<u64, { [64] }> = pair_part(qp, 0i64);
                             let mut cl: Tile<u64, { [64] }> = pair_part(qp, 1i64);
                             // Captures are rare: do the capture work only when some
@@ -429,7 +590,7 @@ mod kernel {
                                 let lower_index: Tile<i64, { [64] }> =
                                     (j_t - one_i) * lower_words + low_word;
                                 let lp: Tile<u64, { [64, 2] }> =
-                                    unsafe { gather_pair(lower, lower_index, capture) };
+                                    unsafe { gather_pair(lower, lower_index, capture & active) };
                                 cw = cw | pair_part(lp, 0i64);
                                 cl = cl | pair_part(lp, 1i64);
                             }
@@ -446,7 +607,7 @@ mod kernel {
             }
             // Black king moves inside the word, and black king captures.
             if black_to_move == 1i32 {
-                let cp: Tile<u64, { [64, 2] }> = unsafe { gather_pair(input, w ^ stm_bit, ones) };
+                let cp: Tile<u64, { [64, 2] }> = unsafe { gather_pair(input, w ^ stm_bit, active) };
                 let cw: Tile<u64, { [64] }> = pair_part(cp, 0i64);
                 let cl: Tile<u64, { [64] }> = pair_part(cp, 1i64);
                 win = win | king_reach(cl & (cw ^ ones));
@@ -464,7 +625,7 @@ mod kernel {
                         let lower_index: Tile<i64, { [64] }> =
                             i64s(j - 1i32) * lower_words + low_word;
                         let lp: Tile<u64, { [64, 2] }> =
-                            unsafe { gather_pair(lower, lower_index, ones) };
+                            unsafe { gather_pair(lower, lower_index, active) };
                         let lw: Tile<u64, { [64] }> = pair_part(lp, 0i64);
                         let ll: Tile<u64, { [64] }> = pair_part(lp, 1i64);
                         let tu: Tile<u64, { [64] }> = bitcast(t);
@@ -482,8 +643,9 @@ mod kernel {
                 }
             }
         }
-        let mut new_win: Tile<u64, { [64] }> = old_win | (win & valid);
-        let mut new_loss: Tile<u64, { [64] }> = old_loss | (valid & any & (nonwin ^ ones));
+        let live: Tile<u64, { [64] }> = valid & active;
+        let mut new_win: Tile<u64, { [64] }> = old_win | (win & live);
+        let mut new_loss: Tile<u64, { [64] }> = old_loss | (live & any & (nonwin ^ ones));
         if MODE == 0 {
             let check: Tile<u64, { [64] }> = unsafe { gather(check_in, w) };
             new_win = old_win;
@@ -496,6 +658,7 @@ mod kernel {
         let changed: Tile<i64, { [64] }> = select(ne_tile(fresh, zero), one_i, zero_i);
         let total: Tile<i64, { [] }> = reduce_sum(changed, 0);
         let block_changed: i64 = tile_to_scalar(total);
+        unsafe { store_lanes(changed_out, w, fresh) };
         if RANKED == 1 {
             if block_changed > 0i64 {
                 // Proof rank = this round, for every position decided now.
@@ -676,17 +839,23 @@ impl<T: Copy + Default> DeviceVec<T> {
 
     fn to_host(&self) -> Result<Vec<T>, Error> {
         let mut out = vec![T::default(); self.len];
-        // SAFETY: both buffers hold len elements; synchronized before return.
+        self.read_into(0, &mut out)?;
+        Ok(out)
+    }
+
+    /// Copy elements `offset..offset + out.len()` to the host.
+    fn read_into(&self, offset: usize, out: &mut [T]) -> Result<(), Error> {
+        if offset + out.len() > self.len {
+            return Err("device read out of range".into());
+        }
+        let at = self.ptr + (offset * std::mem::size_of::<T>()) as u64;
+        // SAFETY: the range lies inside the allocation (checked above) and the
+        // stream is synchronized before `out` is released.
         unsafe {
-            cutile::cuda_core::memcpy_dtoh_async(
-                out.as_mut_ptr(),
-                self.ptr,
-                self.len,
-                &self.stream,
-            )?;
+            cutile::cuda_core::memcpy_dtoh_async(out.as_mut_ptr(), at, out.len(), &self.stream)?;
             self.stream.synchronize()?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn ptr(&self) -> cutile::tile_kernel::DevicePointer<T> {
@@ -709,6 +878,9 @@ impl<T> Drop for DeviceVec<T> {
 
 struct Gpu {
     stream: Arc<cutile::cuda_core::Stream>,
+    /// Rounds after a round that changed at most this fraction of the words
+    /// sweep only the frontier (`TB_FRONTIER`; 0 disables).
+    frontier: f64,
 }
 
 impl Gpu {
@@ -717,12 +889,17 @@ impl Gpu {
     /// `ranked`: synchronous double-buffered rounds with device proof ranks.
     /// Otherwise WDL is updated in place (sound because the sets are monotone),
     /// which halves the state but yields no proof ranks.
+    ///
+    /// With `stored`, only the proof ranks of stored words (white king in the
+    /// triangle) are downloaded and returned separately; the table then has
+    /// no rank plane.
     fn solve(
         &self,
         material: &Material,
         lower: &[Option<&Table>],
         ranked: bool,
-    ) -> Result<(Table, serde_json::Value), Error> {
+        stored: Option<&Layout>,
+    ) -> Result<(Table, Vec<u16>, serde_json::Value), Error> {
         let start = Instant::now();
         let words = material.words();
         // Lower tables in skeleton order k = 1..m, each 2 * 64^(m - 1) records.
@@ -748,7 +925,11 @@ impl Gpu {
             state[0].bytes() + state[1].bytes() + check.bytes() + lower_dev.bytes() + rank.bytes();
         let grid = launch_grid(words);
         let device = self.stream.device();
-        let (event_start, event_end) = (device.new_event()?, device.new_event()?);
+        let (event_start, event_mid, event_end) = (
+            device.new_event()?,
+            device.new_event()?,
+            device.new_event()?,
+        );
         let prepare_seconds = start.elapsed().as_secs_f64();
         let t0 = Instant::now();
         // SAFETY: every pointer addresses a live device buffer sized for this
@@ -771,6 +952,12 @@ impl Gpu {
             }
         }
         let statics_seconds = t0.elapsed().as_secs_f64();
+        // Per-word frontier flags: `dirty` gates the next sweep, `changed`
+        // is written by every sweep.
+        let dirty = DeviceVec::<i32>::filled(&self.stream, 1, words)?;
+        let changed_flags = DeviceVec::<i32>::zeroed(&self.stream, words)?;
+        let frontier_limit = (self.frontier * words as f64) as i64;
+        let mut last_changed = i64::MAX;
         let mut rounds = 0u32;
         let mut records_log = Vec::new();
         for round in 0u32.. {
@@ -787,7 +974,24 @@ impl Gpu {
             let counter = DeviceVec::<i64>::zeroed(&self.stream, 1)?;
             round_value.copy_from_host(&[round as u16])?;
             let mode = if round == 0 { "0" } else { "1" };
+            // Round 1 reads the lower tables for the first time: always full.
+            let frontier = round >= 2 && last_changed <= frontier_limit;
             event_start.record(&self.stream)?;
+            if frontier {
+                // SAFETY: flag buffers hold one i32 per block; stream ordered.
+                unsafe {
+                    cutile::cuda_core::memset_d8_async(dirty.ptr, 0, dirty.bytes(), &self.stream)?;
+                    kernel::mark(dirty.ptr(), changed_flags.ptr(), meta.ptr())
+                        .grid(grid)
+                        .sync_on(&self.stream)?;
+                }
+            } else if round >= 2 {
+                // SAFETY: as above; nonzero bytes flag every block.
+                unsafe {
+                    cutile::cuda_core::memset_d8_async(dirty.ptr, 1, dirty.bytes(), &self.stream)?;
+                }
+            }
+            event_mid.record(&self.stream)?;
             // SAFETY: as above. In place, input and output are the same buffer;
             // monotone updates make concurrent reads of old or new values sound.
             unsafe {
@@ -800,6 +1004,8 @@ impl Gpu {
                     lower_dev.ptr(),
                     meta.ptr(),
                     round_value.ptr(),
+                    dirty.ptr(),
+                    changed_flags.ptr(),
                 )
                 .generics(vec![mode.into(), if ranked { "1" } else { "0" }.into()])
                 .grid(grid)
@@ -807,31 +1013,47 @@ impl Gpu {
             }
             event_end.record(&self.stream)?;
             event_end.synchronize()?;
-            let sweep_event_ms = event_start.elapsed_time(&event_end)?;
+            let mark_event_ms = event_start.elapsed_time(&event_mid)?;
+            let sweep_event_ms = event_mid.elapsed_time(&event_end)?;
             let changed = counter.to_host()?[0];
             records_log.push(json!({
-                "round": round, "changed_words": changed,
-                "host_seconds": r0.elapsed().as_secs_f64(), "sweep_event_ms": sweep_event_ms,
+                "round": round, "changed_words": changed, "frontier": frontier,
+                "host_seconds": r0.elapsed().as_secs_f64(),
+                "mark_event_ms": mark_event_ms, "sweep_event_ms": sweep_event_ms,
             }));
             if round > 0 && changed == 0 {
                 break;
             }
+            last_changed = changed;
             rounds = round;
         }
         let rounds_seconds = t0.elapsed().as_secs_f64() - statics_seconds;
         let t2 = Instant::now();
         let last = if ranked { rounds as usize % 2 } else { 0 };
         let wl = state[last].to_host()?;
+        let (full_rank, stored_rank) = match (ranked, stored) {
+            (false, _) => (Vec::new(), Vec::new()),
+            (true, None) => (rank.to_host()?, Vec::new()),
+            (true, Some(layout)) => {
+                // Stored words form 20 contiguous runs of the full layout.
+                let per = layout.words() / 20;
+                let mut out = vec![0u16; layout.words() * 64];
+                for (run, dst) in out.chunks_mut(per * 64).enumerate() {
+                    rank.read_into(layout.full_word(run * per) * 64, dst)?;
+                }
+                (Vec::new(), out)
+            }
+        };
         let mut table = Table {
             material: material.clone(),
             valid: vec![0; words],
             win: vec![0; words],
             loss: vec![0; words],
-            rank: if ranked { rank.to_host()? } else { Vec::new() },
+            rank: full_rank,
             rounds,
         };
         // Records to planes, in parallel chunks.
-        let chunk = words.div_ceil(16).max(1);
+        let chunk = words.div_ceil(CONVERT_THREADS).max(1);
         std::thread::scope(|scope| {
             let parts = table
                 .valid
@@ -859,21 +1081,206 @@ impl Gpu {
             "download_seconds": t2.elapsed().as_secs_f64(),
             "rounds": records_log,
         });
-        Ok((table, record))
+        Ok((table, stored_rank, record))
     }
+}
+
+/// Every pawnless material of at most `pieces` pieces that a complete set
+/// needs: the side with more pieces is white (equal counts: white's pieces
+/// first in QRBN order), closed under captures, lower materials first.
+fn all_materials(pieces: usize) -> Result<Vec<Material>, Error> {
+    const ROLES: [char; 4] = ['Q', 'R', 'B', 'N'];
+    fn multisets(n: usize, from: usize, prefix: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if n == 0 {
+            out.push(prefix.clone());
+            return;
+        }
+        for r in from..ROLES.len() {
+            prefix.push(r);
+            multisets(n - 1, r, prefix, out);
+            prefix.pop();
+        }
+    }
+    let text = |set: &[usize]| set.iter().map(|&r| ROLES[r]).collect::<String>();
+    let mut pending = Vec::new();
+    for total in 0..=pieces.saturating_sub(2) {
+        for white in total.div_ceil(2)..=total {
+            let (mut ws, mut bs) = (Vec::new(), Vec::new());
+            multisets(white, 0, &mut Vec::new(), &mut ws);
+            multisets(total - white, 0, &mut Vec::new(), &mut bs);
+            for w in &ws {
+                for b in &bs {
+                    if 2 * white > total || w <= b {
+                        pending.push(format!("K{}vK{}", text(w), text(b)));
+                    }
+                }
+            }
+        }
+    }
+    let mut all = std::collections::BTreeMap::new();
+    while let Some(name) = pending.pop() {
+        if all.contains_key(&name) {
+            continue;
+        }
+        let m = Material::parse(&name)?;
+        for k in 1..m.skeleton_len() {
+            pending.push(m.without(k)?.name());
+        }
+        all.insert(name, m);
+    }
+    let mut list: Vec<Material> = all.into_values().collect();
+    list.sort_by_key(|m| (m.skeleton_len(), m.name()));
+    Ok(list)
+}
+
+/// A solved table on its way to the compressed file.
+struct Job {
+    stored: Canonical,
+    table: Arc<Table>,
+    path: PathBuf,
+    record: serde_json::Value,
+}
+
+/// Background writer: WDL symmetry check of the full table, then the v3 file
+/// (written to a temporary name and renamed when complete).
+fn write_jobs(
+    jobs: std::sync::mpsc::Receiver<Job>,
+    level: i32,
+    threads: usize,
+) -> tablebase_core::Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for mut job in jobs {
+        let t = Instant::now();
+        let violations = pawnless::symmetry_violations(&job.table, threads)?;
+        drop(job.table);
+        let symmetry_seconds = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let partial = job.path.with_extension("tbz.partial");
+        let file = File::create(&partial).map_err(|e| e.to_string())?;
+        let header = packed::write(&job.stored, BufWriter::new(file), GENERATOR, level, threads)?;
+        std::fs::rename(&partial, &job.path).map_err(|e| e.to_string())?;
+        let r = &mut job.record;
+        r["symmetry_violating_words"] = violations.into();
+        r["symmetry_seconds"] = symmetry_seconds.into();
+        r["pack_seconds"] = t.elapsed().as_secs_f64().into();
+        r["bytes"] = std::fs::metadata(&job.path)
+            .map_err(|e| e.to_string())?
+            .len()
+            .into();
+        r["sections"] = json!(header.sections);
+        r["payload_sha256"] = header.payload_sha256.into();
+        r["content_sha256"] = header.content_sha256.into();
+        eprintln!(
+            "{} rounds {} sweeps {:.2}s packed {} bytes",
+            header.material, header.rounds, r["timing"]["rounds_seconds_total"], r["bytes"]
+        );
+        if violations != 0 {
+            return Err(format!(
+                "{}: {violations} symmetry-violating words",
+                header.material
+            ));
+        }
+        out.push(job.record);
+    }
+    Ok(out)
+}
+
+/// Solve every material of at most `pieces` pieces in one process and write
+/// compressed v3 tables. Tables that later materials capture into stay in
+/// memory; finished v3 files from this exact clean build are reused.
+fn solve_all(
+    gpu: &Gpu,
+    pieces: usize,
+    output: &std::path::Path,
+    level: i32,
+    threads: usize,
+) -> Result<serde_json::Value, Error> {
+    let materials = all_materials(pieces)?;
+    let max_skeleton = materials
+        .iter()
+        .map(Material::skeleton_len)
+        .max()
+        .unwrap_or(1);
+    let (send, receive) = std::sync::mpsc::sync_channel::<Job>(2);
+    let writer = std::thread::spawn(move || write_jobs(receive, level, threads));
+    let mut solved = Solved::new();
+    let mut resumed = Vec::new();
+    for m in &materials {
+        let name = m.name();
+        let path = output.join(format!("{name}.tbz"));
+        let needed_below = m.skeleton_len() < max_skeleton;
+        if path.exists() && !GENERATOR.ends_with("+dirty") {
+            let packed = PackedTable::open(&path, true)?;
+            if packed.header.generator == GENERATOR {
+                if needed_below {
+                    solved.insert(name.clone(), Arc::new(packed.decode(threads)?));
+                }
+                resumed.push(
+                    json!({"material": name, "payload_sha256": packed.header.payload_sha256}),
+                );
+                continue;
+            }
+        }
+        let layout = Layout::new(m);
+        let (table, stored_rank, timing) = {
+            let lower: Vec<Option<&Table>> = (0..m.skeleton_len())
+                .map(|k| match k {
+                    0 => Ok(None),
+                    _ => m
+                        .without(k)
+                        .map(|l| solved.get(&l.name()).map(|t| t.as_ref())),
+                })
+                .collect::<tablebase_core::Result<_>>()?;
+            gpu.solve(m, &lower, true, Some(&layout))?
+        };
+        let table = Arc::new(table);
+        let counts = table.counts();
+        let records = (0..layout.words())
+            .map(|cw| {
+                let w = layout.full_word(cw);
+                let illegal = !table.valid[w];
+                [table.win[w] | illegal, table.loss[w] | illegal]
+            })
+            .collect();
+        let stored = Canonical {
+            material: m.clone(),
+            rounds: table.rounds,
+            records,
+            rank: stored_rank,
+            counts: Some(counts),
+        };
+        let record = json!({
+            "material": name, "rounds": table.rounds, "timing": timing,
+            "counts_white_to_move": counts[0], "counts_black_to_move": counts[1], "file": path,
+        });
+        if needed_below {
+            solved.insert(name, table.clone());
+        }
+        if send
+            .send(Job {
+                stored,
+                table,
+                path,
+                record,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+    drop(send);
+    let tables = writer.join().map_err(|_| "writer thread panicked")??;
+    Ok(json!({"materials": materials.len(), "resumed_verified_tables": resumed, "tables": tables}))
 }
 
 fn main() -> Result<(), Error> {
     let wall = Instant::now();
-    let mut args = std::env::args().skip(1);
-    let usage = "usage: gpu_solve MATERIAL OUTPUT_DIRECTORY [MAX_RANKED_SKELETON]";
-    let material = Material::parse(&args.next().ok_or(usage)?)?;
+    let mut args = std::env::args().skip(1).peekable();
+    let usage = "usage: gpu_solve MATERIAL OUTPUT_DIRECTORY [MAX_RANKED_SKELETON]\n       \
+                 gpu_solve --all PIECES OUTPUT_DIRECTORY [ZSTD_LEVEL [PACK_THREADS]]";
+    let all = args.next_if(|a| a == "--all").is_some();
+    let target = args.next().ok_or(usage)?;
     let output = PathBuf::from(args.next().ok_or(usage)?);
-    // Proof ranks need 128 bytes per word: keep them up to five pieces.
-    let max_ranked: usize = match args.next() {
-        Some(v) => v.parse()?,
-        None => 4,
-    };
     std::fs::create_dir_all(&output)?;
     // Compiled kernels persist across runs (keyed by source, generics, toolkit).
     jit_cache::enable(Arc::new(FileSystemJitStore::default_location()?));
@@ -881,12 +1288,42 @@ fn main() -> Result<(), Error> {
     let device = cutile::cuda_core::Device::new(0)?;
     let gpu = Gpu {
         stream: device.new_stream()?,
+        frontier: std::env::var("TB_FRONTIER").map_or(Ok(0.03), |v| v.parse())?,
     };
     let device_init_seconds = init.elapsed().as_secs_f64();
+    let mut report = if all {
+        let level = args.next().map_or(Ok(19), |v| v.parse())?;
+        let threads = args.next().map_or(Ok(20), |v| v.parse())?;
+        solve_all(&gpu, target.parse()?, &output, level, threads)?
+    } else {
+        solve_one_tree(&gpu, &Material::parse(&target)?, &output, args.next())?
+    };
+    report["solver"] = "gpu-cutile".into();
+    report["generator"] = GENERATOR.into();
+    report["device"] = std::env::var("CUDA_VISIBLE_DEVICES")
+        .unwrap_or_default()
+        .into();
+    report["device_init_seconds"] = device_init_seconds.into();
+    report["wall_seconds"] = wall.elapsed().as_secs_f64().into();
+    println!("{report}");
+    Ok(())
+}
+
+/// Solve `material` and its capture dependencies, writing v2 files.
+fn solve_one_tree(
+    gpu: &Gpu,
+    material: &Material,
+    output: &std::path::Path,
+    max_ranked: Option<String>,
+) -> Result<serde_json::Value, Error> {
+    // Proof ranks need 128 bytes per word: keep them up to five pieces.
+    let max_ranked: usize = max_ranked.map_or(Ok(4), |v| v.parse())?;
     let mut records_out = Vec::new();
     let mut solve_one = |m: &Material, lower: &[Option<&Table>]| -> tablebase_core::Result<Table> {
         let ranked = m.skeleton_len() <= max_ranked;
-        let (table, timing) = gpu.solve(m, lower, ranked).map_err(|e| e.to_string())?;
+        let (table, _, timing) = gpu
+            .solve(m, lower, ranked, None)
+            .map_err(|e| e.to_string())?;
         let t = Instant::now();
         let path = output.join(format!("{}.gpu.tbp", m.name()));
         let file = File::create(&path).map_err(|e| e.to_string())?;
@@ -903,7 +1340,7 @@ fn main() -> Result<(), Error> {
     // Restart: reuse completed tables whose payload digest verifies.
     let mut solved = Solved::new();
     let mut resumed = Vec::new();
-    for entry in std::fs::read_dir(&output)? {
+    for entry in std::fs::read_dir(output)? {
         let path = entry?.path();
         if path.to_string_lossy().ends_with(".gpu.tbp") {
             let (table, header) = Table::read(std::io::BufReader::new(File::open(&path)?))?;
@@ -922,16 +1359,6 @@ fn main() -> Result<(), Error> {
             solved.insert(header.material, Arc::new(table));
         }
     }
-    solve_tree(&material, &mut solved, &mut solve_one)?;
-    println!(
-        "{}",
-        json!({
-            "solver": "gpu-cutile", "generator": GENERATOR,
-            "device": std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default(),
-            "wall_seconds": wall.elapsed().as_secs_f64(),
-            "device_init_seconds": device_init_seconds,
-            "resumed_verified_tables": resumed, "tables": records_out,
-        })
-    );
-    Ok(())
+    solve_tree(material, &mut solved, &mut solve_one)?;
+    Ok(json!({"resumed_verified_tables": resumed, "tables": records_out}))
 }
