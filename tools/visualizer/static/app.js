@@ -412,7 +412,7 @@ function renderTools() {
   else if (exact && r.r != null) pearl.textContent = mate ? "#" : `#${whiteWins ? "" : "-"}${Math.ceil(r.r / 2)}`;
   else pearl.textContent = whiteWins ? "1-0" : "0-1";
   gauge.classList.remove("is-off");
-  $("gauge-black").style.height = r.w === 0 ? "50%" : whiteWins ? "0%" : "100%";
+  $("gauge-black").style.transform = `scaleY(${r.w === 0 ? 0.5 : whiteWins ? 0 : 1})`;
   const z = r.z === undefined ? "no Syzygy file" : Math.sign(r.z) === r.w / 2 ? "Syzygy agrees" : `Syzygy says ${SYZ[r.z]}`;
   const rankText = r.r == null ? "no proof rank" : exact ? `mate in ${r.r} plies` : `proof rank ${r.r}`;
   sub.textContent = mate ? `Checkmate · ${z}` : terminal ? `Stalemate · ${z}` : `${r.m} · ${rankText} · ${z} · ${r.ms} ms`;
