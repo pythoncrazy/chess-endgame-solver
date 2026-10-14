@@ -1,5 +1,5 @@
-//! Convert pawnless tables (v1/v2/v3/v4) to the compressed v4 format;
-//! `--check` decodes each output and requires it to equal the input exactly.
+//! Convert pawnless tables (v1/v2/v3/v4) to the compressed v4 format.
+//! `--check` decodes each output and makes sure that it is exactly equal to the input.
 use std::{fs::File, io::BufWriter, path::PathBuf, time::Instant};
 use tablebase_core::packed::{self, Canonical, Codec, PackedTable, RankSides, WriteOptions};
 

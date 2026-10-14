@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(FileStore::new(&args[0]))
     };
     let origin = Arc::new(Metered::new(selected));
-    // Single-flight without a second retained copy of the authenticated data.
+    // Single-flight with no second cached copy of the authenticated data.
     let transport = Arc::new(TileStore::new(
         origin.clone(),
         catalog.object_sizes(),

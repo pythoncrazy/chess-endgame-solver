@@ -1,5 +1,5 @@
-//! Shared-geometry INT8/FP16/FP8 tensor cores vs packed knight stencils.
-//! CPU builds legality masks; this measures resident operators, not generation.
+//! Shared-geometry INT8/FP16/FP8 tensor cores compared with packed knight stencils.
+//! The CPU builds the legality masks. This program measures resident operators, not generation.
 use cutile::prelude::*;
 use serde_json::json;
 use std::{sync::Arc, time::Instant};
@@ -52,7 +52,7 @@ mod kernel {
         let value = select(cmpi(wb, zero, predicate::Equal), c8, c0)
             + select(cmpi(lb, zero, predicate::NotEqual), c1, c0);
         let value = select(cmpi(db, zero, predicate::NotEqual), value, c0);
-        // Integer narrowing is not available in the pinned convert_tile, so route
+        // The pinned convert_tile cannot narrow integers, so convert
         // through f32. The values 0, 8 and 9 are exact in f32, i8, f16 and FP8 E4M3.
         let value: Tile<f32, { [64, BN] }> = convert_tile(value);
         let rhs: Tile<E, { [64, BN] }> = convert_tile(value);
@@ -83,8 +83,8 @@ mod kernel {
         );
         out.store(result);
     }
-    // Knight reach is inlined in the entry: the pinned cuTile JIT does not
-    // substitute const generics through a helper's return type.
+    // Knight reach is inlined in the entry. The pinned cuTile JIT does not
+    // substitute const generics through the return type of a helper.
     #[cutile::entry()]
     fn knight_bits<const B: i32>(
         out: &mut Tensor<u64, { [B, 2] }>,
@@ -203,8 +203,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mut flat = vec![0; 2 * q];
     for (i, p) in expected.iter().enumerate() {
-        // Output layout [fiber, plane]: grid X carries the fiber blocks, because
-        // grid Y is limited to 65,535 blocks (q / 32 exceeds it at 4,194,304).
+        // Output layout [fiber, plane]: grid X carries the fiber blocks. Grid Y
+        // has a limit of 65,535 blocks, and q / 32 exceeds it at 4,194,304.
         flat[2 * i] = p.winning;
         flat[2 * i + 1] = p.nonwinning;
     }
@@ -233,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l = api::copy_host_vec_to_device(&Arc::new(l)).sync_on(&stream)?;
     let d = api::copy_host_vec_to_device(&Arc::new(d)).sync_on(&stream)?;
     let v = api::copy_host_vec_to_device(&Arc::new(v)).sync_on(&stream)?;
-    // Sentinel fill: a kernel that writes nothing must not inherit a prior mode's output.
+    // Sentinel fill: a kernel that writes nothing must not inherit the output of an earlier mode.
     let sentinel = 0x5a5a_5a5a_5a5a_5a5au64;
     let mut out = api::full::<u64>(sentinel, &[q, 2]).sync_on(&stream)?;
     // Launch one mode either synchronously or asynchronously (no host sync).
@@ -302,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Err(format!("{mode} disagrees with exact CPU oracle").into());
         }
-        // Host scope: one synchronous launch per sample, including launch and sync.
+        // Host scope: one synchronous launch per sample. The time includes launch and sync.
         let mut host = Vec::new();
         for _ in 0..host_repetitions {
             let start = Instant::now();
@@ -328,8 +328,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host_batch.push(start.elapsed().as_secs_f64() * 1e3 / launches_per_batch as f64);
             let ms = event_start.elapsed_time(&event_end)? as f64 / launches_per_batch as f64;
             device_raw.push(ms);
-            // A non-positive event interval is physically impossible for real work;
-            // record it as invalid instead of using it in the statistics.
+            // A non-positive event interval is physically impossible for real work.
+            // Record it as invalid and do not use it in the statistics.
             if ms > 0.0 {
                 device.push(ms);
             }

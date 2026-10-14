@@ -60,7 +60,7 @@ pub fn solve(edges: &[Vec<usize>], terminal: &[Option<Wdl>]) -> Result<Vec<Wdl>>
         .collect())
 }
 /// Dense local stencil propagation: two bitplanes and one validity mask.
-/// Rows are independent; masks prevent missing moves from counting as losses.
+/// Rows are independent. The masks make sure that absent moves do not count as losses.
 pub fn update_row(
     unknown: bool,
     losing_children: u64,

@@ -32,7 +32,7 @@ fn geometry_matches_bitboard_shifts() {
         let queen = g.attacks(Role::Queen, s, 0);
         assert_eq!(queen, rook | g.attacks(Role::Bishop, s, 0));
     }
-    // a1 rook blocked on a4 and d1; between excludes both endpoints.
+    // a1 rook blocked on a4 and d1. The between function excludes both endpoints.
     let occupied = (1 << 24) | (1 << 3);
     assert_eq!(
         g.attacks(Role::Rook, 0, occupied),
@@ -52,7 +52,7 @@ fn solved_kqvk() -> Table {
 
 #[test]
 fn kqvk_counts_and_known_positions() {
-    // Counts verified against Syzygy by verify_pawnless (all legal positions).
+    // verify_pawnless checked these counts against Syzygy (all legal positions).
     let t = solved_kqvk();
     let [white, black] = t.counts();
     assert_eq!((white.legal, white.win, white.draw), (144_508, 144_508, 0));
@@ -168,7 +168,7 @@ fn rank_width_follows_round_count() {
     let mut bytes = Vec::new();
     assert_eq!(t.write(&mut bytes, "test").unwrap().planes[2], "rank:u8x64");
     assert_eq!(Table::read(bytes.as_slice()).unwrap().0, t);
-    // A table needing 255 or more rounds stores u16 ranks.
+    // A table with 255 or more rounds stores u16 ranks.
     t.rounds = 300;
     t.rank[5 * 64 + 9] = 299;
     let mut bytes = Vec::new();

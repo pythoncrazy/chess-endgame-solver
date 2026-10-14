@@ -1,22 +1,24 @@
-//! Compressed pawnless tables, format v4 (`TBPAWNZ2`); v3 (`TBPAWNZ1`) is
-//! still read. Specification: `TBZ_FORMAT.md`.
+//! Compressed pawnless tables, format v4 (`TBPAWNZ2`). The reader also reads v3
+//! (`TBPAWNZ1`). Specification: `TBZ_FORMAT.md`.
 //!
-//! Each position is stored once per symmetry class. Its stored image has the
-//! white king in the a1-d1-d4 triangle and, among the images that do, the
-//! smallest index (the transpose decides for a white king on the long
-//! diagonal; identical pieces take ascending squares). Illegal positions and
-//! non-stored images are "don't care": they repeat the previous stored value,
-//! which costs almost nothing once compressed. Readers decide legality with
-//! `pawnless::statics`, so the file never encodes it.
+//! The file stores each position one time per symmetry class. Its stored image has
+//! the white king in the a1-d1-d4 triangle. Of the images with that property, it
+//! has the smallest index. For a white king on the long diagonal, the transpose
+//! decides. Identical pieces take their squares from low to high. Illegal
+//! positions and images that are not stored are "do not care" entries. They
+//! repeat the previous stored value, which costs almost nothing after
+//! compression. Readers decide legality with `pawnless::statics`, so the file
+//! never encodes it.
 //!
 //! Stored index: `((turn * 10 + triangle(white king)) * 64^(m-1) + other
-//! skeleton squares) * 64 + black king`. Two sections, each a block index
-//! followed by independent zstd or LZMA frames of `BLOCK` decompressed bytes:
-//! `wdl` (2 bits per position: 0 draw, 1 win, 2 loss, 3 black-to-move win of
-//! rank 1) and `rank` (proof rank of decisive positions, u8 or u16). By
-//! default only white-to-move ranks are stored; black-to-move ranks follow
-//! exactly from the white-to-move children. A probe decompresses at most one
-//! block per section, plus the children's blocks for a black-to-move rank.
+//! skeleton squares) * 64 + black king`. There are two sections. Each section is
+//! a block index, then independent zstd or LZMA frames of `BLOCK` decompressed
+//! bytes. The `wdl` section has 2 bits per position: 0 draw, 1 win, 2 loss, 3
+//! black-to-move win of rank 1. The `rank` section has the proof rank of
+//! decisive positions, as u8 or u16. By default, the file stores only
+//! white-to-move ranks. Black-to-move ranks follow exactly from the
+//! white-to-move children. A probe decompresses at most one block per section.
+//! For a black-to-move rank, it also decompresses the blocks of the children.
 use crate::Result;
 use crate::cm;
 use crate::pawnless::{
@@ -42,7 +44,7 @@ use std::{
 pub const MAGIC: &[u8; 8] = b"TBPAWNZ2";
 /// Format v3: both rank sides, zstd only, no WDL code 3 (read-only).
 pub const MAGIC_V3: &[u8; 8] = b"TBPAWNZ1";
-/// Decompressed bytes per block (the last block of a section may be shorter).
+/// Decompressed bytes per block (the last block of a section can be shorter).
 pub const BLOCK: usize = 1 << 18;
 /// White-king squares of the stored domain, in index order.
 pub const TRIANGLE: [u8; 10] = [0, 1, 2, 3, 9, 10, 11, 18, 19, 27];
@@ -51,8 +53,8 @@ const TRANSPOSE: Symmetry = Symmetry {
     mirror_files: false,
     mirror_ranks: false,
 };
-/// Squares on or below the a1-h8 diagonal (file >= rank): the stored black
-/// king squares when the transpose leaves the skeleton unchanged.
+/// Squares on or below the a1-h8 diagonal (file >= rank). These are the stored
+/// black king squares when the transpose does not change the skeleton.
 const LOWER_RIGHT: u64 = 0x80c0_e0f0_f8fc_feff;
 const BLOCK_CACHE: usize = 256;
 /// Decompressed blocks keyed by (rank section, block number).
@@ -112,13 +114,13 @@ fn on_diagonal(square: u8) -> bool {
     square % 8 == square / 8
 }
 
-/// The symmetry that moves `square` into the triangle (the identity or the
-/// transpose both qualify on the diagonal; the identity form is returned).
+/// The symmetry that moves `square` into the triangle. On the diagonal, the
+/// identity and the transpose both qualify. The function returns the identity form.
 fn to_triangle(square: u8) -> Symmetry {
     TO_TRIANGLE[usize::from(square)]
 }
 
-/// Where a full-layout word's values live in the stored stream.
+/// The location of the values of a full-layout word in the stored stream.
 #[derive(Clone, Copy, Debug)]
 struct Image {
     word: usize,
@@ -269,8 +271,8 @@ impl Layout {
         image
     }
 
-    /// Black-king squares stored in full-layout word `word` (before legality):
-    /// zero unless the white king is in the triangle.
+    /// Black-king squares stored in full-layout word `word` (before legality).
+    /// Zero if the white king is not in the triangle.
     pub fn stored_in_word(&self, word: usize) -> u64 {
         let (_, squares) = self.material.decode(word);
         if triangle_index(squares[0]).is_none() {
@@ -294,7 +296,7 @@ pub struct Canonical {
     /// Per stored word: `[win | illegal, loss | illegal]`.
     pub records: Vec<[u64; 2]>,
     /// Proof rank per stored position (`word * 64 + black king`), UNRESOLVED
-    /// when undecided; empty for tables without ranks.
+    /// when undecided. Empty for tables without ranks.
     pub rank: Vec<u16>,
     pub counts: Option<[Counts; 2]>,
 }
@@ -338,8 +340,8 @@ pub enum Codec {
     /// One zstd frame per block.
     #[default]
     Zstd,
-    /// One LZMA1 `.lzma` ("alone") stream per block (preset 9e, lc 4): about
-    /// 10% smaller rank sections than zstd 19, about 6x slower cold probes.
+    /// One LZMA1 `.lzma` ("alone") stream per block (preset 9e, lc 4). Rank
+    /// sections are about 10% smaller than with zstd 19. Cold probes are about 6x slower.
     Lzma,
     /// Context mixer with a fixed model and small blocks (`cm` module).
     Cm,
@@ -358,7 +360,7 @@ pub const CM_RANK_WORDS: usize = 64;
 pub enum RankSides {
     #[default]
     Both,
-    /// White to move only; black-to-move ranks follow from the children.
+    /// White to move only. Black-to-move ranks follow from the children.
     White,
 }
 
@@ -392,7 +394,7 @@ impl Default for WriteOptions {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Section {
     pub name: String,
-    /// Offset of the block index from the payload start; frames follow it.
+    /// Offset of the block index from the payload start. Frames follow it.
     pub offset: u64,
     pub blocks: u64,
     pub raw_bytes: u64,
@@ -434,7 +436,7 @@ pub struct PackedHeader {
     pub rank_sides: RankSides,
 }
 
-/// Run `f` on indices `0..n` with dynamic scheduling over `threads` workers.
+/// Run `f` on indices `0..n` on `threads` workers with a dynamic schedule.
 pub(crate) fn parallel<T: Send>(
     n: usize,
     threads: usize,
@@ -571,7 +573,7 @@ fn compress_block(codec: Codec, level: i32, raw: &[u8]) -> Result<Vec<u8>> {
             })
         }
         Codec::Lzma => {
-            // Preset 9e with lc = 4; the dictionary never needs to exceed a block.
+            // Preset 9e with lc = 4. A dictionary larger than one block has no use.
             let mut opts =
                 xz2::stream::LzmaOptions::new_preset(9 | 0x8000_0000).map_err(|e| e.to_string())?;
             opts.literal_context_bits(4)
@@ -940,10 +942,10 @@ fn lower_valid(geometry: &Geometry, lower: &Material, squares: &[u8], k: usize) 
     statics(geometry, lower, lower.encode(false, &rest[..n])).valid
 }
 
-/// Proof ranks of the black-to-move positions `lanes` of word `w` (decisive,
-/// `win` marks the wins), from the white-to-move children: a win is one more
-/// than its fastest losing child, a loss one more than its slowest child, and
-/// captures count as rank 0.
+/// Proof ranks of the black-to-move positions `lanes` of word `w`, from the
+/// white-to-move children. All these positions are decisive, and `win` marks the
+/// wins. A win is one more than the lowest rank of a child that is a loss. A loss
+/// is one more than the highest rank of its children. Captures count as rank 0.
 #[allow(clippy::too_many_arguments)]
 fn derive_black<C: Children + ?Sized>(
     geometry: &Geometry,
@@ -1005,7 +1007,7 @@ fn derive_black<C: Children + ?Sized>(
             moved |= from;
         }
     }
-    // Black piece moves; the black king may block a ray.
+    // Black piece moves. The black king can block a ray.
     for i in 1..len {
         let piece = material.skeleton[i];
         if piece.white {
@@ -1117,7 +1119,7 @@ struct CmIndex {
     model: OnceLock<std::result::Result<Arc<cm::Model>, String>>,
 }
 
-/// A v3 or v4 table opened for probing; blocks are read on demand and cached.
+/// A v3 or v4 table that is open for probes. It reads blocks on demand and caches them.
 pub struct PackedTable {
     pub header: PackedHeader,
     pub layout: Layout,
@@ -1145,7 +1147,7 @@ pub fn is_packed(path: &Path) -> Result<bool> {
 }
 
 impl PackedTable {
-    /// Open a v3 or v4 file. With `authenticate`, the payload digest is checked.
+    /// Open a v3 or v4 file. With `authenticate`, it checks the payload digest.
     pub fn open(path: &Path, authenticate: bool) -> Result<PackedTable> {
         let err = |e: std::io::Error| format!("{}: {e}", path.display());
         let file = File::open(path).map_err(err)?;
@@ -1384,7 +1386,7 @@ impl PackedTable {
     }
 
     /// Value of a position given in the full layout, or None if illegal.
-    /// Identical pieces may be listed in any order.
+    /// Identical pieces can be in any order.
     pub fn probe(&self, black: bool, squares: &[u8], black_king: u8) -> Result<Option<Value>> {
         let material = self.material();
         if squares.len() != material.skeleton_len() || black_king >= 64 {
@@ -1513,8 +1515,8 @@ impl PackedTable {
             rank: vec![0u16; if ranked { words * 64 } else { 0 }],
             rounds: self.header.rounds,
         };
-        // Every other word is a symmetric image of a stored word: map its
-        // planes with O(1) bitboard symmetries instead of re-deriving them.
+        // Every other word is a symmetric image of a stored word. Map its
+        // planes with O(1) bitboard symmetries. Do not derive them again.
         let chunk = 1usize << 16;
         let mut rank_chunks = table.rank.chunks_mut(chunk * 64);
         let work: Vec<_> = table
@@ -1631,8 +1633,8 @@ impl PackedTable {
     }
 }
 
-/// Read a table file of any version (v1, v2 or v3) into the working layout;
-/// returns the table and a payload digest identifying the file.
+/// Read a table file of any version (v1, v2 or v3) into the working layout.
+/// Returns the table and a payload digest that identifies the file.
 pub fn load_table(path: &Path, threads: usize) -> Result<(Table, String)> {
     if is_packed(path)? {
         let packed = PackedTable::open(path, true)?;

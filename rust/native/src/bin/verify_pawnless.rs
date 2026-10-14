@@ -1,13 +1,14 @@
 //! Independent check of solved pawnless tables, position by position.
 //!
-//! Uses shakmaty (not the solver's move generator) for legality and legal moves,
-//! and shakmaty-syzygy for published WDL. For every position of every table:
-//! - legality agrees with shakmaty (impossible-check positions are accepted);
-//! - the unclocked WDL equals the sign of Syzygy WDL after zeroing;
-//! - proof ranks hold: a win has a child loss of smaller rank (or a capture
-//!   into a lower-material loss), every child of a loss is a win of smaller
-//!   rank (or a lower-material win), a rank-0 loss is checkmate, and a draw
-//!   has no losing child and is a stalemate or has a nonwinning child.
+//! It uses shakmaty, not the move generator of the solver, for legality and legal
+//! moves. It uses shakmaty-syzygy for the published WDL. For every position of every table:
+//! - legality agrees with shakmaty. The check accepts impossible-check positions.
+//! - the unclocked WDL equals the sign of Syzygy WDL after zeroing.
+//! - proof ranks hold:
+//!   - a win has a child loss of smaller rank, or a capture into a lower-material loss.
+//!   - every child of a loss is a win of smaller rank, or a lower-material win.
+//!   - a rank-0 loss is checkmate.
+//!   - a draw has no child that is a loss. It is a stalemate or has a child that is not a win.
 use shakmaty::{
     Board, CastlingMode, Chess, Color, FromSetup, Piece, Position, PositionError, Role, Setup,
     Square,
@@ -31,8 +32,8 @@ use tablebase_core::pawnless::{self, Material, Table, canonical_white_king};
 
 type Tables = BTreeMap<String, Table>;
 
-/// Syzygy files held in memory: each probe is a slice copy instead of a
-/// `pread` system call (which dominated the verifier's profile).
+/// Syzygy files held in memory. Each probe is a slice copy instead of a
+/// `pread` system call. Those calls dominated the profile of the verifier.
 struct MemoryFilesystem;
 
 struct MemoryFile(Vec<u8>);
@@ -68,7 +69,7 @@ impl RandomAccessFile for MemoryFile {
     }
 }
 
-/// A table and the lower tables its captures lead to, resolved once.
+/// A table and the lower tables its captures lead to, resolved one time.
 struct Context<'a> {
     table: &'a Table,
     /// (captured piece, table without it) for every non-king skeleton piece.
@@ -88,7 +89,7 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Per-thread counts, added to the shared tally once per chunk.
+/// Per-thread counts, added to the shared tally one time per chunk.
 #[derive(Default)]
 struct Counts {
     positions: u64,
@@ -119,7 +120,7 @@ fn piece(p: pawnless::Piece) -> Piece {
 }
 
 /// Build the position of `word` with the black king on `black_king`. Returns
-/// None for overlapping pieces or a position shakmaty rejects.
+/// None if two pieces share a square or if shakmaty rejects the position.
 fn position(material: &Material, word: usize, black_king: u8) -> Option<Chess> {
     let (black_to_move, squares) = material.decode(word);
     let mut board = Board::empty();
@@ -146,8 +147,8 @@ fn position(material: &Material, word: usize, black_king: u8) -> Option<Chess> {
         .ok()
 }
 
-/// Locate a board in a table of `material`: (word, black-king square).
-/// Repeated pieces take their squares in increasing order; any assignment of
+/// Find a board in a table of `material`: (word, black-king square).
+/// Repeated pieces take their squares from low to high. Any assignment of
 /// identical pieces is a valid duplicate cell of the working index.
 fn locate(material: &Material, board: &Board, turn: Color) -> Option<(usize, u8)> {
     let mut used = 0u64;
@@ -176,7 +177,7 @@ struct Tally {
     failures: AtomicU64,
 }
 
-/// Value and rank of a child, which may be in a lower material.
+/// Value and rank of a child, which can be in a lower material.
 fn child_value(
     ctx: &Context,
     child: &Chess,
@@ -236,17 +237,17 @@ fn check_position(
         return Err("bare kings must be a draw".into());
     }
     if table.rank.is_empty() {
-        // Solved in place: no proof ranks to check; legality and WDL only.
+        // Solved in place: there are no proof ranks to check. Check legality and WDL only.
         return Ok(());
     }
     let rank = table.rank[word * 64 + usize::from(bk)];
     let moves = pos.legal_moves();
     let smaller = |r: Option<u16>| r.is_none_or(|r| r < rank);
-    // Over all children: a losing child of smaller rank, a losing child, a
-    // nonwinning child, and whether every child is a win of smaller rank.
-    // The loop stops once the obligation's outcome is settled; a skipped
-    // child's legality is covered by its own stored image and the symmetry
-    // check. Checkmates (rank 0) need no child at all.
+    // Over all children, look for a loss of smaller rank, any loss and any child
+    // that is not a win. Also find if every child is a win of smaller rank.
+    // The loop stops when the outcome of the obligation is known. The stored
+    // image of a skipped child and the symmetry check cover its legality.
+    // A checkmate (rank 0) has no child to probe.
     let (mut proving_loss, mut any_loss, mut any_nonwin, mut all_smaller_wins) =
         (false, false, false, true);
     let probe_children = !(value == -2 && rank == 0);
@@ -370,7 +371,7 @@ fn main() -> Result<(), String> {
             .add_directory(dir)
             .map_err(|e| format!("{dir}: {e}"))?;
     }
-    // Tables stay loaded only while a remaining material reads them.
+    // Tables stay loaded only while a material that is not done yet reads them.
     let mut tables = Tables::new();
     let mut digests = BTreeMap::new();
     let mut report = Vec::new();
