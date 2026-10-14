@@ -261,7 +261,7 @@ The fixed model is now a good choice for a parallel GPU coder with fast probes.
 
 Question: Does a real coder keep the E6 gain, with good speed?
 
-Method: `src/cm.rs` and `TBZ_CM.md` give the codec. It uses the E6 fixed model.
+Method: `rust/src/cm.rs` and [tbz-cm.md](tbz-cm.md) give the codec. It uses the E6 fixed model.
 
 - A model blob in each section keeps the 12-bit probabilities and the mixer weights.
 - A 32-bit binary arithmetic coder codes each block. The coder is the lpaq coder.

@@ -1,7 +1,7 @@
 """Local visualizer for pawnless tablebases (*.tbz format v3/v4, *.tbp v1/v2).
 
 Usage:
-  python -I tools/visualizer/server.py --tables DIR [--tables DIR ...]
+  uv run tools/visualizer/server.py --tables DIR [--tables DIR ...]
       [--syzygy DIR ...] [--logs DIR] [--host 127.0.0.1] [--port 8642]
 
 Network budget: the page is one self-contained document. It has the CSS, the JS
@@ -201,7 +201,7 @@ class Table(Layout):
                     bits &= bits - 1
 
 
-# Formats v3/v4 (rust/src/packed.rs, rust/TBZ_FORMAT.md): one position per symmetry class.
+# Formats v3/v4 (rust/src/packed.rs, docs/tbz-format.md): one position per symmetry class.
 TRIANGLE = (0, 1, 2, 3, 9, 10, 11, 18, 19, 27)
 TRIANGLE_INDEX = {s: i for i, s in enumerate(TRIANGLE)}
 LOWER_RIGHT = 0x80C0E0F0F8FCFEFF

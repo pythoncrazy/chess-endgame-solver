@@ -1,7 +1,6 @@
 # prek (https://github.com/j178/prek) hooks.
 # To install the hooks, run `prek install`. To run all hooks, run `prek run --all-files`.
-# The code of the supplied Python oracle scripts stays as in the ZIP.
-# Thus Python lint and format apply to tools/ only. The hooks check all Rust workspaces.
+# Python lint and format apply to tools/. The hooks check the three Rust workspaces.
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
   - repo: builtin
@@ -13,34 +12,30 @@ repos:
       - id: check-yaml
       - id: check-json
       - id: trailing-whitespace
-        files: ^(tools/|\.pre-commit-config\.yaml|ruff\.toml|rust/.*\.(rs|toml))
       - id: end-of-file-fixer
-        files: ^(tools/|\.pre-commit-config\.yaml|ruff\.toml|rust/.*\.(rs|toml))
   - repo: local
     hooks:
       - id: strip-trailers
         name: remove co-author and tool trailers
         language: system
-        entry: python3 tools/strip_trailers.py
+        entry: uv run --no-project python tools/strip_trailers.py
         stages: [commit-msg]
       - id: ruff-check
         name: ruff check (tools)
-        language: python
-        additional_dependencies: [ruff==0.17.0]
-        entry: ruff check --force-exclude
+        language: system
+        entry: uv run --frozen ruff check --force-exclude
         types: [python]
         files: ^tools/
       - id: ruff-format
         name: ruff format (tools)
-        language: python
-        additional_dependencies: [ruff==0.17.0]
-        entry: ruff format --check --force-exclude
+        language: system
+        entry: uv run --frozen ruff format --check --force-exclude
         types: [python]
         files: ^tools/
       - id: cargo-fmt
-        name: cargo fmt (core, native, gpu)
+        name: cargo fmt (core, verify, gpu)
         language: system
-        entry: bash -c 'for m in rust/Cargo.toml rust/native/Cargo.toml rust/gpu/Cargo.toml; do cargo fmt --manifest-path "$m" --check || exit 1; done'
+        entry: bash -c 'for m in rust/Cargo.toml rust/verify/Cargo.toml rust/gpu/Cargo.toml; do cargo fmt --manifest-path "$m" --check || exit 1; done'
         pass_filenames: false
         files: ^rust/.*\.rs$
       - id: clippy-core
@@ -49,14 +44,14 @@ repos:
         entry: cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
         pass_filenames: false
         files: ^rust/(src|tests|Cargo)
-      - id: clippy-native
-        name: clippy -D warnings (native)
+      - id: clippy-verify
+        name: clippy -D warnings (verify)
         language: system
-        entry: cargo clippy --locked --manifest-path rust/native/Cargo.toml --all-targets --features http -- -D warnings
+        entry: cargo clippy --locked --manifest-path rust/verify/Cargo.toml --all-targets -- -D warnings
         pass_filenames: false
-        files: ^rust/native/
+        files: ^rust/(verify/|src/)
       - id: clippy-gpu
-        name: clippy -D warnings (gpu, needs CUDA toolkit)
+        name: clippy -D warnings (gpu, with the CUDA toolkit)
         language: system
         entry: bash -c 'CUDA_TOOLKIT_PATH="${CUDA_TOOLKIT_PATH:-/usr/local/cuda-13.3}" cargo clippy --locked --release --manifest-path rust/gpu/Cargo.toml --all-targets -- -D warnings'
         pass_filenames: false

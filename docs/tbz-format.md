@@ -1,6 +1,6 @@
 # `.tbz` pawnless table format, version 4
 
-Reference implementation: `src/packed.rs` (writer, reader, probe, decode).
+Reference implementation: `rust/src/packed.rs` (writer, reader, probe, decode).
 Independent reader: `tools/visualizer/server.py` (`PackedTable`).
 Readers can still read version 3 files (`TBPAWNZ1`). Version 3 is version 4
 with both rank sides stored, zstd blocks and no WDL code 3.
@@ -46,7 +46,7 @@ that goes past the end of the file. Codecs:
 - `lzma`: one LZMA1 "alone" (`.lzma`) stream per block, preset 9e with
   `lc=4`, dictionary = block size. Python: `lzma.FORMAT_ALONE`.
 - `cm`: a context model with a binary arithmetic coder. A `cm` section has a
-  different layout. [TBZ_CM.md](TBZ_CM.md) gives it.
+  different layout. [tbz-cm.md](tbz-cm.md) gives it.
 
 ## Stored domain and index
 

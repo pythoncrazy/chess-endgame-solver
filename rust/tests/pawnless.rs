@@ -1,7 +1,26 @@
-use tablebase_core::fiber::knight_reach;
 use tablebase_core::pawnless::{
     Geometry, Material, Role, Solved, Table, king_reach, solve, solve_tree,
 };
+
+/// Knight moves of square `s` from file and rank steps, not from bit shifts.
+fn knight_reach(s: u8) -> u64 {
+    let (file, rank) = (i32::from(s % 8), i32::from(s / 8));
+    let steps = [
+        (1, 2),
+        (2, 1),
+        (2, -1),
+        (1, -2),
+        (-1, -2),
+        (-2, -1),
+        (-2, 1),
+        (-1, 2),
+    ];
+    steps
+        .iter()
+        .map(|(df, dr)| (file + df, rank + dr))
+        .filter(|&(f, r)| (0..8).contains(&f) && (0..8).contains(&r))
+        .fold(0, |bits, (f, r)| bits | 1 << (8 * r + f))
+}
 
 #[test]
 fn material_names_indices_and_captures() {
@@ -25,7 +44,7 @@ fn material_names_indices_and_captures() {
 fn geometry_matches_bitboard_shifts() {
     let g = Geometry::new();
     for s in 0..64u8 {
-        assert_eq!(g.attacks(Role::Knight, s, 0), knight_reach(1 << s));
+        assert_eq!(g.attacks(Role::Knight, s, 0), knight_reach(s));
         assert_eq!(g.king(s), king_reach(1 << s));
         let rook = g.attacks(Role::Rook, s, 0);
         assert_eq!(rook.count_ones(), 14);
