@@ -1,5 +1,5 @@
 //! Compressed pawnless tables, format v4 (`TBPAWNZ2`). The reader also reads v3
-//! (`TBPAWNZ1`). Specification: `TBZ_FORMAT.md`.
+//! (`TBPAWNZ1`). Specification: `docs/tbz-format.md`.
 //!
 //! The file stores each position one time per symmetry class. Its stored image has
 //! the white king in the a1-d1-d4 triangle. Of the images with that property, it

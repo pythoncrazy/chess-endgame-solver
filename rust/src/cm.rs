@@ -9,7 +9,7 @@
 //!
 //! The model is in the section. Thus each block is independent of the other
 //! blocks. The encoder codes all blocks in parallel, and a probe decodes one
-//! small block. Specification: `TBZ_FORMAT.md`.
+//! small block. Specification: `docs/tbz-format.md`.
 use crate::Result;
 use crate::pawnless::{Geometry, Piece};
 use std::sync::{

@@ -17,8 +17,9 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@v6
       - name: No co-author or tool lines in commit messages
-        run: python3 tools/strip_trailers.py --check HEAD
+        run: uv run --no-project python tools/strip_trailers.py --check HEAD
       - name: No co-author or tool lines in the pull request text
         if: github.event_name == 'pull_request'
         env:
@@ -26,7 +27,7 @@ jobs:
           TITLE: ${{ github.event.pull_request.title }}
         run: |
           printf '%s\n%s\n' "$TITLE" "$BODY" > "$RUNNER_TEMP/pr.txt"
-          python3 tools/strip_trailers.py --check-text "$RUNNER_TEMP/pr.txt"
+          uv run --no-project python tools/strip_trailers.py --check-text "$RUNNER_TEMP/pr.txt"
 
   rust:
     runs-on: ubuntu-24.04
@@ -38,30 +39,28 @@ jobs:
         with:
           workspaces: |
             rust
-            rust/native
+            rust/verify
       - name: Format
         run: |
-          for m in rust/Cargo.toml rust/native/Cargo.toml rust/gpu/Cargo.toml; do
+          for m in rust/Cargo.toml rust/verify/Cargo.toml rust/gpu/Cargo.toml; do
             cargo fmt --manifest-path "$m" --check
           done
       - name: Clippy
         run: |
           cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path rust/native/Cargo.toml --all-targets --features http -- -D warnings
+          cargo clippy --locked --manifest-path rust/verify/Cargo.toml --all-targets -- -D warnings
       - name: Test
         run: |
           cargo test --locked --release --manifest-path rust/Cargo.toml
-          cargo test --locked --release --manifest-path rust/native/Cargo.toml --features http
+          cargo test --locked --release --manifest-path rust/verify/Cargo.toml
 
   python:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install ruff==0.17.0
-      - run: ruff check
-      - run: ruff format --check
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run --frozen ruff check
+      - run: uv run --frozen ruff format --check
       - name: ASD-STE100 prose check
-        run: python tools/ste_check.py
+        run: uv run --frozen python tools/ste_check.py

@@ -1,7 +1,7 @@
 # `cm` section codec
 
-This file specifies the `cm` codec of `.tbz` sections. `TBZ_FORMAT.md` gives the rest of the format.
-The reference implementation is `src/cm.rs`. `src/packed.rs` has the section reader and writer.
+This file specifies the `cm` codec of `.tbz` sections. [tbz-format.md](tbz-format.md) gives the rest of the format.
+The reference implementation is `rust/src/cm.rs`. `rust/src/packed.rs` has the section reader and writer.
 
 The codec codes each stored value as a short sequence of binary decisions.
 A fixed model gives each decision a probability. A binary arithmetic coder then codes the decision.
