@@ -306,3 +306,29 @@ One WDL block takes approximately 0.5 ms to decode. One rank block takes approxi
 The first probe of a table also reads the model: approximately 5 ms for WDL and 11 ms for rank.
 
 Decision: Add `cm` as a codec. Keep zstd as the default until the viewer can read `cm`.
+
+## E8: frame index and block size
+
+Question: How much space do the block index and the block size use?
+
+Method: The E7 files keep a u64 offset for each block. At 256 WDL words and 64 rank words, the offsets use approximately 491 KB for the three large tables.
+The new index keeps a u32 frame length for each block, in one zstd frame.
+The test uses `tb_pack --cm-wdl-words N --cm-rank-words M` with 24 threads.
+
+Results (file bytes):
+
+| WDL words | Rank words | KQBvKR | KRNvKQ | KBNvKN | Total |
+|---|---|---|---|---|---|
+| 256 | 64 (u64 offsets) | 12,627,871 | 13,203,463 | 6,630,038 | 32,461,372 |
+| 128 | 32 | 12,460,737 | 12,941,100 | 6,344,068 | 31,745,905 |
+| 256 | 64 | 12,194,203 | 12,781,199 | 6,193,739 | 31,169,141 |
+| 256 | 128 | 11,834,326 | 12,720,820 | 6,101,599 | 30,656,745 |
+| 512 | 64 | 12,177,935 | 12,694,314 | 6,187,444 | 31,059,693 |
+| 512 | 128 | 11,818,058 | 12,633,935 | 6,095,304 | 30,547,297 |
+
+The new index makes the files 4% smaller at the same block size.
+With KQvKR (392,252 bytes) and KRvKB (87,404 bytes), the five tables use 31,648,797 bytes. This is 37% less than v4 zstd, and less than the E6 estimate.
+
+Larger WDL blocks give less than 0.4%. Rank blocks of 128 words give 1.6%, but a decisive probe then decodes twice the rank words.
+
+Decision: Use the u32 index. Keep 256 WDL words and 64 rank words as the default.
