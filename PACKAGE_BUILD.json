@@ -1,0 +1,12 @@
+{
+  "package_revision": "h100-handoff-2026-10-14",
+  "previous_library_version": 3,
+  "native_revision": "fd6296926137d89192c7810a0894346a03f749ef",
+  "gpu_revision": "bc46b1ffb751885073066b087594045f07f0f81b",
+  "includes_latest_six_piece_sources": true,
+  "h100_benchmarked": false,
+  "complete_gpu_six_piece_solver": false,
+  "historical_cpu_results": true,
+  "reference_collection_not_bundled": true,
+  "language_review": "handoff_language_review.json"
+}

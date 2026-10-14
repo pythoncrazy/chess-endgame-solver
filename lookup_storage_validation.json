@@ -1,0 +1,16 @@
+{
+  "status": "pass",
+  "positions": 65567,
+  "random_queries": 10000,
+  "adjacent_pages": 8,
+  "ordinary_cold_requests": 9,
+  "optimized_cold_requests": 3,
+  "optimized_cold_bytes": 3940,
+  "cached_batch_requests": 0,
+  "warm_index_single_page_requests": 1,
+  "warm_index_constant_page_requests": 0,
+  "wdl_cache_bytes_for_one_page": 452,
+  "local_first_batch_seconds": 0.005793185999209527,
+  "live_r2_tested": false,
+  "warning": "Request counts measured with local Range store. Local CPU time is not cloud latency or whole chess-probe latency."
+}

@@ -1,0 +1,16 @@
+[package]
+name = "tablebase-cutile"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+default-run = "tablebase-cutile"
+
+# Independent workspace: CPU tests do not download/build the CUDA toolchain.
+[workspace]
+
+[dependencies]
+cutile = { git = "https://github.com/NVIDIA/cuda-rust", rev = "bc46b1ffb751885073066b087594045f07f0f81b" }
+tablebase-core = { path = ".." }
+serde_json = "1"
+half = "2"
+

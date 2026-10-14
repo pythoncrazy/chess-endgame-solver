@@ -1,0 +1,9 @@
+{
+  "status": "pass",
+  "concurrent_batches": 16,
+  "materials": 2,
+  "global_compressed_cache_bytes": 16384,
+  "invalid_query_cleanup": true,
+  "closed_session_rejected": true,
+  "live_r2_tested": false
+}

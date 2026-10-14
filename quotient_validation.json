@@ -1,0 +1,70 @@
+{
+  "h100_benchmarked": false,
+  "random": {
+    "random_cases": 32,
+    "lifted_example": {
+      "concrete_nodes": 640,
+      "concrete_edges": 640,
+      "quotient_nodes": 5,
+      "quotient_edges": 5,
+      "refinement_rounds": 4,
+      "node_reduction": 128.0
+    },
+    "random_node_reductions": [
+      1.1071428571428572,
+      1.103448275862069,
+      1.064516129032258,
+      1.1724137931034482,
+      1.1666666666666667,
+      1.0588235294117647,
+      1.0571428571428572,
+      1.0857142857142856,
+      1.1142857142857143,
+      1.1111111111111112,
+      1.0512820512820513,
+      1.0769230769230769,
+      1.048780487804878,
+      1.0731707317073171,
+      1.0465116279069768,
+      1.069767441860465,
+      1.0444444444444445,
+      1.0666666666666667,
+      1.0425531914893618,
+      1.0416666666666667,
+      1.0625,
+      1.04,
+      1.0816326530612246,
+      1.08,
+      1.0784313725490196,
+      1.0566037735849056,
+      1.0555555555555556,
+      1.0357142857142858,
+      1.0350877192982457,
+      1.0344827586206897,
+      1.0517241379310345,
+      1.0333333333333334
+    ]
+  },
+  "KQvK": {
+    "concrete_nodes": 46138,
+    "concrete_edges": 609873,
+    "quotient_nodes": 45249,
+    "quotient_edges": 606868,
+    "refinement_rounds": 9,
+    "node_reduction": 1.0196468430241552,
+    "build_seconds": 9.01787269800002,
+    "oracle_seconds": 0.2697991950001324,
+    "quotient_seconds": 1.2190950799999882,
+    "max_dtm_plies": 20,
+    "syzygy_positions_checked": 46137,
+    "status": "pass",
+    "geometric_wdl_predictor_mismatches": 0,
+    "compression": {
+      "raw_two_bit_bytes": 11535,
+      "zstd_level19_bytes": 2168,
+      "downloaded_syzygy_bytes": 272,
+      "caveat": "Canonical index/metadata differs. Sizes are not a like-for-like format benchmark."
+    },
+    "caveat": "Explicit graph construction costs are included; no eight-piece extrapolation justified."
+  }
+}

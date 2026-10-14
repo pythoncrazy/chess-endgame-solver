@@ -1,0 +1,29 @@
+{
+  "status": "pass",
+  "material": "KNNvKP",
+  "sampled_legal_positions": 5000,
+  "classes": {
+    "0": 3466,
+    "-2": 223,
+    "2": 926,
+    "-1": 180,
+    "1": 205
+  },
+  "examples": {
+    "0": "8/5K2/8/6p1/6N1/8/8/3N1k2 w - - 0 1",
+    "-2": "N3K3/8/8/2k5/8/8/4p3/5N2 w - - 0 1",
+    "2": "8/8/3p4/6N1/4K3/N1k5/8/8 w - - 0 1",
+    "-1": "8/8/1K2p3/8/8/2N5/2N5/5k2 b - - 0 1",
+    "1": "6N1/1kp5/8/8/8/7N/8/5K2 w - - 0 1"
+  },
+  "all_five_classes_preserved": true,
+  "frame_bytes": 1337,
+  "encoding": {
+    "mode": "offset-packed",
+    "compression": "zstd",
+    "bytes": 1337
+  },
+  "full_material_generated": false,
+  "h100_benchmarked": false,
+  "live_r2_tested": false
+}

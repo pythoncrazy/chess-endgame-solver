@@ -1,0 +1,7 @@
+{
+  "status": "pass",
+  "frames": 136,
+  "cells_checked": 15830,
+  "corrupt_frame_mutations_rejected": 408,
+  "all_selected_cells_match_full_decode": true
+}

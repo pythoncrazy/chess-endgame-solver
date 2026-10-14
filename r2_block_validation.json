@@ -1,0 +1,10 @@
+{
+  "status": "pass",
+  "positions": 69635,
+  "random_queries": 10000,
+  "frames": 18,
+  "objects": 3,
+  "requests_for_first_batch": 17,
+  "live_r2_tested": false,
+  "corruption_detected": true
+}

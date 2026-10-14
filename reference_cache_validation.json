@@ -1,0 +1,6 @@
+{
+  "status": "pass",
+  "corrupt_symbol_cache_reextracted": true,
+  "source_addressed_names": true,
+  "atomic_cache_replacement": true
+}

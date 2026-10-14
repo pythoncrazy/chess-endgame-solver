@@ -1,0 +1,17 @@
+{
+  "status": "pass",
+  "wdl_fens_checked": 2500,
+  "includes_color_mirrors": true,
+  "dtz_fens_checked": 100,
+  "first_batch_origin_reads": 3,
+  "first_batch_bytes": 17016,
+  "repeated_batch_origin_reads": 0,
+  "wdl_dependency_waves": 1,
+  "dtz_dependency_waves": 0,
+  "archive_bytes_including_chess_metadata": 18224,
+  "published_original_wdl_bytes": 20496,
+  "reencoded_original_file_opened": false,
+  "live_r2_tested": false,
+  "h100_benchmarked": false,
+  "caveat": "WDL archive is complete for KQvKR native slots. Other material dependencies and DTZ data still come from local original Syzygy files. DTZ checks preserve published probe semantics, not a new exact-ply generator. Private python-chess APIs need version pinning."
+}

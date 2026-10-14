@@ -1,0 +1,3 @@
+numpy==2.3.5
+zstandard==0.25.0
+chess==1.11.2

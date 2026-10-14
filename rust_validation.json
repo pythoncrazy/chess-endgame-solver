@@ -1,0 +1,29 @@
+{
+  "status": "pass",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "checks": [
+    "fmt",
+    "clippy",
+    "test",
+    "build"
+  ],
+  "independent_codec_frames": 402,
+  "encoding_modes": 10,
+  "compressors": 3,
+  "encoded_corruption_checks": 3216,
+  "python_decoded_rust_arrays": 19,
+  "native_chess_archive_ids": 10000,
+  "legacy_v2_archive_ids": 10000,
+  "graph_oracle_cases": 100,
+  "bitmask_loss_predicates": 65536,
+  "concurrent_join_callers": 16,
+  "decimal_ids_above_2pow53": true,
+  "int64_extremes": true,
+  "cache_eviction_and_range_splitting": true,
+  "cpu": "x86_64",
+  "gpu_dependency_revision": "bc46b1ffb751885073066b087594045f07f0f81b",
+  "gpu_build_status": "Blocked in NVIDIA cuda-bindings build: no CUDA toolkit installed. Kernel host/JIT compilation and H100 execution are unverified.",
+  "h100_benchmarked": false,
+  "live_r2_tested": false,
+  "full_eight_piece_generator_implemented": false
+}

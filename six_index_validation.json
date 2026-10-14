@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "canonical_king_pairs": 462,
+  "king_pair_inputs": 4096,
+  "padded_slots": 15502147584,
+  "legal_six_piece_positions": 256,
+  "quiet_transitions": 4566,
+  "king_transitions": 946,
+  "random_and_boundary_roundtrip_ids": 2053,
+  "residual_stabilizer_duplicates_retained": true,
+  "captures_promotions_and_castling_indexed": false,
+  "h100_benchmarked": false
+}

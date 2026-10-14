@@ -1,0 +1,39 @@
+{
+  "h100_benchmarked": false,
+  "graph_tests": {
+    "cases": 120,
+    "nodes": 12720,
+    "duplicate_notifications": 22941,
+    "max_rounds": 12,
+    "chain_depth": 256,
+    "radix_carry_regression": "pass"
+  },
+  "clocked_dag_tests": [
+    {
+      "deadline": 8,
+      "claim_threshold": null,
+      "states": 144,
+      "status": "pass"
+    },
+    {
+      "deadline": 100,
+      "claim_threshold": null,
+      "states": 1616,
+      "status": "pass"
+    },
+    {
+      "deadline": 150,
+      "claim_threshold": 100,
+      "states": 2416,
+      "status": "pass"
+    }
+  ],
+  "chess_fiber_tests": {
+    "cases": 160,
+    "legal_source_rows": 7426,
+    "quiet_edges": 48842,
+    "segment_source_rows": 5369,
+    "status": "pass",
+    "library": "python-chess"
+  }
+}

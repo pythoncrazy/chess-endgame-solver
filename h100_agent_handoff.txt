@@ -1,0 +1,713 @@
+# Single H100 tablebase procedure
+
+## 1. Task and limits
+
+Use the supplied ZIP to prepare this machine for chess tablebase work.
+Use only one H100.
+Complete the software installation, CPU tests, online comparisons, and GPU operator measurements.
+Continue to a completed GPU solver for a small chess material.
+Increase the material size only after the preceding correct-operation checks pass.
+Use Rust for the solver and storage software.
+Use NVIDIA cuTile Rust for applicable GPU operations.
+Use CUDA SIMT operations when measurements show better performance.
+Keep all results correct.
+Do not replace measured results with estimates.
+
+The ZIP contains research software.
+It does not contain a completed six-piece GPU solver.
+Initial work did not include H100 measurements.
+The full eight-piece, one-hour target is a research objective.
+
+Do the procedures in sequence.
+Repair problems within the available machine and account permissions.
+Continue work that does not depend on a stopped stage.
+Record a specified cause when a stage cannot continue.
+Do not stop after a proposal when the machine can do the work.
+
+## 2. Language and terms
+
+Use ASD-STE100 Issue 9 for your report and procedural text.
+Use a maximum of 20 words in each procedural sentence.
+Use a maximum of 25 words in each descriptive sentence.
+Use one instruction in each procedural sentence.
+Use the imperative form for instructions.
+Use approved words with their approved meanings and parts of speech.
+Use the technical terms below consistently.
+Keep commands, identifiers, formulas, paths, and source code unchanged when necessary.
+
+Technical nouns for this project:
+
+- Agent: The software assistant that does this procedure.
+- ZIP: The supplied archive of project files.
+- Package root: The extracted directory that contains README.txt and rust/.
+- Material: A specified collection of chess pieces, including the two kings.
+- FEN: A chess position record with turn, rights, counters, and board placement.
+- WDL: A win, draw, or loss value from the viewpoint of the player with the move.
+- WDL50: A Syzygy result that includes the fifty-move rule.
+- DTZ: A Syzygy distance to a move that resets the halfmove clock.
+- DTM: A distance to checkmate.
+- Quiet move: A move without a capture or promotion.
+- Zeroing move: A capture or pawn move that resets the halfmove clock.
+- Oracle: A reference implementation or service used for a result comparison.
+- Fiber: A group of positions with five fixed pieces and one variable square.
+- Source row: One variable source square in a fiber.
+- Packed mask: A 64-bit word with one bit for each square.
+- Native Syzygy file: An unchanged .rtbw or .rtbz reference file.
+- Working index: An index for GPU state, different from the native Syzygy index.
+- Proof rank: A finite rank that supports a win or loss proof.
+- Roofline: A performance ceiling calculated from arithmetic and data-transfer limits.
+- Checkpoint: A saved solver state from which the solver can continue.
+
+Technical nouns also include the standard chess, mathematics, computer, storage, and GPU terms below.
+Product names, protocol names, file names, and identifiers are technical nouns.
+Technical verbs include compile, decode, download, encode, extract, hash, parse, probe, profile, save, and synchronize.
+These verbs refer only to their specified computer processes.
+
+## 3. Examine the ZIP
+
+Locate the supplied ZIP.
+Record its absolute path, byte size, and SHA-256 digest.
+Examine the archive directory before extraction.
+Reject absolute member paths, parent-directory traversal, and symbolic links outside the extraction directory.
+Do the ZIP integrity check.
+Extract the ZIP into a new project directory on the selected disk.
+Keep the supplied ZIP unchanged.
+Find the package root from its files.
+Do not assume that the archive name gives its internal directory layout.
+Read applicable project instructions.
+Read README.txt, rust/README.md, and report.html.
+Read SIX_PIECE_SPEC.md when that file is present.
+Read rust/native/README.md when that file is present.
+
+The initial saved ZIP had 500,429 bytes and 102 members.
+That ZIP did not contain the subsequent native reader or fiber_compare.rs.
+The updated ZIP includes those sources and this procedure.
+
+Record the presence of these files:
+
+- rust/Cargo.toml and rust/Cargo.lock
+- rust/gpu/Cargo.toml and rust/gpu/Cargo.lock
+- rust/native/Cargo.toml and rust/native/Cargo.lock
+- rust/src/fiber.rs and rust/src/dense6.rs
+- rust/gpu/src/bin/fiber_compare.rs
+- download_six_references.py and six_source_catalog.json
+- native_range_catalog.py and validate_six_rust.py
+- six_extended_probe_queries.json
+- validate_six_fibers.py and validate_six_index.py
+- SIX_PIECE_SPEC.md, six_measurements.json, and six_rooflines.json.
+
+If a necessary file is missing, record its name.
+Do not record missing software as completed.
+Use the completed stages that the supplied sources support.
+
+## 4. Examine machine capacity
+
+Record the operating system, CPU architecture, processor count, and available RAM.
+Record the disk mounts, filesystem types, available bytes, and available inodes.
+Record applicable disk quotas.
+Record available capacity for the project directory, temporary directory, Cargo cache, and CUDA installation.
+Make sure that the project directory permits file creation.
+Make sure that the filesystem supports the necessary file sizes.
+Select storage with sufficient capacity for each stage.
+
+Use these Linux commands as applicable:
+
+```sh
+uname -a
+cat /etc/os-release
+lscpu
+nproc
+free -b
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+df -B1
+df -i
+quota -s
+```
+
+Record commands that are not available.
+Do not use a missing quota command as proof of unlimited storage.
+Calculate the capacity needed before each large download or allocation.
+Include downloads, extracted files, build files, logs, checkpoints, temporary copies, and final output.
+Keep a capacity reserve of at least 10 percent on the selected filesystem.
+Do not delete unrelated files to get capacity.
+
+The selected WDL references need 37,373,968 bytes.
+Publication creates another copy plus small hash indexes.
+CUDA and Cargo need additional capacity.
+A 30 GiB allowance is an initial setup estimate, not a measured requirement.
+
+The listed Syzygy collection through six pieces needs 161,209,573,952 bytes before hash indexes.
+The collection needs approximately 161.52 GB with the proposed physical hash indexes.
+Do not download that collection for the initial tests.
+Calculate checkpoint and output capacity from the implemented solver layout.
+Do not use the compressed reference size as the GPU working-memory requirement.
+
+## 5. Examine the H100
+
+Record the H100 model, UUID, PCI address, memory capacity, and driver version.
+Record GPU use, temperature, clocks, power limits, ECC state, and MIG state.
+Make sure that the selected device is an H100.
+Make sure that all GPU work uses one selected device.
+Use its UUID for CUDA_VISIBLE_DEVICES when necessary.
+Record other processes that use this device.
+Do not record a MIG instance as an entire H100.
+Use the memory capacity available to this process in all allocation decisions.
+
+```sh
+nvidia-smi -L
+nvidia-smi -q
+nvidia-smi --query-gpu=name,uuid,pci.bus_id,memory.total,memory.free,driver_version --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
+```
+
+The reference roofline uses H100 SXM with 80 GB and 3.35 TB/s.
+An H100 PCIe card or H100 NVL has different performance limits.
+Replace the reference hardware values with values applicable to the installed device.
+Keep the GPU memory reserve in the allocation plan.
+
+## 6. Install the host software
+
+Use a project directory that has sufficient capacity.
+Set TB_ROOT to its absolute path.
+Set TB_PACKAGE to the absolute package-root path.
+Create directories for logs, results, downloads, and build records.
+Install missing host tools with the package manager for the operating system.
+On Ubuntu, use the package names below when applicable.
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config clang libclang-dev cmake git curl ca-certificates python3 python3-venv python3-pip unzip zstd
+```
+
+If system installation is not available, use the permitted user installation or container environment.
+Do not fabricate correct installation results.
+Record the compiler and linker versions.
+Record the Python version.
+Create a Python virtual environment in the project directory.
+Install the supplied Python requirements in that environment.
+Keep the host Python installation unchanged.
+
+```sh
+python3 -m venv "$TB_ROOT/venv"
+. "$TB_ROOT/venv/bin/activate"
+python -m pip install --upgrade pip
+python -m pip install -r "$TB_PACKAGE/requirements.txt"
+python -m pip check
+python -c 'import chess,numpy,zstandard; print(chess.__version__,numpy.__version__,zstandard.__version__)'
+```
+
+The initial requirements specify chess 1.11.2, NumPy 2.3.5, and zstandard 0.25.0.
+Record differences if the supplied requirements specify other versions.
+
+## 7. Install Rust and prepare Cargo
+
+Use the official Rust installation procedure if rustup is missing.
+Use Rust 1.99.0 for the initial reproduction.
+The native crate requires Rust 1.97 or subsequent.
+The cuTile crate requires stable Rust, not an unspecified nightly compiler.
+Install rustfmt and Clippy for the selected toolchain.
+Apply the toolchain override only to this project.
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$TB_ROOT/rustup-init.sh"
+sh "$TB_ROOT/rustup-init.sh" -y --profile minimal --default-toolchain 1.99.0 --no-modify-path
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+cd "$TB_PACKAGE"
+rustup override set 1.99.0
+rustc --version --verbose
+cargo --version
+rustup show
+```
+
+If rustup already exists, omit its installation commands.
+Examine Cargo environment variables and applicable .cargo/config.toml files.
+Make sure that target directories have sufficient capacity.
+Keep the three Cargo workspaces separate.
+Keep the supplied Cargo.lock files.
+Use --locked for dependency resolution, tests, and builds.
+Use --offline only after the necessary dependencies exist in the Cargo cache.
+Record dependency changes when a repair requires them.
+Do not silently replace a pinned revision with the latest revision.
+
+The GPU revision is bc46b1ffb751885073066b087594045f07f0f81b.
+Its repository is https://github.com/NVIDIA/cuda-rust.
+The native-library revision is fd6296926137d89192c7810a0894346a03f749ef.
+Its repository is https://github.com/niklasf/shakmaty.
+
+```sh
+cargo fetch --locked --manifest-path rust/Cargo.toml
+cargo fetch --locked --manifest-path rust/native/Cargo.toml
+cargo metadata --locked --manifest-path rust/Cargo.toml --format-version 1
+cargo metadata --locked --manifest-path rust/native/Cargo.toml --format-version 1
+```
+
+The validation scripts expect binaries in the target directory of each project.
+If CARGO_TARGET_DIR changes that location, correct the script configuration before use.
+Do not mistake a binary-path error for a chess-result error.
+Select Cargo job counts from CPU count and available RAM.
+Decrease the job count after an out-of-memory error.
+Use a new target directory if restored build files have incorrect metadata.
+Do not remove source files or lockfiles during that repair.
+
+## 8. Prepare CUDA and cuTile
+
+Read the setup instructions at the pinned NVIDIA revision.
+Use a toolkit with CUDA Tile IR 13.3 or subsequent for Hopper.
+Use the official CUDA installer or a permitted NVIDIA development container.
+Make sure that the toolkit and NVIDIA driver support the necessary JIT operations.
+Refer to the official CUDA compatibility documentation for the installed versions.
+Do not use the CUDA version in nvidia-smi as proof of an installed toolkit.
+Record the measured toolkit path.
+Make sure that cuda.h, nvcc, tileiras, and the driver libraries are available.
+Set CUDA_TOOLKIT_PATH to that toolkit path.
+Keep tileiras and the toolkit from a compatible release.
+
+```sh
+export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.3
+export PATH="$CUDA_TOOLKIT_PATH/bin:$PATH"
+nvcc --version
+tileiras --version
+ls -l "$CUDA_TOOLKIT_PATH/include/cuda.h"
+ldconfig -p
+```
+
+Replace the example toolkit path when necessary.
+Do not replace the installed NVIDIA driver without the necessary machine permissions.
+Complete CPU work if the GPU driver or toolkit needs an external repair.
+Download the GPU dependencies after the toolkit check.
+Compile the supplied GPU program before a large allocation.
+
+```sh
+cargo fetch --locked --manifest-path rust/gpu/Cargo.toml
+cargo build --locked --release --manifest-path rust/gpu/Cargo.toml --bin fiber_compare
+```
+
+A correct host build does not prove correct GPU JIT compilation.
+Use a small GPU execution for the JIT check.
+If compilation fails, record the first related error and the installed versions.
+Repair the source against the pinned API.
+Keep the CPU oracle unchanged during that repair.
+
+## 9. Do the CPU tests
+
+Use the package root as the working directory.
+Save the output and exit status of each command.
+Keep the initial result files before a script replaces them.
+Do not disable Clippy checks to get a correct result.
+
+```sh
+cargo fmt --manifest-path rust/Cargo.toml --check
+cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --release --manifest-path rust/Cargo.toml
+cargo fmt --manifest-path rust/native/Cargo.toml --check
+cargo clippy --locked --manifest-path rust/native/Cargo.toml --all-targets --features http -- -D warnings
+cargo test --locked --release --manifest-path rust/native/Cargo.toml --features http
+cargo fmt --manifest-path rust/gpu/Cargo.toml --check
+python validate_six_fibers.py --chess-path .
+python validate_six_index.py --chess-path .
+```
+
+The fiber checks include 320 fibers and 1,310,720 adjacency cells.
+They include knights, bishops, rooks, queens, and the two colors.
+The Rust tests include 65,536 degree-eight child assignments.
+The working-index checks include 4,096 king-pair inputs and 4,566 legal quiet transitions.
+They include 946 king moves and 2,053 boundary or random ID roundtrips.
+Record the measured counts from this execution.
+Do not accept an old JSON status as proof that these tests passed.
+
+## 10. Download and compare the references
+
+Download only the selected reference files and their dependencies first.
+Use the supplied source catalog for byte sizes and SHA-256 digests.
+Make sure that each download has the specified size and digest.
+Keep partial downloads separate from accepted files.
+Reject truncated or incorrect files.
+Publish the accepted files with native_range_catalog.py.
+
+```sh
+python download_six_references.py --directory "$TB_ROOT/references-six"
+python native_range_catalog.py --output "$TB_ROOT/native-objects" "$TB_ROOT"/references-six/*.rtbw
+python validate_six_rust.py --objects "$TB_ROOT/native-objects"
+```
+
+The selected catalog contains 29 WDL files with 37,373,968 source bytes.
+The download does not generate new chess results.
+The Rust comparison uses 1,000 six-piece FENs and five additional WDL-class examples.
+The smaller Cargo fixtures include 64 WDL and DTZ comparisons.
+The tests include cache eviction, corruption, short HTTP responses, and concurrent batches.
+
+Reference KQBNvKR.rtbw has 18,577,168 bytes.
+Its SHA-256 digest is:
+
+```text
+7662c2baeae358c03e4505e5485c1b7eadb4338055cf3fbe2dad977c366a109e
+```
+
+Reference KNNvKNN.rtbw has 1,013,968 bytes.
+Its SHA-256 digest is:
+
+```text
+e1a3880df3a23556924b8e0957b5665a1f9464833cc2298575da0fc5d336e439
+```
+
+Use the native reader for FEN comparisons:
+
+```sh
+cargo run --locked --release --manifest-path rust/native/Cargo.toml -- \
+  "$TB_ROOT/native-objects" six_extended_probe_queries.json 67108864 scalar
+cargo run --locked --release --manifest-path rust/native/Cargo.toml -- \
+  "$TB_ROOT/native-objects" six_extended_probe_queries.json 67108864 batch
+```
+
+The numeric cache argument is a retained-data budget in bytes.
+It is not a limit for all process memory.
+Record cold and warm results separately.
+Record request counts, transferred bytes, cache use, and CPU time.
+
+## 11. Compare with an online tablebase
+
+Use this service for standard chess:
+
+```text
+https://tablebase.lichess.ovh/standard
+https://github.com/lichess-org/lila-tablebase
+```
+
+Read the API description before the comparisons.
+Send FEN through a URL-encoded query parameter.
+Keep the exact FEN and the player with the move.
+Use zero for the halfmove clock when comparing WDL after zeroing.
+Record comparisons with other clock values separately.
+Use a maximum of one request per second initially.
+Save each response with its request, time, HTTP status, and source URL.
+Use cached responses for repeated requests.
+Increase the request interval after HTTP 429.
+Obey Retry-After when the service gives that field.
+Do not treat a missing table, network error, or unknown category as a draw.
+
+Use this initial service check:
+
+```sh
+curl --fail-with-body --get 'https://tablebase.lichess.ovh/standard' \
+  --data-urlencode 'fen=8/8/8/8/8/7k/4r3/KQ6 w - - 0 1'
+```
+
+This reference position returned category win and DTZ 3 during preparation.
+Make sure that the service response agrees with the local result.
+Compare at least 64 different positions before the large GPU tests.
+Include the five published WDL classes when the selected references permit them.
+Include the two turns, checkmate, stalemate, captures, and repeated pieces.
+Include legal en passant and all four promotion choices in subsequent pawn tests.
+
+Use this mapping only for these five categories at the agreed clock state:
+
+| Online category | WDL value |
+| --- | ---: |
+| win | 2 |
+| cursed-win | 1 |
+| draw | 0 |
+| blessed-loss | -1 |
+| loss | -2 |
+
+Do not use this mapping for maybe-win, maybe-loss, syzygy-win, syzygy-loss, or unknown.
+Read the server source when a category needs interpretation.
+Record an unresolved comparison as unresolved.
+Do not include unresolved comparisons in the correct-comparison count.
+Compare the legal UCI move sets with a local chess implementation.
+Online move entries describe the child position, including its turn and clock.
+Do not use child values as parent values.
+Set the child halfmove clock to zero before a comparison with WDL after zeroing.
+
+Compare DTZ only when the local metric and online metric agree.
+Use precise_dtz for an exact distance comparison when that field has a value.
+Record rounded or missing distances separately.
+Do not compare DTM directly with DTZ.
+Make sure that the checkmate distance convention agrees before distance comparisons.
+
+If a comparison differs, stop performance acceptance for the affected operation.
+Save the smallest FEN that shows the difference.
+Record the expected value, measured value, metric, turn, rights, clock, and reference digests.
+Find the first incorrect stage before more optimization.
+Do the affected tests again after the repair.
+
+## 12. Do the GPU operator tests
+
+Start with 256 fibers.
+Make sure that all device results agree with the CPU oracle.
+Use additional fiber counts after that comparison passes.
+Use positive multiples of 256 for the supplied program.
+Save stdout and stderr separately.
+Make sure that each correct output is valid JSON.
+Keep the process exit status.
+
+```sh
+cargo run --locked --release --manifest-path rust/gpu/Cargo.toml --bin fiber_compare -- 256
+cargo run --locked --release --manifest-path rust/gpu/Cargo.toml --bin fiber_compare -- 4096
+cargo run --locked --release --manifest-path rust/gpu/Cargo.toml --bin fiber_compare -- 65536
+cargo run --locked --release --manifest-path rust/gpu/Cargo.toml --bin fiber_compare -- 4194304
+```
+
+Use run_h100_lab.py only after the direct commands pass:
+
+```sh
+python run_h100_lab.py --toolkit "$CUDA_TOOLKIT_PATH" \
+  --fibers 4194304 --output "$TB_ROOT/results/h100-operators.json"
+```
+
+Compare packed knight shifts, INT8/INT32, FP16/FP32, and FP8/FP32 on same inputs.
+Make sure that the comparison includes the eight-loss carry case.
+Include all-win, all-loss, no-move, invalid-source, and partial-mask cases.
+Record the selected device in each result.
+Record the initial JIT time separately from subsequent execution times.
+Keep transfers and allocations outside kernel-only timing.
+Record host time and CUDA event time separately.
+Do not label timing as kernel-only if it includes host gaps or synchronization.
+
+The supplied default has 4,194,304 fibers and 192 MiB of input and output data.
+This allocation is larger than the 50 MB H100 L2 capacity.
+The first launch includes JIT work and result validation.
+The subsequent launches include host-launch effects in the supplied measurements.
+Change the measurements when a more restricted timing scope is necessary.
+Do at least five repetitions after the initial launch.
+Record the median, minimum, and spread.
+Do not include profiler executions in the normal timing distribution.
+
+## 13. Keep the operator mathematics
+
+Use separate packed masks for proven wins and proven losses.
+Reject overlap between these masks.
+Keep unknown positions different from draws until solver termination.
+Cache legal-move existence separately from the dynamic result masks.
+
+For a knight, let G be the shared 64-by-64 geometry matrix.
+Let D identify permitted destinations.
+Let V identify valid sources.
+Use this encoding for the shared tensor operation:
+
+```text
+B = D * (8 * [child != Win] + [child == Loss])
+Z = G * B
+winning_source = V & (((Z & 7) != 0) | (Z == 72))
+nonwinning_source = V & (Z != 0)
+```
+
+The input values are 0, 8, and 9.
+FP8 E4M3 represents these values accurately.
+A knight has at most eight destinations.
+Eight losing destinations give Z = 72.
+The additional comparison keeps loss information during the digit carry.
+Use FP32 accumulation for the FP8 and FP16 comparisons.
+Keep reduced-precision fast accumulation disabled in the initial correct-operation tests.
+Do not replace the initial 0/16/17 encoding with FP8.
+FP8 E4M3 does not represent 17 accurately.
+
+Compare the tensor result with the eight-shift knight operation.
+Use physical blockers for bishop, rook, and queen operations.
+Use fill distances of 1, 2, and 4 squares.
+Apply king-safety masks to destinations.
+Do not use unsafe intermediate squares as physical blockers.
+Include captures through a separate dependency path.
+
+## 14. Measure performance limits
+
+Calculate the roofline with the measured device specifications.
+Record dense tensor rates separately from structured-sparsity rates.
+Use these values only for the H100 SXM reference model:
+
+| Quantity | Reference value |
+| --- | ---: |
+| HBM bandwidth | 3.35 TB/s |
+| Dense FP16 arithmetic | 989.5 TFLOPS |
+| Dense INT8 arithmetic | 1,979 TOPS |
+| Dense FP8 arithmetic ceiling | 1,979 TFLOPS |
+| Packed operator traffic | 0.75 bytes per source row |
+
+The traffic model reads four 64-bit words and writes two words for 64 source rows.
+Its bandwidth ceiling is approximately 4.47 trillion source rows per second.
+That value is not a measured chess-position rate.
+The initial FP8 accumulation mode can decrease the arithmetic rate.
+
+Record the cost of mask construction, index calculation, transposes, scalar packing, and register spills.
+Record measured HBM traffic when a profiler is available.
+Use NVIDIA Nsight tools with versions compatible with the toolkit.
+Record useful source rows and useful legal edges.
+Do not record dense matrix operations as useful chess work.
+Select tensor or packed-mask operations from measured time for same work.
+Include the conversion cost in that selection.
+
+The knight matrix permits an accurate 2:4 structured-sparsity representation with zero padding.
+The supplied GPU program does not implement that representation.
+Do not record its possible speed increase as an achieved result.
+Use a separate experiment if the pinned API cannot express sparse MMA.
+
+## 15. Implement and verify the solver
+
+Begin with KQvK for a completed GPU solve.
+Compare all its legal positions with the published reference.
+Make sure that the GPU performs the solving operation, not only reference-table decoding.
+Continue with an applicable four-piece material.
+Continue to KQBNvKR after the smaller solver passes its correctness checks.
+Use KNNvKNN as another six-piece operator and solver comparison.
+Use KRPvKRP only after the pawn rules and dependency path are correct.
+
+Implement legal positions, checkmate seeds, stalemate seeds, and all legal successors.
+Implement the capture dependencies before the same-material iteration.
+Implement promotion dependencies before pawn materials.
+Keep the iteration state on the GPU.
+Prepare correct lower-material values before the timed solve.
+Do not use raw native fill codes as legal-board results.
+Decode native compression by blocks when preparation needs many reference values.
+
+Commit a win only when a legal child has a proved loss.
+Commit a loss only when legal moves exist and all legal children have proved wins.
+Treat unknown family contributions as nonwinning-child masks.
+Use idempotent dirty notifications.
+Prevent duplicate messages from changing a counter twice.
+Include pending updates in the termination condition.
+Classify unresolved cycles as draws only after completed global termination checks.
+
+Use proof ranks to reject false win or loss cycles.
+Make sure that a winning witness has a smaller proof rank.
+Make sure that all children of a loss have the necessary smaller proof ranks.
+Validate terminal states and dependency proofs.
+Validate draw conditions after the win and loss proofs.
+Do not treat a Bellman-value check alone as a proof for cyclic positions.
+Do not use asynchronous commitment depth as DTM.
+
+The padded pawnless index uses 462 canonical king pairs.
+It retains duplicate orientations from king-pair stabilizers.
+The four other piece coordinates each have 64 values.
+The two turns give 15,502,147,584 candidate cells.
+Nonking quiet moves change one coordinate digit and the turn.
+King moves transform the other coordinates after king-pair normalization.
+Keep the working index different from the compact native index.
+Do not apply these eight board symmetries unchanged to pawn or castling-right states.
+
+The WDL working-memory model is 28,317,221,376 bytes.
+An additional all-side 16-bit DTM buffer needs 31,004,295,168 bytes.
+The combined model is 59,321,516,544 bytes.
+These values include assumed dependency and scratch allowances.
+Measure measured allocation peaks before the large solve.
+Use overflow escapes or a wider representation for distances beyond the 16-bit range.
+
+Record these phases separately:
+
+- Position enumeration and legal-move masks
+- Lower-material preparation
+- GPU solving and termination checks
+- WDL verification
+- Distance and draw-rule stages
+- Compression and output
+- Checkpoint and restart operations.
+
+Use a local oracle for large comparisons.
+Use the online service for an additional sample comparison.
+Do not send billions of positions to the public service.
+Do a completed small-material comparison before performance extrapolation.
+
+## 16. Cover chess and storage boundary cases
+
+Include the following cases in the applicable tests:
+
+- The two turns and board symmetries
+- Invalid king adjacency and piece overlap
+- Positions in check and double check
+- Checkmate and stalemate
+- Captures with a change of material
+- Repeated-piece permutations
+- Legal and illegal en passant
+- Pawn double moves
+- Promotion to queen, rook, bishop, and knight
+- Promotion captures
+- The five Syzygy WDL classes
+- Halfmove clocks at the selected rule boundaries
+- Castling rights and unsupported-state rejection
+- Repetition history and an incomplete history record
+- Distance overflow and undefined-distance codes
+- Decimal IDs larger than 2^53
+- Signed 64-bit limits
+- Empty files, partial final pages, and truncated data
+- Incorrect data, hash pages, and catalogs
+- Cache eviction and zero cache budgets
+- Concurrent lookups and duplicate notifications
+- Interrupted publication, checkpoints, and restart operations.
+
+Keep WDL without the move clock different from WDL50.
+Keep DTZ different from DTM.
+Do not record repetition-history support from FEN alone.
+Reject unsupported states with a specified error.
+Do not replace an unsupported state with a guessed result.
+Start an interrupted solve from its checkpoint only after the checkpoint integrity check passes.
+
+## 17. Keep storage and lookup correct-operation
+
+Use native Syzygy compression as the initial storage reference.
+KQBNvKR contains 13,531,664,160 native index slots.
+Those slots are not a count of legal boards.
+KNNvKNN contains 1,546,346,340 stored slots.
+A fixed logical-page index can be larger than a small native Syzygy file.
+Include all index and dictionary bytes in storage comparisons.
+
+The range format adds one SHA-256 digest per physical 16 KiB tile.
+Its payload overhead is approximately 0.195 percent.
+The catalog authenticates pages of tile digests.
+Keep data and index cache budgets separate.
+Make sure that each range digest agrees with its catalog entry before the decoder uses the data.
+Keep object identities based on content digests.
+Include capture dependencies in lookup measurements.
+Measure cold and warm lookups separately.
+Do not use local filesystem time as a cloud latency measurement.
+
+The initial 1,005-position trace used a 64 MiB retained-data budget.
+Scalar lookup used 565 cold source requests.
+Batch lookup used 448 cold source requests.
+Each mode transferred 8,927,936 bytes.
+Each mode used zero source requests during its warm repetition.
+These values describe that trace, not all collection files.
+Measure the installed implementation again.
+Select batching from CPU cost, remote latency, cache capacity, and request savings.
+Do not deploy a cloud service only to complete the local GPU tests.
+
+## 18. Completion records
+
+Save the final source changes and dependency lockfiles.
+Save the machine inventory and disk-capacity calculations.
+Save compiler, toolkit, driver, Python, and dependency versions.
+Save each command, exit status, log, reference digest, and result file.
+Save online requests and responses with their interpretation.
+Save the smallest position for each result difference.
+Save operator measurements with their timing scope.
+Save solver measurements with their material, metric, and legal-position count.
+Save measured memory peaks and output byte counts.
+Save the STE terminology list and language-check results.
+
+Give each stage one of these statuses:
+
+- PASS: The specified checks passed in this execution.
+- FAIL: A specified check produced an incorrect result.
+- BLOCKED: A specified dependency or machine condition prevented execution.
+- NOT IMPLEMENTED: The supplied or repaired program does not perform the operation.
+
+Do not classify BLOCKED or NOT IMPLEMENTED as PASS.
+Record whether the GPU operator program compiled and executed correctly.
+Record whether a GPU solver completed all legal positions in one material.
+Record the largest material that passed the required comparisons.
+Record which chess states and metrics the solver supports.
+Record the cause and next necessary action for each incomplete stage.
+Do not record a completed six-piece solver from operator measurements alone.
+Do not record the eight-piece, one-hour target as achieved without a completed execution and the required checks.
+
+Reference documents:
+
+- https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf
+- https://rust-lang.org/tools/install/
+- https://doc.rust-lang.org/cargo/
+- https://github.com/NVIDIA/cuda-rust
+- https://developer.nvidia.com/cuda-downloads
+- https://docs.nvidia.com/deploy/cuda-compatibility/
+- https://www.nvidia.com/en-us/data-center/h100/
+- https://github.com/niklasf/shakmaty
+- https://github.com/syzygy1/tb
+- https://github.com/lichess-org/lila-tablebase
+- https://tablebase.lichess.ovh/tables/standard/.

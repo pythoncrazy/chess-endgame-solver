@@ -1,0 +1,13 @@
+{
+  "standard": "ASD-STE100 Issue 9, 2025-01-15",
+  "official_source": "https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf",
+  "source_sha256": "d1f4ea9e7cd6e46b47aa9057209f99e78c0e9cfc4e27a5b07895b05c1a166431",
+  "prompt_sha256": "3b132661096389d9a9e85be8b84b82df7970ea480399300824532498865e3f18",
+  "prose_units": 443,
+  "maximum_prose_words": 17,
+  "over_20_word_units": [],
+  "prose_semicolons": false,
+  "contractions": [],
+  "terminology": "Project terms and computer-process verbs are defined in section 2.",
+  "review_scope": "Sentence length, imperative instructions, prohibited contractions/semicolons and manual dictionary/technical-term review. No third-party certification claimed."
+}

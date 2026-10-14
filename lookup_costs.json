@@ -1,0 +1,144 @@
+{
+  "as_of_utc": "2026-10-13",
+  "status": "pass",
+  "examples": {
+    "100M_single_block_hit_0": {
+      "queries": 100000000,
+      "expected_payload_gets": 100000000.0,
+      "expected_all_r2_gets": 100000000.0,
+      "expected_fetched_bytes": 6553600000000.0,
+      "api_requests": 100000000,
+      "r2_storage_usd": 0.0,
+      "r2_read_operations_usd": 32.4,
+      "r2_retrieval_usd": 0,
+      "worker_usd": 41.4,
+      "estimated_monthly_total_usd": 73.8,
+      "assumptions": {
+        "blocks_per_position": 1,
+        "block_hit_rate": 0,
+        "positions_per_payload_get": 1,
+        "metadata_gets_per_position": 0,
+        "fetched_bytes_per_get": 65536,
+        "storage_class": "standard",
+        "positions_per_api_request": 1,
+        "worker_cpu_ms_per_api_request": 5
+      }
+    },
+    "100M_single_block_hit_0.9": {
+      "queries": 100000000,
+      "expected_payload_gets": 9999999.999999998,
+      "expected_all_r2_gets": 9999999.999999998,
+      "expected_fetched_bytes": 655359999999.9999,
+      "api_requests": 100000000,
+      "r2_storage_usd": 0.0,
+      "r2_read_operations_usd": 0.0,
+      "r2_retrieval_usd": 0,
+      "worker_usd": 41.4,
+      "estimated_monthly_total_usd": 41.4,
+      "assumptions": {
+        "blocks_per_position": 1,
+        "block_hit_rate": 0.9,
+        "positions_per_payload_get": 1,
+        "metadata_gets_per_position": 0,
+        "fetched_bytes_per_get": 65536,
+        "storage_class": "standard",
+        "positions_per_api_request": 1,
+        "worker_cpu_ms_per_api_request": 5
+      }
+    },
+    "100M_single_block_hit_0.99": {
+      "queries": 100000000,
+      "expected_payload_gets": 1000000.0000000009,
+      "expected_all_r2_gets": 1000000.0000000009,
+      "expected_fetched_bytes": 65536000000.00006,
+      "api_requests": 100000000,
+      "r2_storage_usd": 0.0,
+      "r2_read_operations_usd": 0.0,
+      "r2_retrieval_usd": 0,
+      "worker_usd": 41.4,
+      "estimated_monthly_total_usd": 41.4,
+      "assumptions": {
+        "blocks_per_position": 1,
+        "block_hit_rate": 0.99,
+        "positions_per_payload_get": 1,
+        "metadata_gets_per_position": 0,
+        "fetched_bytes_per_get": 65536,
+        "storage_class": "standard",
+        "positions_per_api_request": 1,
+        "worker_cpu_ms_per_api_request": 5
+      }
+    },
+    "100M_four_blocks_hit_99pct": {
+      "queries": 100000000,
+      "expected_payload_gets": 4000000.0000000037,
+      "expected_all_r2_gets": 4000000.0000000037,
+      "expected_fetched_bytes": 262144000000.00024,
+      "api_requests": 100000000,
+      "r2_storage_usd": 0.0,
+      "r2_read_operations_usd": 0.0,
+      "r2_retrieval_usd": 0,
+      "worker_usd": 41.4,
+      "estimated_monthly_total_usd": 41.4,
+      "assumptions": {
+        "blocks_per_position": 4,
+        "block_hit_rate": 0.99,
+        "positions_per_payload_get": 1,
+        "metadata_gets_per_position": 0,
+        "fetched_bytes_per_get": 65536,
+        "storage_class": "standard",
+        "positions_per_api_request": 1,
+        "worker_cpu_ms_per_api_request": 5
+      }
+    },
+    "100M_batched_32_positions": {
+      "queries": 100000000,
+      "expected_payload_gets": 1000000.0000000009,
+      "expected_all_r2_gets": 1000000.0000000009,
+      "expected_fetched_bytes": 65536000000.00006,
+      "api_requests": 3125000,
+      "r2_storage_usd": 0.0,
+      "r2_read_operations_usd": 0.0,
+      "r2_retrieval_usd": 0,
+      "worker_usd": 10.65,
+      "estimated_monthly_total_usd": 10.65,
+      "assumptions": {
+        "blocks_per_position": 1,
+        "block_hit_rate": 0.99,
+        "positions_per_payload_get": 1,
+        "metadata_gets_per_position": 0,
+        "fetched_bytes_per_get": 65536,
+        "storage_class": "standard",
+        "positions_per_api_request": 32,
+        "worker_cpu_ms_per_api_request": 100
+      }
+    }
+  },
+  "marginal_one_required_block": [
+    {
+      "cache_hit_rate": 0,
+      "r2_gets_per_million_positions": 1000000.0,
+      "r2_standard_read_usd_before_free_tier": 0.36
+    },
+    {
+      "cache_hit_rate": 0.9,
+      "r2_gets_per_million_positions": 99999.99999999997,
+      "r2_standard_read_usd_before_free_tier": 0.03599999999999999
+    },
+    {
+      "cache_hit_rate": 0.99,
+      "r2_gets_per_million_positions": 10000.00000000001,
+      "r2_standard_read_usd_before_free_tier": 0.003600000000000003
+    },
+    {
+      "cache_hit_rate": 0.999,
+      "r2_gets_per_million_positions": 1000.0000000000009,
+      "r2_standard_read_usd_before_free_tier": 0.0003600000000000003
+    }
+  ],
+  "ia_storage_vs_standard_retrieval_break_even_fraction": 0.5,
+  "warning": "Examples exclude data storage unless supplied, writes, logging, other infrastructure and deployment work. Metadata assumed warm and free allowances available. A full chess probe can need several dependent blocks. IA input must reflect billable retrieval bytes, not merely logical result size. R2 unit rounding is modelled; Workers uses stated unit rates. No latency or hit-rate promise.",
+  "sources": [
+    "https://developers.cloudflare.com/r2/pricing/",
+    "https://developers.cloudflare.com/workers/platform/pricing/"
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "status": "pass",
+  "material": "KQvKR",
+  "native_slots": 3822504,
+  "published_syzygy_bytes": 20496,
+  "sweep": [
+    {
+      "page_positions": 4096,
+      "archive_object_bytes": 76405,
+      "outer_manifest_bytes": 406,
+      "index_bytes": 14944,
+      "encode_seconds": 2.8968213379998815,
+      "representative_frame_bytes": 133,
+      "representative_decode_median_ms": 0.06258400026126765,
+      "representative_decode_p95_ms": 0.1871415001915011,
+      "full_stream_verified": true
+    },
+    {
+      "page_positions": 16384,
+      "archive_object_bytes": 37898,
+      "outer_manifest_bytes": 406,
+      "index_bytes": 3744,
+      "encode_seconds": 2.7463758900003086,
+      "representative_frame_bytes": 140,
+      "representative_decode_median_ms": 0.13772700003755745,
+      "representative_decode_p95_ms": 0.2438169999550155,
+      "full_stream_verified": true
+    },
+    {
+      "page_positions": 65536,
+      "archive_object_bytes": 22242,
+      "outer_manifest_bytes": 404,
+      "index_bytes": 944,
+      "encode_seconds": 2.1842837979997967,
+      "representative_frame_bytes": 180,
+      "representative_decode_median_ms": 0.6794230002924451,
+      "representative_decode_p95_ms": 0.8506555000167282,
+      "full_stream_verified": true
+    },
+    {
+      "page_positions": 262144,
+      "archive_object_bytes": 16776,
+      "outer_manifest_bytes": 405,
+      "index_bytes": 240,
+      "encode_seconds": 2.602013276999969,
+      "representative_frame_bytes": 767,
+      "representative_decode_median_ms": 2.034972999808815,
+      "representative_decode_p95_ms": 2.7344859997811,
+      "full_stream_verified": true
+    },
+    {
+      "page_positions": 1048576,
+      "archive_object_bytes": 14661,
+      "outer_manifest_bytes": 404,
+      "index_bytes": 64,
+      "encode_seconds": 2.2119040689999565,
+      "representative_frame_bytes": 3698,
+      "representative_decode_median_ms": 9.496855999714171,
+      "representative_decode_p95_ms": 10.188776999939364,
+      "full_stream_verified": true
+    }
+  ],
+  "live_r2_tested": false,
+  "caveat": "Archives omit chess indexing metadata and capture-probing semantics. CPU decode is local; not cloud latency. Large pages can reduce bytes while increasing cache footprint and decode cost."
+}
