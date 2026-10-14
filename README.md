@@ -2,7 +2,8 @@
 
 This repository makes exact tables for pawnless chess endgames.
 A table gives the result of each position with best play: win, draw or loss.
-It also gives a proof rank, which is the distance to mate in plies.
+It also gives a proof rank: the number of plies to checkmate, or to a capture
+into a table with fewer pieces.
 
 The solver runs on one NVIDIA H100 GPU. A CPU solver gives the same tables
 for comparison. A separate program checks each table against the published
@@ -23,7 +24,7 @@ The `verify_pawnless` program makes these checks on each position:
 
 - The legality of the position agrees with shakmaty.
 - The win, draw or loss agrees with the Syzygy WDL value.
-- The proof rank agrees with the ranks of the next positions.
+- The proof rank is exact. The program calculates it again from the ranks of the next positions.
 
 Thus a table cannot pass with a wrong result or with a wrong rank.
 
