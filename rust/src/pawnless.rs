@@ -594,7 +594,7 @@ pub struct FileHeader {
 }
 
 const DIGEST_CHUNK: usize = 16 << 20;
-const DIGEST_TREE: &str = "sha256-tree-16MiB";
+pub const DIGEST_TREE: &str = "sha256-tree-16MiB";
 
 /// Payload digest under `scheme`, computed in parallel for the tree scheme.
 pub fn payload_digest(payload: &[u8], scheme: &str) -> Result<String> {

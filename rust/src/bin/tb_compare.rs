@@ -1,10 +1,9 @@
-//! Compare the valid/win/loss planes of two pawnless table files.
-use std::{fs::File, io::BufReader};
-use tablebase_core::pawnless::Table;
+//! Compare the valid/win/loss planes and proof ranks of two pawnless table
+//! files of any format version.
+use tablebase_core::{packed::load_table, pawnless::Table};
 
 fn load(path: &str) -> Result<Table, String> {
-    let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(Table::read(BufReader::new(file))?.0)
+    Ok(load_table(path.as_ref(), 24)?.0)
 }
 
 fn main() -> Result<(), String> {
