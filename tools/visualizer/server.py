@@ -49,8 +49,12 @@ GZIP_MIN = 200
 
 
 class TableFormatError(ValueError):
-    def __init__(self, path: Path) -> None:
-        super().__init__(f"{path}: not a pawnless table file")
+    def __init__(self, path: Path, reason: str = "not a pawnless table file") -> None:
+        super().__init__(f"{path}: {reason}")
+
+
+# Section codecs that the viewer decodes. The Rust reader also decodes `cm`.
+CODECS = ("zstd", "lzma")
 
 
 def skeleton(name: str) -> list[tuple[bool, int]]:
@@ -254,10 +258,12 @@ class BlockCache:
             self.misses += 1
         if codec == "lzma":
             block = lzma.LZMADecompressor(lzma.FORMAT_ALONE).decompress(frame, max_length=size)
-        else:
+        elif codec == "zstd":
             if not hasattr(self.local, "zstd"):
                 self.local.zstd = zstandard.ZstdDecompressor()
             block = self.local.zstd.decompress(frame, max_output_size=size)
+        else:
+            raise TableFormatError(Path(str(key[0])), f"codec {codec} is not supported")
         if len(block) != size:
             raise TableFormatError(Path(str(key[0])))
         with self.lock:
@@ -304,7 +310,11 @@ class PackedTable(Layout):
             at = 16 + length + s["offset"]
             index = np.frombuffer(view[at : at + 8 * (s["blocks"] + 1)], dtype="<u8")
             frames = at + 8 * (s["blocks"] + 1)
-            self.sections[s["name"]] = (frames, index, s["raw_bytes"], s.get("codec", "zstd"))
+            codec = s.get("codec", "zstd")
+            if codec not in CODECS:
+                reason = f"the viewer cannot decode codec {codec}. Use tb_pack with zstd or lzma"
+                raise TableFormatError(path, reason)
+            self.sections[s["name"]] = (frames, index, s["raw_bytes"], codec)
         self.view = view
 
     def _mapped(self, g: int, squares: list[int]) -> list[int]:
