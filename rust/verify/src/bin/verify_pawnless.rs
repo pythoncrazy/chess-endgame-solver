@@ -247,9 +247,9 @@ fn check_position(
         return Err(format!("value {value} has no proof rank"));
     }
     let moves = pos.legal_moves();
-    // The rank is the solver round: a win is one more than its fastest child
-    // that is a loss, and a loss is one more than its slowest child. A child in
-    // a lower material counts as 0. Thus a rank is the distance to mate in
+    // The rank is the solver round. A win is one more than its fastest child
+    // that is a loss. A loss is one more than its slowest child. A child in a
+    // lower material counts as 0. Thus a rank is the distance to mate in
     // plies, if no capture is on the path. Over all children, find the fastest
     // loss, the slowest child, and any child that is not a win. The loop stops
     // when the obligation fails. The stored image of a skipped child and the
