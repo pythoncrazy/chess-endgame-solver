@@ -1,2 +1,9 @@
+# Build output, environments and caches
+target/
+.venv/
 __pycache__/
 *.pyc
+.ruff_cache/
+
+# Scratch scripts and outputs
+/tmp/

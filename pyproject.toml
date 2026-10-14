@@ -1,0 +1,31 @@
+[project]
+name = "chess-endgame-tools"
+version = "0.1.0"
+description = "Python tools for the pawnless endgame tables: the viewer, checks and reference downloads."
+requires-python = ">=3.12"
+dependencies = [
+  "chess==1.11.2",
+  "numpy>=2.3",
+  "zstandard>=0.25",
+]
+
+[dependency-groups]
+dev = [
+  "ruff==0.17.0",
+  "playwright>=1.64",
+  "prek>=0.5.5",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+include = ["tools/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "C4", "PL", "S", "BLE", "TRY", "PTH", "N"]
+ignore = [
+  "PLR2004", # chess constants (for example, halfmove limits) are clearer inline
+]

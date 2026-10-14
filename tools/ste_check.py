@@ -12,7 +12,7 @@ rules that a program can check:
 Approved meanings, parts of speech and noun clusters must have a human review.
 This tool does not certify compliance.
 
-Usage: python tools/ste_check.py [PATH...]
+Usage: uv run tools/ste_check.py [PATH...]
 """
 
 from __future__ import annotations
@@ -360,7 +360,7 @@ def main(argv: list[str]) -> int:
     count = 0
     for path in tracked(argv or ["."]):
         licence = path.name.startswith(("OFL", "LICENSE"))
-        if licence or path.name == "Cargo.lock" or "reference_directory_listings" in path.parts:
+        if licence or path.name == "Cargo.lock":
             continue
         text = path.read_text(encoding="utf-8")
         for unit in EXTRACT[SUFFIXES[path.suffix]](str(path), text):

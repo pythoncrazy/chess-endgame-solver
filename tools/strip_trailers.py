@@ -3,9 +3,9 @@
 The repository has one author. A commit message must not have co-author or tool lines.
 
 Usage:
-    python tools/strip_trailers.py MESSAGE_FILE    (commit-msg hook: edit the file)
-    python tools/strip_trailers.py --check REV_RANGE    (CI: fail if a commit has one)
-    python tools/strip_trailers.py --check-text FILE    (CI: fail if a text has one)
+    uv run tools/strip_trailers.py MESSAGE_FILE    (commit-msg hook: edit the file)
+    uv run tools/strip_trailers.py --check REV_RANGE    (CI: fail if a commit has one)
+    uv run tools/strip_trailers.py --check-text FILE    (CI: fail if a text has one)
 """
 
 from __future__ import annotations

@@ -4,7 +4,7 @@ This path shares no code with the Rust solver or the shakmaty-based verifier.
 The numpy and zstandard packages read the .tbp/.tbz files. The python-chess package
 judges legality and probes Syzygy.
 
-Usage: python -I tools/visualizer/test_store.py TABLE_DIR SYZYGY_DIR [SAMPLES]
+Usage: uv run tools/visualizer/test_store.py TABLE_DIR SYZYGY_DIR [SAMPLES]
 """
 
 from __future__ import annotations
