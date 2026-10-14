@@ -4,6 +4,7 @@ pub mod codec;
 pub mod dense6;
 pub mod encode;
 pub mod fiber;
+pub mod pawnless;
 pub mod range_cache;
 pub mod retrograde;
 
