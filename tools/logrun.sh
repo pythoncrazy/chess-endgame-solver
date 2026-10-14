@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: logrun.sh NAME CMD... ; saves stdout, stderr, exit status and command to $TB_ROOT/logs/NAME.*
 set -u
-TB_ROOT=${TB_ROOT:-/home/supersketchy/git/chess-solver/tb}
+TB_ROOT=${TB_ROOT:?set TB_ROOT to the data directory}
 name=$1; shift
 log=$TB_ROOT/logs/$name
 printf '%q ' "$@" > "$log.cmd"; echo >> "$log.cmd"
