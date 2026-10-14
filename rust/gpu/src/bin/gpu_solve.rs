@@ -294,7 +294,9 @@ mod kernel {
 
     /// One round. MODE 0 seeds checkmates; MODE 1 commits wins and losses
     /// derived from `input` into `output` (the same buffer when in place).
-    #[cutile::entry()]
+    // Occupancy 8 measured fastest on the H100 NVL (4: 50.6 ms, 8: 42.5 ms,
+    // 16: 53.1 ms, 32: 75.5 ms per KQBvKR sweep).
+    #[cutile::entry(optimization_hints = (sm_90 = (occupancy = 8,),))]
     unsafe fn sweep<const MODE: i32, const RANKED: i32>(
         output: *mut u64,
         counter: *mut i64,
@@ -349,113 +351,137 @@ mod kernel {
         let mut win: Tile<u64, { [64] }> = zero;
         let mut nonwin: Tile<u64, { [64] }> = zero;
         let mut any: Tile<u64, { [64] }> = zero;
-        // Skeleton moves: only the side to move's pieces, each role's own rays.
-        for i in 0i32..m {
-            let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
-            if white == mover_white {
-                let role: i32 = unsafe { scalar_at(meta, 8i32 + 4i32 * i) };
-                let dirs: i32 = unsafe { scalar_at(meta, 10i32 + 4i32 * i) };
-                let slides: i32 = unsafe { scalar_at(meta, 11i32 + 4i32 * i) };
-                let shift: Tile<i64, { [64] }> = i64s(6i32 * (m - 1i32 - i));
-                let sq: Tile<i64, { [64] }> = (w >> shift) & sixty_three;
-                let file: Tile<i64, { [64] }> = sq & seven_i;
-                let rank: Tile<i64, { [64] }> = sq >> three_i;
-                for d in 0i32..dirs {
-                    let df: Tile<i64, { [64] }> =
-                        i64s(unsafe { scalar_at(meta, 64i32 + 16i32 * role + 2i32 * d) });
-                    let dr: Tile<i64, { [64] }> =
-                        i64s(unsafe { scalar_at(meta, 65i32 + 16i32 * role + 2i32 * d) });
-                    let mut alive: Tile<u64, { [64] }> = ones;
-                    let mut path: Tile<u64, { [64] }> = zero;
-                    for k in 1i32..(2i32 + 6i32 * slides) {
-                        let kt: Tile<i64, { [64] }> = i64s(k);
-                        let tf: Tile<i64, { [64] }> = file + df * kt;
-                        let tr: Tile<i64, { [64] }> = rank + dr * kt;
-                        alive = alive
-                            & lanes(ge_tile(tf, zero_i))
-                            & lanes(lt_tile(tf, eight_i))
-                            & lanes(ge_tile(tr, zero_i))
-                            & lanes(lt_tile(tr, eight_i));
-                        let t: Tile<i64, { [64] }> = (tr * eight_i + tf) & sixty_three;
-                        let tbit: Tile<u64, { [64] }> = one << bitcast(t);
-                        let hit_own: Tile<u64, { [64] }> = lanes(ne_tile(blockers & tbit, zero));
-                        let hit_enemy: Tile<u64, { [64] }> = lanes(ne_tile(enemy & tbit, zero));
-                        let moving: Tile<u64, { [64] }> = alive & (hit_own ^ ones);
-                        let quiet: Tile<u64, { [64] }> = moving & (hit_enemy ^ ones);
-                        let capture: Tile<u64, { [64] }> = moving & hit_enemy;
-                        let moved: Tile<i64, { [64] }> = w + ((t - sq) << shift);
-                        let qp: Tile<u64, { [64, 2] }> =
-                            unsafe { gather_pair(input, moved ^ stm_bit, quiet) };
-                        // Captured skeleton piece j: its lower table is the record
-                        // range (j - 1) * lower_words, indexed without piece j.
-                        let mut j_t: Tile<i64, { [64] }> = zero_i;
-                        for j in 1i32..m {
-                            let jj: Tile<i64, { [64] }> = i64s(j);
-                            let sq_j: Tile<i64, { [64] }> =
-                                (w >> i64s(6i32 * (m - 1i32 - j))) & sixty_three;
-                            j_t = select(eq_tile(sq_j, t), jj, j_t);
-                        }
-                        let low_shift: Tile<i64, { [64] }> = six_i * (m_t - one_i - j_t);
-                        let low_mask: Tile<i64, { [64] }> = (one_i << low_shift) - one_i;
-                        let hi: Tile<i64, { [64] }> = moved >> (low_shift + six_i);
-                        let low_word: Tile<i64, { [64] }> =
-                            ((hi << low_shift) | (moved & low_mask)) ^ lower_stm_bit;
-                        let lower_index: Tile<i64, { [64] }> =
-                            (j_t - one_i) * lower_words + low_word;
-                        let lp: Tile<u64, { [64, 2] }> =
-                            unsafe { gather_pair(lower, lower_index, capture) };
-                        let cw: Tile<u64, { [64] }> = pair_part(qp, 0i64) | pair_part(lp, 0i64);
-                        let cl: Tile<u64, { [64] }> = pair_part(qp, 1i64) | pair_part(lp, 1i64);
-                        let mask: Tile<u64, { [64] }> = ((path | tbit) ^ ones) & (quiet | capture);
-                        win = win | (cl & (cw ^ ones) & mask);
-                        nonwin = nonwin | ((cw ^ ones) & mask);
-                        any = any | (((cw & cl) ^ ones) & mask);
-                        path = path | (tbit & alive);
-                        alive = alive & (lanes(ne_tile(occ & tbit, zero)) ^ ones);
-                    }
-                }
-            }
-        }
-        // Black king moves inside the word, and black king captures.
-        if black_to_move == 1i32 {
-            let cp: Tile<u64, { [64, 2] }> = unsafe { gather_pair(input, w ^ stm_bit, ones) };
-            let cw: Tile<u64, { [64] }> = pair_part(cp, 0i64);
-            let cl: Tile<u64, { [64] }> = pair_part(cp, 1i64);
-            win = win | king_reach(cl & (cw ^ ones));
-            nonwin = nonwin | king_reach(cw ^ ones);
-            any = any | king_reach((cw & cl) ^ ones);
-            for j in 1i32..m {
-                let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * j) };
-                if white == 1i32 {
-                    let low_shift: Tile<i64, { [64] }> = i64s(6i32 * (m - 1i32 - j));
-                    let t: Tile<i64, { [64] }> = (w >> low_shift) & sixty_three;
-                    let low_mask: Tile<i64, { [64] }> = (one_i << low_shift) - one_i;
-                    let hi: Tile<i64, { [64] }> = w >> (low_shift + six_i);
-                    let low_word: Tile<i64, { [64] }> =
-                        ((hi << low_shift) | (w & low_mask)) ^ lower_stm_bit;
-                    let lower_index: Tile<i64, { [64] }> = i64s(j - 1i32) * lower_words + low_word;
-                    let lp: Tile<u64, { [64, 2] }> =
-                        unsafe { gather_pair(lower, lower_index, ones) };
-                    let lw: Tile<u64, { [64] }> = pair_part(lp, 0i64);
-                    let ll: Tile<u64, { [64] }> = pair_part(lp, 1i64);
-                    let tu: Tile<u64, { [64] }> = bitcast(t);
-                    let sources: Tile<u64, { [64] }> = king_reach(one << tu);
-                    let bit_l: Tile<u64, { [64] }> =
-                        lanes(ne_tile(((ll & (lw ^ ones)) >> tu) & one, zero));
-                    let bit_n: Tile<u64, { [64] }> =
-                        lanes(ne_tile(((lw ^ ones) >> tu) & one, zero));
-                    let bit_v: Tile<u64, { [64] }> =
-                        lanes(ne_tile((((lw & ll) ^ ones) >> tu) & one, zero));
-                    win = win | (sources & bit_l);
-                    nonwin = nonwin | (sources & bit_n);
-                    any = any | (sources & bit_v);
-                }
-            }
-        }
         let op: Tile<u64, { [64, 2] }> = unsafe { gather_pair(input, w, ones) };
         let old_win: Tile<u64, { [64] }> = pair_part(op, 0i64);
         let old_loss: Tile<u64, { [64] }> = pair_part(op, 1i64);
         let valid: Tile<u64, { [64] }> = (old_win & old_loss) ^ ones;
+        // A block whose positions are all decided (or illegal) cannot change:
+        // skip its move generation. The seed round always runs.
+        let open: Tile<i64, { [64] }> =
+            select(ne_tile((old_win | old_loss) ^ ones, zero), one_i, zero_i);
+        let open: Tile<i64, { [] }> = reduce_sum(open, 0);
+        let mut pending: i64 = tile_to_scalar(open);
+        if MODE == 0 {
+            pending = 1i64;
+        }
+        if pending > 0i64 {
+            // Skeleton moves: only the side to move's pieces, each role's own rays.
+            for i in 0i32..m {
+                let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
+                if white == mover_white {
+                    let role: i32 = unsafe { scalar_at(meta, 8i32 + 4i32 * i) };
+                    let dirs: i32 = unsafe { scalar_at(meta, 10i32 + 4i32 * i) };
+                    let slides: i32 = unsafe { scalar_at(meta, 11i32 + 4i32 * i) };
+                    let shift: Tile<i64, { [64] }> = i64s(6i32 * (m - 1i32 - i));
+                    let sq: Tile<i64, { [64] }> = (w >> shift) & sixty_three;
+                    let file: Tile<i64, { [64] }> = sq & seven_i;
+                    let rank: Tile<i64, { [64] }> = sq >> three_i;
+                    for d in 0i32..dirs {
+                        let df: Tile<i64, { [64] }> =
+                            i64s(unsafe { scalar_at(meta, 64i32 + 16i32 * role + 2i32 * d) });
+                        let dr: Tile<i64, { [64] }> =
+                            i64s(unsafe { scalar_at(meta, 65i32 + 16i32 * role + 2i32 * d) });
+                        let mut alive: Tile<u64, { [64] }> = ones;
+                        let mut path: Tile<u64, { [64] }> = zero;
+                        for k in 1i32..(2i32 + 6i32 * slides) {
+                            let kt: Tile<i64, { [64] }> = i64s(k);
+                            let tf: Tile<i64, { [64] }> = file + df * kt;
+                            let tr: Tile<i64, { [64] }> = rank + dr * kt;
+                            alive = alive
+                                & lanes(ge_tile(tf, zero_i))
+                                & lanes(lt_tile(tf, eight_i))
+                                & lanes(ge_tile(tr, zero_i))
+                                & lanes(lt_tile(tr, eight_i));
+                            let t: Tile<i64, { [64] }> = (tr * eight_i + tf) & sixty_three;
+                            let tbit: Tile<u64, { [64] }> = one << bitcast(t);
+                            let hit_own: Tile<u64, { [64] }> =
+                                lanes(ne_tile(blockers & tbit, zero));
+                            let hit_enemy: Tile<u64, { [64] }> = lanes(ne_tile(enemy & tbit, zero));
+                            let moving: Tile<u64, { [64] }> = alive & (hit_own ^ ones);
+                            let quiet: Tile<u64, { [64] }> = moving & (hit_enemy ^ ones);
+                            let capture: Tile<u64, { [64] }> = moving & hit_enemy;
+                            let moved: Tile<i64, { [64] }> = w + ((t - sq) << shift);
+                            let qp: Tile<u64, { [64, 2] }> =
+                                unsafe { gather_pair(input, moved ^ stm_bit, quiet) };
+                            let mut cw: Tile<u64, { [64] }> = pair_part(qp, 0i64);
+                            let mut cl: Tile<u64, { [64] }> = pair_part(qp, 1i64);
+                            // Captures are rare: do the capture work only when some
+                            // lane of the block captures on this step.
+                            let captures: Tile<i64, { [64] }> =
+                                select(ne_tile(capture, zero), one_i, zero_i);
+                            let captures: Tile<i64, { [] }> = reduce_sum(captures, 0);
+                            let captures: i64 = tile_to_scalar(captures);
+                            if captures > 0i64 {
+                                // Captured skeleton piece j: its lower table is the
+                                // record range (j - 1) * lower_words, without piece j.
+                                let mut j_t: Tile<i64, { [64] }> = zero_i;
+                                for j in 1i32..m {
+                                    let jj: Tile<i64, { [64] }> = i64s(j);
+                                    let sq_j: Tile<i64, { [64] }> =
+                                        (w >> i64s(6i32 * (m - 1i32 - j))) & sixty_three;
+                                    j_t = select(eq_tile(sq_j, t), jj, j_t);
+                                }
+                                let low_shift: Tile<i64, { [64] }> = six_i * (m_t - one_i - j_t);
+                                let low_mask: Tile<i64, { [64] }> = (one_i << low_shift) - one_i;
+                                let hi: Tile<i64, { [64] }> = moved >> (low_shift + six_i);
+                                let low_word: Tile<i64, { [64] }> =
+                                    ((hi << low_shift) | (moved & low_mask)) ^ lower_stm_bit;
+                                let lower_index: Tile<i64, { [64] }> =
+                                    (j_t - one_i) * lower_words + low_word;
+                                let lp: Tile<u64, { [64, 2] }> =
+                                    unsafe { gather_pair(lower, lower_index, capture) };
+                                cw = cw | pair_part(lp, 0i64);
+                                cl = cl | pair_part(lp, 1i64);
+                            }
+                            let mask: Tile<u64, { [64] }> =
+                                ((path | tbit) ^ ones) & (quiet | capture);
+                            win = win | (cl & (cw ^ ones) & mask);
+                            nonwin = nonwin | ((cw ^ ones) & mask);
+                            any = any | (((cw & cl) ^ ones) & mask);
+                            path = path | (tbit & alive);
+                            alive = alive & (lanes(ne_tile(occ & tbit, zero)) ^ ones);
+                        }
+                    }
+                }
+            }
+            // Black king moves inside the word, and black king captures.
+            if black_to_move == 1i32 {
+                let cp: Tile<u64, { [64, 2] }> = unsafe { gather_pair(input, w ^ stm_bit, ones) };
+                let cw: Tile<u64, { [64] }> = pair_part(cp, 0i64);
+                let cl: Tile<u64, { [64] }> = pair_part(cp, 1i64);
+                win = win | king_reach(cl & (cw ^ ones));
+                nonwin = nonwin | king_reach(cw ^ ones);
+                any = any | king_reach((cw & cl) ^ ones);
+                for j in 1i32..m {
+                    let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * j) };
+                    if white == 1i32 {
+                        let low_shift: Tile<i64, { [64] }> = i64s(6i32 * (m - 1i32 - j));
+                        let t: Tile<i64, { [64] }> = (w >> low_shift) & sixty_three;
+                        let low_mask: Tile<i64, { [64] }> = (one_i << low_shift) - one_i;
+                        let hi: Tile<i64, { [64] }> = w >> (low_shift + six_i);
+                        let low_word: Tile<i64, { [64] }> =
+                            ((hi << low_shift) | (w & low_mask)) ^ lower_stm_bit;
+                        let lower_index: Tile<i64, { [64] }> =
+                            i64s(j - 1i32) * lower_words + low_word;
+                        let lp: Tile<u64, { [64, 2] }> =
+                            unsafe { gather_pair(lower, lower_index, ones) };
+                        let lw: Tile<u64, { [64] }> = pair_part(lp, 0i64);
+                        let ll: Tile<u64, { [64] }> = pair_part(lp, 1i64);
+                        let tu: Tile<u64, { [64] }> = bitcast(t);
+                        let sources: Tile<u64, { [64] }> = king_reach(one << tu);
+                        let bit_l: Tile<u64, { [64] }> =
+                            lanes(ne_tile(((ll & (lw ^ ones)) >> tu) & one, zero));
+                        let bit_n: Tile<u64, { [64] }> =
+                            lanes(ne_tile(((lw ^ ones) >> tu) & one, zero));
+                        let bit_v: Tile<u64, { [64] }> =
+                            lanes(ne_tile((((lw & ll) ^ ones) >> tu) & one, zero));
+                        win = win | (sources & bit_l);
+                        nonwin = nonwin | (sources & bit_n);
+                        any = any | (sources & bit_v);
+                    }
+                }
+            }
+        }
         let mut new_win: Tile<u64, { [64] }> = old_win | (win & valid);
         let mut new_loss: Tile<u64, { [64] }> = old_loss | (valid & any & (nonwin ^ ones));
         if MODE == 0 {
