@@ -48,6 +48,15 @@ mod kernel {
         select(condition, ones, zero)
     }
 
+    /// `1 << square` as a scalar bitboard.
+    fn square_bit(square: i32) -> u64 {
+        let s: Tile<i32, { [] }> = scalar_to_tile(square);
+        let s: Tile<i64, { [] }> = exti(s);
+        let s: Tile<u64, { [] }> = bitcast(s);
+        let one: Tile<u64, { [] }> = scalar_to_tile(1u64);
+        tile_to_scalar(one << s)
+    }
+
     fn i64s(value: i32) -> Tile<i64, { [64] }> {
         let t: Tile<i32, { [64] }> = broadcast_scalar(value, shape![64]);
         exti(t)
@@ -288,6 +297,203 @@ mod kernel {
                 Latency::<0>,
             )
         };
+    }
+
+    // Half-split tiles: element 2 * lane + half, half 0 = black king squares 0..32.
+    fn col_index() -> Tile<i32, { [128] }> {
+        let e: Tile<i32, { [128] }> = iota(shape![128]);
+        e & constant(1i32, shape![128])
+    }
+
+    fn row_index() -> Tile<i32, { [128] }> {
+        let e: Tile<i32, { [128] }> = iota(shape![128]);
+        e >> constant(1i32, shape![128])
+    }
+
+    fn i32h(value: i32) -> Tile<i32, { [128] }> {
+        broadcast_scalar(value, shape![128])
+    }
+
+    fn i64h(value: i32) -> Tile<i64, { [128] }> {
+        exti(i32h(value))
+    }
+
+    fn lanes_h(condition: Tile<bool, { [128] }>) -> Tile<u32, { [128] }> {
+        let zero: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+        let one: Tile<u32, { [128] }> = constant(1u32, shape![128]);
+        select(condition, zero - one, zero)
+    }
+
+    /// `1 << (square & 31)` as a u32 scalar.
+    fn bit32(square: i32) -> u32 {
+        let s: Tile<i32, { [] }> = scalar_to_tile(square & 31i32);
+        let s: Tile<u32, { [] }> = bitcast(s);
+        let one: Tile<u32, { [] }> = scalar_to_tile(1u32);
+        tile_to_scalar(one << s)
+    }
+
+    /// Low and high halves of `1 << square` (zero off the board).
+    fn lo_bit(square: i32) -> u32 {
+        if square < 32i32 { bit32(square) } else { 0u32 }
+    }
+
+    fn hi_bit(square: i32) -> u32 {
+        let mut b: u32 = 0u32;
+        if square >= 32i32 {
+            if square < 64i32 {
+                b = bit32(square);
+            }
+        }
+        b
+    }
+
+    /// Per element, the half `col` of a 64-bit scalar given as halves.
+    fn pick(col: Tile<i32, { [128] }>, lo: u32, hi: u32) -> Tile<u32, { [128] }> {
+        let zero: Tile<i32, { [128] }> = constant(0i32, shape![128]);
+        let lo_t: Tile<u32, { [128] }> = broadcast_scalar(lo, shape![128]);
+        let hi_t: Tile<u32, { [128] }> = broadcast_scalar(hi, shape![128]);
+        select(eq_tile(col, zero), lo_t, hi_t)
+    }
+
+    /// All ones where bit `square` (0..64) of the 64-bit value (lo, hi) is set.
+    fn test_bit(lo: u32, hi: u32, square: Tile<i32, { [128] }>) -> Tile<u32, { [128] }> {
+        let thirty_two: Tile<i32, { [128] }> = constant(32i32, shape![128]);
+        let thirty_one: Tile<i32, { [128] }> = constant(31i32, shape![128]);
+        let lo_t: Tile<u32, { [128] }> = broadcast_scalar(lo, shape![128]);
+        let hi_t: Tile<u32, { [128] }> = broadcast_scalar(hi, shape![128]);
+        let v: Tile<u32, { [128] }> = select(lt_tile(square, thirty_two), lo_t, hi_t);
+        let sh: Tile<u32, { [128] }> = bitcast(square & thirty_one);
+        let one: Tile<u32, { [128] }> = constant(1u32, shape![128]);
+        let zero: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+        lanes_h(ne_tile((v >> sh) & one, zero))
+    }
+
+    /// Half `col` of the bitboard `1 << square` (square on the board).
+    fn half_bit(square: Tile<i32, { [128] }>, col: Tile<i32, { [128] }>) -> Tile<u32, { [128] }> {
+        let five: Tile<i32, { [128] }> = constant(5i32, shape![128]);
+        let thirty_one: Tile<i32, { [128] }> = constant(31i32, shape![128]);
+        let one: Tile<u32, { [128] }> = constant(1u32, shape![128]);
+        let zero: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+        let sh: Tile<u32, { [128] }> = bitcast(square & thirty_one);
+        select(eq_tile(square >> five, col), one << sh, zero)
+    }
+
+    /// Both u32 halves of each lane, low half first.
+    fn halves(x: Tile<u64, { [64] }>) -> Tile<u32, { [128] }> {
+        let x2: Tile<u64, { [64, 2] }> = x.reshape(shape![64, 1]).broadcast(shape![64, 2]);
+        let c: Tile<u64, { [2] }> = iota(shape![2]);
+        let c: Tile<u64, { [64, 2] }> = c.reshape(shape![1, 2]).broadcast(shape![64, 2]);
+        let thirty_two: Tile<u64, { [64, 2] }> = constant(32u64, shape![64, 2]);
+        let low: Tile<u64, { [64, 2] }> = constant(0xffff_ffffu64, shape![64, 2]);
+        let h: Tile<u32, { [64, 2] }> =
+            trunci((x2 >> (c * thirty_two)) & low, overflow::NoUnsignedWrap);
+        h.reshape(shape![128])
+    }
+
+    fn join(h: Tile<u32, { [128] }>) -> Tile<u64, { [64] }> {
+        let h: Tile<u32, { [64, 2] }> = h.reshape(shape![64, 2]);
+        let wide: Tile<u64, { [64, 2] }> = exti(h);
+        let c: Tile<u64, { [2] }> = iota(shape![2]);
+        let c: Tile<u64, { [64, 2] }> = c.reshape(shape![1, 2]).broadcast(shape![64, 2]);
+        let thirty_two: Tile<u64, { [64, 2] }> = constant(32u64, shape![64, 2]);
+        reduce_sum(wide << (c * thirty_two), 1)
+    }
+
+    fn count_h(mask: Tile<u32, { [128] }>) -> i64 {
+        let zero: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+        let one_i: Tile<i64, { [128] }> = constant(1i64, shape![128]);
+        let zero_i: Tile<i64, { [128] }> = constant(0i64, shape![128]);
+        let n: Tile<i64, { [] }> = reduce_sum(select(ne_tile(mask, zero), one_i, zero_i), 0);
+        tile_to_scalar(n)
+    }
+
+    /// Record of the lower table after skeleton piece `j` is captured on the
+    /// move to `moved`: table j - 1, without piece j, other side to move.
+    fn lower_child(
+        moved: Tile<i64, { [128] }>,
+        j: Tile<i64, { [128] }>,
+        m: Tile<i64, { [128] }>,
+        lower_words: Tile<i64, { [128] }>,
+        lower_stm: Tile<i64, { [128] }>,
+    ) -> Tile<i64, { [128] }> {
+        let one: Tile<i64, { [128] }> = constant(1i64, shape![128]);
+        let six: Tile<i64, { [128] }> = constant(6i64, shape![128]);
+        let low_shift: Tile<i64, { [128] }> = six * (m - one - j);
+        let low_mask: Tile<i64, { [128] }> = (one << low_shift) - one;
+        let hi: Tile<i64, { [128] }> = moved >> (low_shift + six);
+        let low_word: Tile<i64, { [128] }> = ((hi << low_shift) | (moved & low_mask)) ^ lower_stm;
+        (j - one) * lower_words + low_word
+    }
+
+    /// Masked gather of half `col` of record word `part` (0 win, 2 loss) of
+    /// `records` viewed as u32; masked-off lanes yield zero.
+    unsafe fn gather_half(
+        records: *const u32,
+        record: Tile<i64, { [128] }>,
+        col: Tile<i64, { [128] }>,
+        mask: Tile<u32, { [128] }>,
+        part: i64,
+    ) -> Tile<u32, { [128] }> {
+        let zero: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+        let four: Tile<i64, { [128] }> = constant(4i64, shape![128]);
+        let p: Tile<i64, { [128] }> = broadcast_scalar(part, shape![128]);
+        let base: PointerTile<*const u32, { [] }> = pointer_to_tile(records);
+        let base: PointerTile<*const u32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const u32, { [128] }> = base.broadcast(shape![128]);
+        let ptrs: PointerTile<*const u32, { [128] }> = base.offset_tile(record * four + p + col);
+        let loaded: (Tile<u32, { [128] }>, Token) = unsafe {
+            load_ptr_tko(
+                ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(ne_tile(mask, zero)),
+                Some(0u32),
+                None,
+                Latency::<0>,
+            )
+        };
+        loaded.0
+    }
+
+    /// Masked gather of `records` (u32 view) at block `block` (64 records,
+    /// 256 u32) plus per-element `offsets`; masked-off lanes yield zero.
+    unsafe fn gather_block(
+        records: *const u32,
+        block: i32,
+        offsets: Tile<i32, { [128] }>,
+        mask: Tile<u32, { [128] }>,
+    ) -> Tile<u32, { [128] }> {
+        let zero: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+        let b: Tile<i32, { [] }> = scalar_to_tile(block);
+        let b: Tile<i64, { [] }> = exti(b);
+        let per_block: Tile<i64, { [] }> = scalar_to_tile(256i64);
+        let base: PointerTile<*const u32, { [] }> = pointer_to_tile(records);
+        let base: PointerTile<*const u32, { [] }> = base.offset_tile(b * per_block);
+        let base: PointerTile<*const u32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const u32, { [128] }> = base.broadcast(shape![128]);
+        let ptrs: PointerTile<*const u32, { [128] }> = base.offset_tile(offsets);
+        let loaded: (Tile<u32, { [128] }>, Token) = unsafe {
+            load_ptr_tko(
+                ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(ne_tile(mask, zero)),
+                Some(0u32),
+                None,
+                Latency::<0>,
+            )
+        };
+        loaded.0
+    }
+
+    /// Block of the lower table without skeleton piece `j` (1..m-1) that
+    /// block `block` of an m-piece table maps to, other side to move.
+    fn lower_block(block: i32, j: i32, m: i32) -> i32 {
+        let low_shift: i32 = 6i32 * (m - 2i32 - j);
+        let hi: i32 = block >> (low_shift + 6i32);
+        let low: i32 = block & ((1i32 << low_shift) - 1i32);
+        (((hi << low_shift) | low) ^ (1i32 << (6i32 * m - 12i32)))
+            + (j - 1i32) * (1i32 << (6i32 * m - 11i32))
     }
 
     fn sym_square(sym: i32, mut s: Tile<i64, { [64] }>) -> Tile<i64, { [64] }> {
@@ -587,7 +793,7 @@ mod kernel {
     /// valid because neither they nor their children changed last round.
     // Occupancy 8 measured fastest on the H100 NVL (4: 50.6 ms, 8: 42.5 ms,
     // 16: 53.1 ms, 32: 75.5 ms per KQBvKR sweep).
-    #[cutile::entry(optimization_hints = (sm_90 = (occupancy = 8,),))]
+    #[cutile::entry(optimization_hints = (sm_90 = (occupancy = 12, num_worker_warps_per_cta = 2,),))]
     unsafe fn sweep<const MODE: i32, const RANKED: i32>(
         output: *mut u64,
         counter: *mut i64,
@@ -599,6 +805,8 @@ mod kernel {
         round: *const u16,
         dirty: *const i32,
         changed_out: *mut i32,
+        input32: *const u32,
+        lower32: *const u32,
     ) {
         let blk: i32 = block_id();
         let w: Tile<i64, { [64] }> = word_index(blk);
@@ -610,10 +818,7 @@ mod kernel {
             let ones: Tile<u64, { [64] }> = zero - one;
             let zero_i: Tile<i64, { [64] }> = constant(0i64, shape![64]);
             let one_i: Tile<i64, { [64] }> = constant(1i64, shape![64]);
-            let three_i: Tile<i64, { [64] }> = constant(3i64, shape![64]);
             let six_i: Tile<i64, { [64] }> = constant(6i64, shape![64]);
-            let seven_i: Tile<i64, { [64] }> = constant(7i64, shape![64]);
-            let eight_i: Tile<i64, { [64] }> = constant(8i64, shape![64]);
             let sixty_three: Tile<i64, { [64] }> = constant(63i64, shape![64]);
             let m_t: Tile<i64, { [64] }> = i64s(m);
             let stm_shift: Tile<i64, { [64] }> = six_i * m_t;
@@ -623,6 +828,8 @@ mod kernel {
             let lower_words: Tile<i64, { [64] }> = one_i << (stm_shift - six_i + one_i);
             let black_to_move: i32 = (blk >> (6i32 * m - 6i32)) & 1i32;
             let mover_white: i32 = 1i32 - black_to_move;
+            let lower_stm_h: Tile<i64, { [128] }> = i64h(1i32) << i64h(6i32 * m - 6i32);
+            let lower_words_h: Tile<i64, { [128] }> = i64h(2i32) * lower_stm_h;
             let op: Tile<u64, { [64, 2] }> = unsafe { gather_pair(input, w, ones) };
             let old_win: Tile<u64, { [64] }> = pair_part(op, 0i64);
             let old_loss: Tile<u64, { [64] }> = pair_part(op, 1i64);
@@ -636,107 +843,280 @@ mod kernel {
             let mut nonwin: Tile<u64, { [64] }> = zero;
             let mut any: Tile<u64, { [64] }> = zero;
             if count_lanes(live_words) > 0i64 {
-                let mut occ_white: Tile<u64, { [64] }> = zero;
-                let mut occ_black: Tile<u64, { [64] }> = zero;
-                for i in 0i32..m {
-                    let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
-                    let white_l: Tile<u64, { [64] }> = lanes(ne_tile(i64s(white), zero_i));
-                    let sq: Tile<i64, { [64] }> = (w >> i64s(6i32 * (m - 1i32 - i))) & sixty_three;
-                    let bit: Tile<u64, { [64] }> = one << bitcast(sq);
-                    occ_white = occ_white | (bit & white_l);
-                    occ_black = occ_black | (bit & (white_l ^ ones));
+                // Skeleton moves never shift bits across the black king
+                // bitboard, so they run on its 32-bit halves: element 2 * lane
+                // + half of a [128] u32 tile.
+                let col: Tile<i32, { [128] }> = col_index();
+                let col64: Tile<i64, { [128] }> = exti(col);
+                let row: Tile<i32, { [128] }> = row_index();
+                let zero_h: Tile<u32, { [128] }> = constant(0u32, shape![128]);
+                let one_h: Tile<u32, { [128] }> = constant(1u32, shape![128]);
+                let ones_h: Tile<u32, { [128] }> = zero_h - one_h;
+                let zero_i32h: Tile<i32, { [128] }> = constant(0i32, shape![128]);
+                let w_h: Tile<i64, { [128] }> = i64h(blk) * i64h(64i32) + exti(row);
+                let live_h: Tile<u32, { [128] }> = halves(live_words);
+                // Per-element u32 offsets of the win and loss halves of a lane's
+                // record in its block, and the block bit of the side to move.
+                let four_h: Tile<i32, { [128] }> = i32h(4i32);
+                let win_off: Tile<i32, { [128] }> = four_h * row + col;
+                let loss_off: Tile<i32, { [128] }> = win_off + i32h(2i32);
+                let stm_blk: i32 = 1i32 << (6i32 * m - 6i32);
+                let mut win_h: Tile<u32, { [128] }> = zero_h;
+                let mut nonwin_h: Tile<u32, { [128] }> = zero_h;
+                let mut any_h: Tile<u32, { [128] }> = zero_h;
+                // Pieces 0..m-1 stand on the same squares in every lane (lanes
+                // differ in the last piece only): trace their rays with scalars.
+                let last_white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * (m - 1i32)) };
+                let mut occ_lo: u32 = 0u32;
+                let mut occ_hi: u32 = 0u32;
+                let mut own_lo: u32 = 0u32;
+                let mut own_hi: u32 = 0u32;
+                for j in 0i32..(m - 1i32) {
+                    let sq_j: i32 = (blk >> (6i32 * (m - 2i32 - j))) & 63i32;
+                    occ_lo = occ_lo | lo_bit(sq_j);
+                    occ_hi = occ_hi | hi_bit(sq_j);
+                    let white_j: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * j) };
+                    if white_j == mover_white {
+                        own_lo = own_lo | lo_bit(sq_j);
+                        own_hi = own_hi | hi_bit(sq_j);
+                    }
                 }
-                let occ: Tile<u64, { [64] }> = occ_white | occ_black;
-                let own: Tile<u64, { [64] }> = if mover_white == 1i32 {
-                    occ_white
+                // The white king (piece 0) is never captured and always blocks.
+                let wk_sq: i32 = if m > 1i32 {
+                    (blk >> (6i32 * (m - 2i32))) & 63i32
                 } else {
-                    occ_black
+                    64i32
                 };
-                let wk: Tile<i64, { [64] }> = (w >> i64s(6i32 * (m - 1i32))) & sixty_three;
-                let wk_bit: Tile<u64, { [64] }> = one << bitcast(wk);
-                let enemy: Tile<u64, { [64] }> = (occ ^ own) & (wk_bit ^ ones);
-                let blockers: Tile<u64, { [64] }> = own | wk_bit;
-                // Skeleton moves: only the side to move's pieces, each role's own rays.
-                for i in 0i32..m {
+                let block_lo: u32 = own_lo | lo_bit(wk_sq);
+                let block_hi: u32 = own_hi | hi_bit(wk_sq);
+                let enemy_lo: u32 = occ_lo ^ (occ_lo & block_lo);
+                let enemy_hi: u32 = occ_hi ^ (occ_hi & block_hi);
+                for i in 0i32..(m - 1i32) {
                     let white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
                     if white == mover_white {
                         let role: i32 = unsafe { scalar_at(meta, 8i32 + 4i32 * i) };
                         let dirs: i32 = unsafe { scalar_at(meta, 10i32 + 4i32 * i) };
                         let slides: i32 = unsafe { scalar_at(meta, 11i32 + 4i32 * i) };
-                        let shift: Tile<i64, { [64] }> = i64s(6i32 * (m - 1i32 - i));
-                        let sq: Tile<i64, { [64] }> = (w >> shift) & sixty_three;
-                        let file: Tile<i64, { [64] }> = sq & seven_i;
-                        let rank_sq: Tile<i64, { [64] }> = sq >> three_i;
+                        let sq_s: i32 = (blk >> (6i32 * (m - 2i32 - i))) & 63i32;
+                        let shift_h: Tile<i64, { [128] }> = i64h(6i32 * (m - 1i32 - i));
+                        // Lanes whose last piece (an enemy) this piece captures.
+                        let mut cap: Tile<u32, { [128] }> = zero_h;
+                        let mut cap_path: Tile<u32, { [128] }> = zero_h;
                         for d in 0i32..dirs {
-                            let df: Tile<i64, { [64] }> =
-                                i64s(unsafe { scalar_at(meta, 64i32 + 16i32 * role + 2i32 * d) });
-                            let dr: Tile<i64, { [64] }> =
-                                i64s(unsafe { scalar_at(meta, 65i32 + 16i32 * role + 2i32 * d) });
-                            let mut alive: Tile<u64, { [64] }> = live_words;
-                            let mut path: Tile<u64, { [64] }> = zero;
-                            for k in 1i32..(2i32 + 6i32 * slides) {
-                                let kt: Tile<i64, { [64] }> = i64s(k);
-                                let tf: Tile<i64, { [64] }> = file + df * kt;
-                                let tr: Tile<i64, { [64] }> = rank_sq + dr * kt;
-                                alive = alive
-                                    & lanes(ge_tile(tf, zero_i))
-                                    & lanes(lt_tile(tf, eight_i))
-                                    & lanes(ge_tile(tr, zero_i))
-                                    & lanes(lt_tile(tr, eight_i));
-                                let t: Tile<i64, { [64] }> = (tr * eight_i + tf) & sixty_three;
-                                let tbit: Tile<u64, { [64] }> = one << bitcast(t);
-                                let hit_own: Tile<u64, { [64] }> =
-                                    lanes(ne_tile(blockers & tbit, zero));
-                                let hit_enemy: Tile<u64, { [64] }> =
-                                    lanes(ne_tile(enemy & tbit, zero));
-                                let moving: Tile<u64, { [64] }> = alive & (hit_own ^ ones);
-                                if count_lanes(moving) > 0i64 {
-                                    let quiet: Tile<u64, { [64] }> = moving & (hit_enemy ^ ones);
-                                    let capture: Tile<u64, { [64] }> = moving & hit_enemy;
-                                    let moved: Tile<i64, { [64] }> = w + ((t - sq) << shift);
-                                    let qp: Tile<u64, { [64, 2] }> =
-                                        unsafe { gather_pair(input, moved ^ stm_bit, quiet) };
-                                    let mut cw: Tile<u64, { [64] }> = pair_part(qp, 0i64);
-                                    let mut cl: Tile<u64, { [64] }> = pair_part(qp, 1i64);
-                                    // Captures are rare: do the capture work only when some
-                                    // lane of the block captures on this step.
-                                    if count_lanes(capture) > 0i64 {
-                                        // Captured skeleton piece j: its lower table is the
-                                        // record range (j - 1) * lower_words, without piece j.
-                                        let mut j_t: Tile<i64, { [64] }> = zero_i;
-                                        for j in 1i32..m {
-                                            let jj: Tile<i64, { [64] }> = i64s(j);
-                                            let sq_j: Tile<i64, { [64] }> =
-                                                (w >> i64s(6i32 * (m - 1i32 - j))) & sixty_three;
-                                            j_t = select(eq_tile(sq_j, t), jj, j_t);
-                                        }
-                                        let low_shift: Tile<i64, { [64] }> =
-                                            six_i * (m_t - one_i - j_t);
-                                        let low_mask: Tile<i64, { [64] }> =
-                                            (one_i << low_shift) - one_i;
-                                        let hi: Tile<i64, { [64] }> = moved >> (low_shift + six_i);
-                                        let low_word: Tile<i64, { [64] }> = ((hi << low_shift)
-                                            | (moved & low_mask))
-                                            ^ lower_stm_bit;
-                                        let lower_index: Tile<i64, { [64] }> =
-                                            (j_t - one_i) * lower_words + low_word;
-                                        let lp: Tile<u64, { [64, 2] }> =
-                                            unsafe { gather_pair(lower, lower_index, capture) };
-                                        cw = cw | pair_part(lp, 0i64);
-                                        cl = cl | pair_part(lp, 1i64);
-                                    }
-                                    let mask: Tile<u64, { [64] }> =
-                                        ((path | tbit) ^ ones) & (quiet | capture);
-                                    win = win | (cl & (cw ^ ones) & mask);
-                                    nonwin = nonwin | ((cw ^ ones) & mask);
-                                    any = any | (((cw & cl) ^ ones) & mask);
+                            let df: i32 =
+                                unsafe { scalar_at(meta, 64i32 + 16i32 * role + 2i32 * d) };
+                            let dr: i32 =
+                                unsafe { scalar_at(meta, 65i32 + 16i32 * role + 2i32 * d) };
+                            let mut f: i32 = sq_s & 7i32;
+                            let mut r: i32 = sq_s >> 3i32;
+                            let mut alive: i32 = 1i32;
+                            let mut path_lo: u32 = 0u32;
+                            let mut path_hi: u32 = 0u32;
+                            for _k in 1i32..(2i32 + 6i32 * slides) {
+                                f = f + df;
+                                r = r + dr;
+                                if f < 0i32 {
+                                    alive = 0i32;
                                 }
-                                path = path | (tbit & alive);
-                                alive = alive & (lanes(ne_tile(occ & tbit, zero)) ^ ones);
+                                if f > 7i32 {
+                                    alive = 0i32;
+                                }
+                                if r < 0i32 {
+                                    alive = 0i32;
+                                }
+                                if r > 7i32 {
+                                    alive = 0i32;
+                                }
+                                if alive != 0i32 {
+                                    let t_s: i32 = r * 8i32 + f;
+                                    let t_lo: u32 = lo_bit(t_s);
+                                    let t_hi: u32 = hi_bit(t_s);
+                                    if ((block_lo & t_lo) | (block_hi & t_hi)) != 0u32 {
+                                        alive = 0i32;
+                                    } else {
+                                        let reach_lo: u32 = path_lo | t_lo;
+                                        let reach_hi: u32 = path_hi | t_hi;
+                                        let reach: Tile<u32, { [128] }> =
+                                            pick(col, reach_lo, reach_hi);
+                                        // The last piece blocks lanes where it stands on the
+                                        // path; where it stands on t (an enemy) it is captured.
+                                        let free: Tile<u32, { [128] }> =
+                                            live_h & (test_bit(reach_lo, reach_hi, row) ^ ones_h);
+                                        let at_t: Tile<u32, { [128] }> =
+                                            live_h & lanes_h(eq_tile(row, i32h(t_s)));
+                                        cap = cap | at_t;
+                                        cap_path = cap_path | (at_t & reach);
+                                        let captures: i32 =
+                                            if ((enemy_lo & t_lo) | (enemy_hi & t_hi)) != 0u32 {
+                                                1i32
+                                            } else {
+                                                0i32
+                                            };
+                                        // Captures uniform piece j: lower table j - 1.
+                                        let mut jj: i32 = 1i32;
+                                        if captures != 0i32 {
+                                            for j in 1i32..(m - 1i32) {
+                                                let sq_j: i32 =
+                                                    (blk >> (6i32 * (m - 2i32 - j))) & 63i32;
+                                                if sq_j == t_s {
+                                                    jj = j;
+                                                }
+                                            }
+                                        }
+                                        let moved_blk: i32 =
+                                            blk + ((t_s - sq_s) << (6i32 * (m - 2i32 - i)));
+                                        let source: i32 = if captures != 0i32 {
+                                            lower_block(moved_blk, jj, m)
+                                        } else {
+                                            moved_blk ^ stm_blk
+                                        };
+                                        let cw: Tile<u32, { [128] }> = if captures != 0i32 {
+                                            unsafe { gather_block(lower32, source, win_off, free) }
+                                        } else {
+                                            unsafe { gather_block(input32, source, win_off, free) }
+                                        };
+                                        let cl: Tile<u32, { [128] }> = if captures != 0i32 {
+                                            unsafe { gather_block(lower32, source, loss_off, free) }
+                                        } else {
+                                            unsafe { gather_block(input32, source, loss_off, free) }
+                                        };
+                                        if captures != 0i32 {
+                                            alive = 0i32;
+                                        } else {
+                                            path_lo = reach_lo;
+                                            path_hi = reach_hi;
+                                        }
+                                        let mask: Tile<u32, { [128] }> = (reach ^ ones_h) & free;
+                                        win_h = win_h | (cl & (cw ^ ones_h) & mask);
+                                        nonwin_h = nonwin_h | ((cw ^ ones_h) & mask);
+                                        any_h = any_h | (((cw & cl) ^ ones_h) & mask);
+                                    }
+                                }
+                            }
+                        }
+                        if last_white != mover_white {
+                            if count_h(cap) > 0i64 {
+                                // The last piece is captured: lower table m - 2.
+                                let moved: Tile<i64, { [128] }> =
+                                    w_h + (exti(row - i32h(sq_s)) << shift_h);
+                                let source: Tile<i64, { [128] }> = lower_child(
+                                    moved,
+                                    i64h(m - 1i32),
+                                    i64h(m),
+                                    lower_words_h,
+                                    lower_stm_h,
+                                );
+                                let cw: Tile<u32, { [128] }> =
+                                    unsafe { gather_half(lower32, source, col64, cap, 0i64) };
+                                let cl: Tile<u32, { [128] }> =
+                                    unsafe { gather_half(lower32, source, col64, cap, 2i64) };
+                                let mask: Tile<u32, { [128] }> = (cap_path ^ ones_h) & cap;
+                                win_h = win_h | (cl & (cw ^ ones_h) & mask);
+                                nonwin_h = nonwin_h | ((cw ^ ones_h) & mask);
+                                any_h = any_h | (((cw & cl) ^ ones_h) & mask);
                             }
                         }
                     }
                 }
+                // The last piece stands on the lane's square: per-lane rays.
+                let i: i32 = m - 1i32;
+                let white_last: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
+                if white_last == mover_white {
+                    let role: i32 = unsafe { scalar_at(meta, 8i32 + 4i32 * i) };
+                    let dirs: i32 = unsafe { scalar_at(meta, 10i32 + 4i32 * i) };
+                    let slides: i32 = unsafe { scalar_at(meta, 11i32 + 4i32 * i) };
+                    let seven_h: Tile<i32, { [128] }> = i32h(7i32);
+                    let file: Tile<i32, { [128] }> = row & seven_h;
+                    let rank_sq: Tile<i32, { [128] }> = row >> i32h(3i32);
+                    let max_file: Tile<i32, { [128] }> = seven_h - file;
+                    let max_rank: Tile<i32, { [128] }> = seven_h - rank_sq;
+                    let one_i32h: Tile<i32, { [128] }> = i32h(1i32);
+                    for d in 0i32..dirs {
+                        let df: i32 = unsafe { scalar_at(meta, 64i32 + 16i32 * role + 2i32 * d) };
+                        let dr: i32 = unsafe { scalar_at(meta, 65i32 + 16i32 * role + 2i32 * d) };
+                        // Steps to the board edge (leaper steps are at most 2 per axis).
+                        let mut room: Tile<i32, { [128] }> = seven_h;
+                        if df == 1i32 {
+                            room = min_tile(room, max_file);
+                        }
+                        if df == 2i32 {
+                            room = min_tile(room, max_file >> one_i32h);
+                        }
+                        if df == -1i32 {
+                            room = min_tile(room, file);
+                        }
+                        if df == -2i32 {
+                            room = min_tile(room, file >> one_i32h);
+                        }
+                        if dr == 1i32 {
+                            room = min_tile(room, max_rank);
+                        }
+                        if dr == 2i32 {
+                            room = min_tile(room, max_rank >> one_i32h);
+                        }
+                        if dr == -1i32 {
+                            room = min_tile(room, rank_sq);
+                        }
+                        if dr == -2i32 {
+                            room = min_tile(room, rank_sq >> one_i32h);
+                        }
+                        let mut alive: Tile<u32, { [128] }> = live_h;
+                        let mut path: Tile<u32, { [128] }> = zero_h;
+                        // A ray captures at most once, at its end: collect the
+                        // capture square and path, and look up all captures after.
+                        let mut cap: Tile<u32, { [128] }> = zero_h;
+                        let mut cap_t: Tile<i32, { [128] }> = zero_i32h;
+                        let mut cap_path: Tile<u32, { [128] }> = zero_h;
+                        for k in 1i32..(2i32 + 6i32 * slides) {
+                            alive = alive & lanes_h(le_tile(i32h(k), room));
+                            let t: Tile<i32, { [128] }> = row + i32h(k * (df + 8i32 * dr));
+                            let tbit: Tile<u32, { [128] }> = half_bit(t, col);
+                            let hit_own: Tile<u32, { [128] }> = test_bit(block_lo, block_hi, t);
+                            let hit_enemy: Tile<u32, { [128] }> = test_bit(enemy_lo, enemy_hi, t);
+                            let moving: Tile<u32, { [128] }> = alive & (hit_own ^ ones_h);
+                            let quiet: Tile<u32, { [128] }> = moving & (hit_enemy ^ ones_h);
+                            let capture: Tile<u32, { [128] }> = moving & hit_enemy;
+                            cap = cap | capture;
+                            cap_t = select(ne_tile(capture, zero_h), t, cap_t);
+                            cap_path = cap_path | (capture & (path | tbit));
+                            let t_off: Tile<i32, { [128] }> = four_h * t + col;
+                            let cw: Tile<u32, { [128] }> =
+                                unsafe { gather_block(input32, blk ^ stm_blk, t_off, quiet) };
+                            let cl: Tile<u32, { [128] }> = unsafe {
+                                gather_block(input32, blk ^ stm_blk, t_off + i32h(2i32), quiet)
+                            };
+                            let mask: Tile<u32, { [128] }> = ((path | tbit) ^ ones_h) & quiet;
+                            win_h = win_h | (cl & (cw ^ ones_h) & mask);
+                            nonwin_h = nonwin_h | ((cw ^ ones_h) & mask);
+                            any_h = any_h | (((cw & cl) ^ ones_h) & mask);
+                            path = path | (tbit & alive);
+                            alive = alive & (test_bit(occ_lo, occ_hi, t) ^ ones_h);
+                        }
+                        if count_h(cap) > 0i64 {
+                            // Captured skeleton piece j (a uniform piece): lower
+                            // table j - 1, without piece j.
+                            let mut j_t: Tile<i64, { [128] }> = i64h(0i32);
+                            for j in 1i32..(m - 1i32) {
+                                let sq_j: i32 = (blk >> (6i32 * (m - 2i32 - j))) & 63i32;
+                                j_t = select(eq_tile(cap_t, i32h(sq_j)), i64h(j), j_t);
+                            }
+                            let moved: Tile<i64, { [128] }> = w_h + exti(cap_t - row);
+                            let source: Tile<i64, { [128] }> =
+                                lower_child(moved, j_t, i64h(m), lower_words_h, lower_stm_h);
+                            let cw: Tile<u32, { [128] }> =
+                                unsafe { gather_half(lower32, source, col64, cap, 0i64) };
+                            let cl: Tile<u32, { [128] }> =
+                                unsafe { gather_half(lower32, source, col64, cap, 2i64) };
+                            let mask: Tile<u32, { [128] }> = (cap_path ^ ones_h) & cap;
+                            win_h = win_h | (cl & (cw ^ ones_h) & mask);
+                            nonwin_h = nonwin_h | ((cw ^ ones_h) & mask);
+                            any_h = any_h | (((cw & cl) ^ ones_h) & mask);
+                        }
+                    }
+                }
+                win = win | join(win_h);
+                nonwin = nonwin | join(nonwin_h);
+                any = any | join(any_h);
                 // Black king moves inside the word, and black king captures.
                 if black_to_move == 1i32 {
                     let cp: Tile<u64, { [64, 2] }> =
@@ -998,6 +1378,12 @@ impl<T: Copy + Default> DeviceVec<T> {
         unsafe { cutile::tile_kernel::DevicePointer::from_cu_deviceptr(self.ptr) }
     }
 
+    /// The same allocation as elements of type U.
+    fn view<U>(&self) -> cutile::tile_kernel::DevicePointer<U> {
+        // SAFETY: `ptr` is a live allocation; kernels index it in range for U.
+        unsafe { cutile::tile_kernel::DevicePointer::from_cu_deviceptr(self.ptr) }
+    }
+
     fn bytes(&self) -> usize {
         self.len.max(1) * std::mem::size_of::<T>()
     }
@@ -1152,6 +1538,8 @@ impl Gpu {
                     round_value.ptr(),
                     dirty.ptr(),
                     changed_flags.ptr(),
+                    state[src].view::<u32>(),
+                    lower_dev.view::<u32>(),
                 )
                 .generics(vec![mode.into(), if ranked { "1" } else { "0" }.into()])
                 .grid(grid)
@@ -1357,7 +1745,17 @@ fn write_jobs(
         let t = Instant::now();
         let partial = job.path.with_extension("tbz.partial");
         let file = File::create(&partial).map_err(|e| e.to_string())?;
-        let header = packed::write(&job.stored, BufWriter::new(file), GENERATOR, level, threads)?;
+        let options = packed::WriteOptions {
+            level,
+            ..Default::default()
+        };
+        let header = packed::write(
+            &job.stored,
+            BufWriter::new(file),
+            GENERATOR,
+            options,
+            threads,
+        )?;
         drop(job.stored);
         std::fs::rename(&partial, &job.path).map_err(|e| e.to_string())?;
         let r = &mut job.record;

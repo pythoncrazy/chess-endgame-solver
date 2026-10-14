@@ -1,4 +1,5 @@
-//! Compressed pawnless tables, format v3 (`TBPAWNZ1`).
+//! Compressed pawnless tables, format v4 (`TBPAWNZ2`); v3 (`TBPAWNZ1`) is
+//! still read. Specification: `TBZ_FORMAT.md`.
 //!
 //! Each position is stored once per symmetry class. Its stored image has the
 //! white king in the a1-d1-d4 triangle and, among the images that do, the
@@ -10,10 +11,12 @@
 //!
 //! Stored index: `((turn * 10 + triangle(white king)) * 64^(m-1) + other
 //! skeleton squares) * 64 + black king`. Two sections, each a block index
-//! followed by independent zstd frames of `BLOCK` decompressed bytes:
-//! `wdl` (2 bits per position: 0 draw, 1 win, 2 loss, both sides to move) and
-//! `rank` (proof rank of decisive positions, u8 or u16). A probe decompresses
-//! at most one block per section.
+//! followed by independent zstd or LZMA frames of `BLOCK` decompressed bytes:
+//! `wdl` (2 bits per position: 0 draw, 1 win, 2 loss, 3 black-to-move win of
+//! rank 1) and `rank` (proof rank of decisive positions, u8 or u16). By
+//! default only white-to-move ranks are stored; black-to-move ranks follow
+//! exactly from the white-to-move children. A probe decompresses at most one
+//! block per section, plus the children's blocks for a black-to-move rank.
 use crate::Result;
 use crate::pawnless::{
     Counts, DIGEST_TREE, Geometry, MAX_SKELETON, Material, Symmetry, Table, UNRESOLVED,
@@ -35,7 +38,9 @@ use std::{
     },
 };
 
-pub const MAGIC: &[u8; 8] = b"TBPAWNZ1";
+pub const MAGIC: &[u8; 8] = b"TBPAWNZ2";
+/// Format v3: both rank sides, zstd only, no WDL code 3 (read-only).
+pub const MAGIC_V3: &[u8; 8] = b"TBPAWNZ1";
 /// Decompressed bytes per block (the last block of a section may be shorter).
 pub const BLOCK: usize = 1 << 18;
 /// White-king squares of the stored domain, in index order.
@@ -325,6 +330,49 @@ impl Canonical {
     }
 }
 
+/// Block compression of a section.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Codec {
+    /// One zstd frame per block.
+    #[default]
+    Zstd,
+    /// One LZMA1 `.lzma` ("alone") stream per block (preset 9e, lc 4): about
+    /// 10% smaller rank sections than zstd 19, about 6x slower cold probes.
+    Lzma,
+}
+
+/// Sides to move whose proof ranks are stored.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RankSides {
+    #[default]
+    Both,
+    /// White to move only; black-to-move ranks follow from the children.
+    White,
+}
+
+/// How `write` encodes a table.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteOptions {
+    /// zstd level (LZMA always uses preset 9e).
+    pub level: i32,
+    pub wdl_codec: Codec,
+    pub rank_codec: Codec,
+    pub rank_sides: RankSides,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        WriteOptions {
+            level: 19,
+            wdl_codec: Codec::Zstd,
+            rank_codec: Codec::Zstd,
+            rank_sides: RankSides::White,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Section {
     pub name: String,
@@ -333,6 +381,8 @@ pub struct Section {
     pub blocks: u64,
     pub raw_bytes: u64,
     pub compressed_bytes: u64,
+    #[serde(default)]
+    pub codec: Codec,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -355,6 +405,8 @@ pub struct PackedHeader {
     pub generator: String,
     #[serde(default)]
     pub counts: Option<[Counts; 2]>,
+    #[serde(default)]
+    pub rank_sides: RankSides,
 }
 
 /// Run `f` on indices `0..n` with dynamic scheduling over `threads` workers.
@@ -405,12 +457,19 @@ fn stored_bits(layout: &Layout, c: &Canonical, cw: usize) -> u64 {
     layout.stored_mask(&squares) & valid
 }
 
+/// Black-to-move stored words start here in the stored index.
+fn black_start(layout: &Layout) -> usize {
+    10 * layout.per
+}
+
 /// Decompressed WDL block `b`: 4096 stored words, four positions per byte.
-fn wdl_block(layout: &Layout, c: &Canonical, b: usize) -> Vec<u8> {
+/// With white-only ranks, black-to-move wins of rank 1 take code 3.
+fn wdl_block(layout: &Layout, c: &Canonical, b: usize, sides: RankSides) -> Vec<u8> {
     let words_per_block = BLOCK / 16;
     let range = b * words_per_block..((b + 1) * words_per_block).min(c.records.len());
     let mut out = vec![0u8; range.len() * 16];
     let mut prev = 0u8;
+    let mark_rank1 = sides == RankSides::White && !c.rank.is_empty();
     for (i, cw) in range.enumerate() {
         let [win, loss] = c.records[cw];
         let stored = stored_bits(layout, c, cw);
@@ -418,9 +477,13 @@ fn wdl_block(layout: &Layout, c: &Canonical, b: usize) -> Vec<u8> {
             out[i * 16..(i + 1) * 16].fill(prev * 0x55);
             continue;
         }
+        let black = cw >= black_start(layout);
         for bk in 0..64 {
             if stored >> bk & 1 != 0 {
                 prev = ((win >> bk & 1) as u8) | (((loss >> bk & 1) as u8) << 1);
+                if prev == 1 && black && mark_rank1 && c.rank[cw * 64 + bk] == 1 {
+                    prev = 3;
+                }
             }
             let p = i * 64 + bk;
             out[p / 4] |= prev << (2 * (p % 4));
@@ -430,9 +493,9 @@ fn wdl_block(layout: &Layout, c: &Canonical, b: usize) -> Vec<u8> {
 }
 
 /// Decompressed rank block `b`.
-fn rank_block(layout: &Layout, c: &Canonical, b: usize, width: usize) -> Vec<u8> {
+fn rank_block(layout: &Layout, c: &Canonical, b: usize, width: usize, words: usize) -> Vec<u8> {
     let words_per_block = BLOCK / (64 * width);
-    let range = b * words_per_block..((b + 1) * words_per_block).min(c.records.len());
+    let range = b * words_per_block..((b + 1) * words_per_block).min(words);
     let mut out = vec![0u8; range.len() * 64 * width];
     let mut prev = 0u16;
     for (i, cw) in range.enumerate() {
@@ -464,12 +527,61 @@ fn rank_block(layout: &Layout, c: &Canonical, b: usize, width: usize) -> Vec<u8>
     out
 }
 
-/// Compress a stored table into a v3 file image.
+fn compress_block(codec: Codec, level: i32, raw: &[u8]) -> Result<Vec<u8>> {
+    match codec {
+        Codec::Zstd => {
+            thread_local! {
+                static ZSTD: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            ZSTD.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.as_ref().is_none_or(|(l, _)| *l != level) {
+                    let compressor =
+                        zstd::bulk::Compressor::new(level).map_err(|e| e.to_string())?;
+                    *slot = Some((level, compressor));
+                }
+                let (_, compressor) = slot.as_mut().expect("compressor");
+                compressor.compress(raw).map_err(|e| e.to_string())
+            })
+        }
+        Codec::Lzma => {
+            // Preset 9e with lc = 4; the dictionary never needs to exceed a block.
+            let mut opts =
+                xz2::stream::LzmaOptions::new_preset(9 | 0x8000_0000).map_err(|e| e.to_string())?;
+            opts.literal_context_bits(4)
+                .nice_len(273)
+                .dict_size(BLOCK as u32);
+            let stream = xz2::stream::Stream::new_lzma_encoder(&opts).map_err(|e| e.to_string())?;
+            let mut encoder = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+            encoder.write_all(raw).map_err(|e| e.to_string())?;
+            encoder.finish().map_err(|e| e.to_string())
+        }
+    }
+}
+
+fn decompress_block(codec: Codec, frame: &[u8], expect: usize) -> Result<Vec<u8>> {
+    match codec {
+        Codec::Zstd => zstd::bulk::decompress(frame, expect).map_err(|e| e.to_string()),
+        Codec::Lzma => {
+            let stream =
+                xz2::stream::Stream::new_lzma_decoder(u64::MAX).map_err(|e| e.to_string())?;
+            let mut out = Vec::with_capacity(expect);
+            xz2::read::XzDecoder::new_stream(frame, stream)
+                .take(expect as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| e.to_string())?;
+            Ok(out)
+        }
+    }
+}
+
+/// Compress a stored table into a v4 file image.
 pub fn write(
     c: &Canonical,
     mut out: impl Write,
     generator: &str,
-    level: i32,
+    options: WriteOptions,
     threads: usize,
 ) -> Result<PackedHeader> {
     let layout = Layout::new(&c.material);
@@ -480,42 +592,32 @@ pub fn write(
     if width == 1 && c.rank.iter().any(|&r| r != UNRESOLVED && r >= 255) {
         return Err("rank exceeds the u8 representation".into());
     }
-    let mut sections = vec![("wdl", c.records.len() * 16)];
+    let sides = if width == 0 {
+        RankSides::Both
+    } else {
+        options.rank_sides
+    };
+    let rank_words = match sides {
+        RankSides::Both => c.records.len(),
+        RankSides::White => black_start(&layout),
+    };
+    let mut sections = vec![("wdl", c.records.len() * 16, options.wdl_codec)];
     if width > 0 {
-        sections.push(("rank", c.records.len() * 64 * width));
+        sections.push(("rank", rank_words * 64 * width, options.rank_codec));
     }
     let mut payload = Vec::new();
     let mut infos = Vec::new();
     let mut content = Sha256::new();
-    for (name, raw_bytes) in sections {
+    for (name, raw_bytes, codec) in sections {
         let blocks = raw_bytes.div_ceil(BLOCK);
         let frames = parallel(blocks, threads, |b| {
             let raw = if name == "wdl" {
-                wdl_block(&layout, c, b)
+                wdl_block(&layout, c, b, sides)
             } else {
-                rank_block(&layout, c, b, width)
+                rank_block(&layout, c, b, width, rank_words)
             };
             let digest: [u8; 32] = Sha256::digest(&raw).into();
-            thread_local! {
-                static COMPRESSOR: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
-                    const { std::cell::RefCell::new(None) };
-            }
-            let frame = COMPRESSOR.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                if borrow.as_ref().is_none_or(|(l, _)| *l != level) {
-                    *borrow = Some((
-                        level,
-                        zstd::bulk::Compressor::new(level).map_err(|e| e.to_string())?,
-                    ));
-                }
-                borrow
-                    .as_mut()
-                    .unwrap()
-                    .1
-                    .compress(&raw)
-                    .map_err(|e| e.to_string())
-            })?;
-            Ok((digest, frame))
+            Ok((digest, compress_block(codec, options.level, &raw)?))
         })?;
         let offset = payload.len() as u64;
         let mut at = 0u64;
@@ -534,28 +636,31 @@ pub fn write(
             blocks: blocks as u64,
             raw_bytes: raw_bytes as u64,
             compressed_bytes: at,
+            codec,
         });
     }
     let header = PackedHeader {
-        format: "tablebase-pawnless-v3".into(),
+        format: "tablebase-pawnless-v4".into(),
         material: c.material.name(),
         layout: "stored once per symmetry class: white king in a1-d1-d4, smallest index \
                  among equivalent images; position = ((turn*10 + triangle(white king)) \
                  * 64^(m-1) + other skeleton squares) * 64 + black king; wdl 2 bits \
-                 (0 draw, 1 win, 2 loss), rank u8 or u16; illegal and non-stored \
-                 positions repeat the previous value"
+                 (0 draw, 1 win, 2 loss, 3 black-to-move win of rank 1 when only white \
+                 ranks are stored), rank u8 or u16 for the stored sides; illegal and \
+                 non-stored positions repeat the previous value"
             .into(),
         stored_words: c.records.len(),
         rounds: c.rounds,
         rank_width: width,
         block_bytes: BLOCK,
-        zstd_level: level,
+        zstd_level: options.level,
         sections: infos,
         payload_sha256: payload_digest(&payload, DIGEST_TREE)?,
         digest_scheme: DIGEST_TREE.into(),
         content_sha256: format!("{:x}", content.finalize()),
         generator: generator.into(),
         counts: c.counts,
+        rank_sides: sides,
     };
     let json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
     let io = |e: std::io::Error| e.to_string();
@@ -568,14 +673,201 @@ pub fn write(
     Ok(header)
 }
 
+/// White-to-move children of black-to-move positions, same material.
+trait Children {
+    /// Legal black-king squares of white-to-move word `word`.
+    fn valid(&self, word: usize) -> Result<u64>;
+    fn is_loss(&self, word: usize, black_king: u8) -> Result<bool>;
+    /// Proof rank of a decisive position.
+    fn rank(&self, word: usize, black_king: u8) -> Result<u16>;
+}
+
+/// Material after each capturable (white, non-king) skeleton piece is taken.
+fn lower_materials(material: &Material) -> Vec<Option<Material>> {
+    (0..material.skeleton_len())
+        .map(|k| (k > 0 && material.skeleton[k].white).then(|| material.without(k).expect("k > 0")))
+        .collect()
+}
+
+/// Legal black-king squares after white skeleton piece `k` is captured.
+fn lower_valid(geometry: &Geometry, lower: &Material, squares: &[u8], k: usize) -> u64 {
+    let mut rest = [0u8; MAX_SKELETON];
+    let mut n = 0;
+    for (i, &s) in squares.iter().enumerate() {
+        if i != k {
+            rest[n] = s;
+            n += 1;
+        }
+    }
+    statics(geometry, lower, lower.encode(false, &rest[..n])).valid
+}
+
+/// Proof ranks of the black-to-move positions `lanes` of word `w` (decisive,
+/// `win` marks the wins), from the white-to-move children: a win is one more
+/// than its fastest losing child, a loss one more than its slowest child, and
+/// captures count as rank 0.
+#[allow(clippy::too_many_arguments)]
+fn derive_black<C: Children + ?Sized>(
+    geometry: &Geometry,
+    material: &Material,
+    lower: &[Option<Material>],
+    kids: &C,
+    w: usize,
+    lanes: u64,
+    win: u64,
+) -> Result<[u16; 64]> {
+    let mut out = [UNRESOLVED; 64];
+    if lanes == 0 {
+        return Ok(out);
+    }
+    let len = material.skeleton_len();
+    let (_, mut squares) = material.decode(w);
+    let squares = &mut squares[..len];
+    let occupied = squares.iter().fold(0u64, |o, &s| o | 1 << s);
+    let mut win_min = [u16::MAX; 64];
+    let mut loss_max = [0u16; 64];
+    let mut moved = 0u64;
+    let mut child = |word: usize, legal: u64, to_king: &dyn Fn(u8) -> u8| -> Result<()> {
+        let mut bits = legal;
+        while bits != 0 {
+            let bk = bits.trailing_zeros() as u8;
+            bits &= bits - 1;
+            let at = usize::from(bk);
+            let kid = to_king(bk);
+            if win >> bk & 1 != 0 {
+                if kids.is_loss(word, kid)? {
+                    win_min[at] = win_min[at].min(kids.rank(word, kid)?);
+                }
+            } else {
+                loss_max[at] = loss_max[at].max(kids.rank(word, kid)?);
+            }
+        }
+        Ok(())
+    };
+    // Black king moves and captures.
+    let same = material.encode(false, squares);
+    let valid = kids.valid(same)?;
+    let mut bits = lanes;
+    while bits != 0 {
+        let bk = bits.trailing_zeros() as u8;
+        bits &= bits - 1;
+        let mut to = geometry.king(bk) & valid;
+        while to != 0 {
+            let t = to.trailing_zeros() as u8;
+            to &= to - 1;
+            moved |= 1 << bk;
+            child(same, 1 << bk, &|_| t)?;
+        }
+    }
+    for (k, lm) in lower.iter().enumerate() {
+        let Some(lm) = lm else { continue };
+        let t = squares[k];
+        let from = geometry.king(t) & lanes;
+        if from != 0 && lower_valid(geometry, lm, squares, k) >> t & 1 != 0 {
+            moved |= from;
+        }
+    }
+    // Black piece moves; the black king may block a ray.
+    for i in 1..len {
+        let piece = material.skeleton[i];
+        if piece.white {
+            continue;
+        }
+        let from = squares[i];
+        let mut targets = geometry.attacks(piece.role, from, occupied) & !(1 << squares[0]);
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            let captured = (1..len).find(|&k| squares[k] == to);
+            if captured.is_some_and(|k| !material.skeleton[k].white) {
+                continue;
+            }
+            let mask = lanes & !geometry.between(from, to) & !(1 << to);
+            if mask == 0 {
+                continue;
+            }
+            squares[i] = to;
+            match captured {
+                None => {
+                    let word = material.encode(false, squares);
+                    let legal = mask & kids.valid(word)?;
+                    moved |= legal;
+                    child(word, legal, &|bk| bk)?;
+                }
+                Some(k) => {
+                    let lm = lower[k].as_ref().expect("white piece");
+                    moved |= mask & lower_valid(geometry, lm, squares, k);
+                }
+            }
+            squares[i] = from;
+        }
+    }
+    let mut bits = lanes;
+    while bits != 0 {
+        let bk = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        out[bk] = if win >> bk & 1 != 0 {
+            match win_min[bk] {
+                u16::MAX => return Err("black-to-move win without a losing child".into()),
+                r => r + 1,
+            }
+        } else if moved >> bk & 1 != 0 {
+            loss_max[bk] + 1
+        } else {
+            0
+        };
+    }
+    Ok(out)
+}
+
+/// Children read from a decoded table (white-to-move ranks filled in).
+struct Decoded<'a> {
+    valid: &'a [u64],
+    loss: &'a [u64],
+    rank: &'a [u16],
+}
+
+impl Children for Decoded<'_> {
+    fn valid(&self, word: usize) -> Result<u64> {
+        Ok(self.valid[word])
+    }
+    fn is_loss(&self, word: usize, black_king: u8) -> Result<bool> {
+        Ok(self.loss[word] >> black_king & 1 != 0)
+    }
+    fn rank(&self, word: usize, black_king: u8) -> Result<u16> {
+        Ok(self.rank[word * 64 + usize::from(black_king)])
+    }
+}
+
+impl Children for PackedTable {
+    fn valid(&self, word: usize) -> Result<u64> {
+        Ok(statics(&self.geometry, self.material(), word).valid)
+    }
+    fn is_loss(&self, word: usize, black_king: u8) -> Result<bool> {
+        let (_, squares) = self.material().decode(word);
+        let p = self
+            .layout
+            .position(false, &squares[..self.layout.m], black_king);
+        Ok(self.code(p)? == 2)
+    }
+    fn rank(&self, word: usize, black_king: u8) -> Result<u16> {
+        let (_, squares) = self.material().decode(word);
+        self.stored_rank(
+            self.layout
+                .position(false, &squares[..self.layout.m], black_king),
+        )
+    }
+}
+
 struct SectionIndex {
     /// Absolute file offset of the first frame.
     frames: u64,
     offsets: Vec<u64>,
     raw_bytes: usize,
+    codec: Codec,
 }
 
-/// A v3 table opened for probing; blocks are read on demand and cached.
+/// A v3 or v4 table opened for probing; blocks are read on demand and cached.
 pub struct PackedTable {
     pub header: PackedHeader,
     pub layout: Layout,
@@ -599,18 +891,18 @@ pub fn is_packed(path: &Path) -> Result<bool> {
     File::open(path)
         .and_then(|mut f| f.read_exact(&mut magic))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(&magic == MAGIC)
+    Ok(&magic == MAGIC || &magic == MAGIC_V3)
 }
 
 impl PackedTable {
-    /// Open a v3 file. With `authenticate`, the payload digest is checked.
+    /// Open a v3 or v4 file. With `authenticate`, the payload digest is checked.
     pub fn open(path: &Path, authenticate: bool) -> Result<PackedTable> {
         let err = |e: std::io::Error| format!("{}: {e}", path.display());
         let file = File::open(path).map_err(err)?;
         let mut head = [0u8; 16];
         file.read_exact_at(&mut head, 0).map_err(err)?;
-        if &head[..8] != MAGIC {
-            return Err(format!("{}: not a v3 pawnless table", path.display()));
+        if &head[..8] != MAGIC && &head[..8] != MAGIC_V3 {
+            return Err(format!("{}: not a packed pawnless table", path.display()));
         }
         let len = u64::from_le_bytes(head[8..].try_into().expect("8 bytes"));
         if len > 1 << 20 {
@@ -657,6 +949,7 @@ impl PackedTable {
                 frames,
                 offsets,
                 raw_bytes: s.raw_bytes as usize,
+                codec: s.codec,
             })
         };
         let find = |name: &str| header.sections.iter().find(|s| s.name == name);
@@ -688,7 +981,7 @@ impl PackedTable {
             .map_err(|e| e.to_string())?;
         let block = self.header.block_bytes;
         let expect = block.min(section.raw_bytes - b * block);
-        let raw = zstd::bulk::decompress(&frame, expect).map_err(|e| e.to_string())?;
+        let raw = decompress_block(section.codec, &frame, expect)?;
         if raw.len() != expect {
             return Err("v3 block has the wrong length".into());
         }
@@ -724,28 +1017,47 @@ impl PackedTable {
             return Ok(None);
         }
         let p = self.layout.position(black, squares, black_king);
-        let block = self.header.block_bytes;
-        let wdl = self.block(false, p / 4 / block)?[p / 4 % block] >> (2 * (p % 4)) & 3;
-        let wdl = match wdl {
-            0 => 0,
-            1 => 2,
-            2 => -2,
+        let code = self.code(p)?;
+        let derived = black && self.header.rank_sides == RankSides::White;
+        let wdl = match (code, derived) {
+            (0, _) => 0,
+            (1, _) | (3, true) => 2,
+            (2, _) => -2,
             _ => return Err("invalid WDL code".into()),
         };
-        let width = self.header.rank_width;
-        let rank = if wdl != 0 && width > 0 {
-            let at = p * width;
-            let data = self.block(true, at / block)?;
-            let i = at % block;
-            Some(if width == 1 {
-                u16::from(data[i])
-            } else {
-                u16::from_le_bytes([data[i], data[i + 1]])
-            })
-        } else {
-            None
+        let rank = match (wdl, self.header.rank_width, derived) {
+            (0, _, _) | (_, 0, _) => None,
+            (_, _, false) => Some(self.stored_rank(p)?),
+            _ if code == 3 => Some(1),
+            _ => {
+                let lower = lower_materials(material);
+                let lanes = 1u64 << black_king;
+                let win = if wdl == 2 { lanes } else { 0 };
+                let ranks = derive_black(&self.geometry, material, &lower, self, word, lanes, win)?;
+                Some(ranks[usize::from(black_king)])
+            }
         };
         Ok(Some(Value { wdl, rank }))
+    }
+
+    /// WDL code of stored position `p`.
+    fn code(&self, p: usize) -> Result<u8> {
+        let block = self.header.block_bytes;
+        Ok(self.block(false, p / 4 / block)?[p / 4 % block] >> (2 * (p % 4)) & 3)
+    }
+
+    /// Stored proof rank of stored position `p` (a stored side to move).
+    fn stored_rank(&self, p: usize) -> Result<u16> {
+        let width = self.header.rank_width;
+        let block = self.header.block_bytes;
+        let at = p * width;
+        let data = self.block(true, at / block)?;
+        let i = at % block;
+        Ok(if width == 1 {
+            u16::from(data[i])
+        } else {
+            u16::from_le_bytes([data[i], data[i + 1]])
+        })
     }
 
     fn section_bytes(&self, section: &SectionIndex, threads: usize) -> Result<Vec<u8>> {
@@ -767,6 +1079,12 @@ impl PackedTable {
         };
         let ranked = width > 0;
         let stored_words = layout.words();
+        let derived = self.header.rank_sides == RankSides::White;
+        let rank_words = if derived {
+            black_start(layout)
+        } else {
+            stored_words
+        };
         let sc = 1usize << 12;
         let stored_parts = parallel(stored_words.div_ceil(sc), threads, |part| {
             let range = part * sc..((part + 1) * sc).min(stored_words);
@@ -781,9 +1099,11 @@ impl PackedTable {
                     let p = cw * 64 + bk;
                     let code = wdl[p / 4] >> (2 * (p % 4)) & 3;
                     if valid >> bk & 1 != 0 {
-                        win |= u64::from(code == 1) << bk;
+                        win |= u64::from(code & 1 == 1) << bk;
                         loss |= u64::from(code == 2) << bk;
-                        if ranked && code != 0 {
+                        if code == 3 {
+                            *slot = 1;
+                        } else if ranked && code != 0 && cw < rank_words {
                             *slot = if width == 1 {
                                 u16::from(rank_raw[p])
                             } else {
@@ -860,7 +1180,76 @@ impl PackedTable {
                 });
             }
         });
+        if ranked && derived {
+            self.derive_black_ranks(&mut table, threads)?;
+        }
         Ok(table)
+    }
+
+    /// Fill the black-to-move ranks that a white-only file leaves unresolved.
+    fn derive_black_ranks(&self, table: &mut Table, threads: usize) -> Result<()> {
+        let material = &table.material;
+        let lower = lower_materials(material);
+        let half = material.words() / 2;
+        let (white, black) = table.rank.split_at_mut(half * 64);
+        let kids = Decoded {
+            valid: &table.valid,
+            loss: &table.loss,
+            rank: white,
+        };
+        let chunk = 1usize << 12;
+        let work = Mutex::new(black.chunks_mut(chunk * 64).enumerate());
+        let failure = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.max(1) {
+                scope.spawn(|| {
+                    loop {
+                        let next = work.lock().expect("work").next();
+                        let Some((part, ranks)) = next else { break };
+                        for (i, dst) in ranks.chunks_mut(64).enumerate() {
+                            let w = half + part * chunk + i;
+                            let win = table.win[w];
+                            let mut lanes = table.loss[w];
+                            let mut wins = win;
+                            while wins != 0 {
+                                let bk = wins.trailing_zeros() as usize;
+                                wins &= wins - 1;
+                                if dst[bk] != 1 {
+                                    lanes |= 1 << bk;
+                                }
+                            }
+                            let derived = derive_black(
+                                &self.geometry,
+                                material,
+                                &lower,
+                                &kids,
+                                w,
+                                lanes,
+                                win,
+                            );
+                            match derived {
+                                Ok(r) => {
+                                    let mut bits = lanes;
+                                    while bits != 0 {
+                                        let bk = bits.trailing_zeros() as usize;
+                                        bits &= bits - 1;
+                                        dst[bk] = r[bk];
+                                    }
+                                }
+                                Err(e) => {
+                                    *failure.lock().expect("failure") = Some(e);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        match failure.into_inner().expect("failure") {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 

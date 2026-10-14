@@ -1,4 +1,4 @@
-"""Local visualizer for pawnless tablebases (*.tbz format v3, *.tbp v1/v2).
+"""Local visualizer for pawnless tablebases (*.tbz format v3/v4, *.tbp v1/v2).
 
 Usage:
   python -I tools/visualizer/server.py --tables DIR [--tables DIR ...]
@@ -8,9 +8,10 @@ Network budget: the page is one self-contained document (CSS, JS and the piece
 sprite inline) revalidated by ETag; fonts are content-addressed and immutable.
 API replies are compact JSON, gzip-compressed, over keep-alive connections. The
 client generates pawnless moves itself, so a probe returns only the value of
-each move, in UCI order. Tables are memory-mapped. A v3 position costs one
-cached block per section (WDL, rank); a v2 position one record. Values are
-never guessed.
+each move, in UCI order. Tables are memory-mapped. A packed position costs one
+cached block per section (WDL, rank); a v4 black-to-move rank is derived from
+its white-to-move children; a v2 position costs one record. Values are never
+guessed.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import gzip
 import hashlib
 import http.server
 import json
+import lzma
 import mmap
 import random
 import re
@@ -163,7 +165,7 @@ class Table(Layout):
         return wdl, None if rank in (None, UNRESOLVED) else rank
 
 
-# Format v3 (rust/src/packed.rs): one position per symmetry class.
+# Formats v3/v4 (rust/src/packed.rs, rust/TBZ_FORMAT.md): one position per symmetry class.
 TRIANGLE = (0, 1, 2, 3, 9, 10, 11, 18, 19, 27)
 TRIANGLE_INDEX = {s: i for i, s in enumerate(TRIANGLE)}
 LOWER_RIGHT = 0x80C0E0F0F8FCFEFF
@@ -183,11 +185,11 @@ def _symmetry(g: int, s: int) -> int:
 SYMMETRY = [[_symmetry(g, s) for s in range(64)] for g in range(8)]
 TRANSPOSE = SYMMETRY[1]
 TO_TRIANGLE = [next(g for g in range(8) if SYMMETRY[g][s] in TRIANGLE_INDEX) for s in range(64)]
-WDL_CODE = (0, 2, -2, None)
+WDL_CODE = (0, 2, -2, 2)
 
 
 class BlockCache:
-    """Decompressed blocks shared by every v3 table, least recently used out."""
+    """Decompressed blocks shared by every packed table, least recently used out."""
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
@@ -196,7 +198,7 @@ class BlockCache:
         self.local = threading.local()
         self.hits = self.misses = 0
 
-    def get(self, key: tuple, frame: memoryview, size: int) -> bytes:
+    def get(self, key: tuple, frame: memoryview, size: int, codec: str = "zstd") -> bytes:
         with self.lock:
             block = self.blocks.get(key)
             if block is not None:
@@ -204,9 +206,12 @@ class BlockCache:
                 self.hits += 1
                 return block
             self.misses += 1
-        if not hasattr(self.local, "zstd"):
-            self.local.zstd = zstandard.ZstdDecompressor()
-        block = self.local.zstd.decompress(frame, max_output_size=size)
+        if codec == "lzma":
+            block = lzma.LZMADecompressor(lzma.FORMAT_ALONE).decompress(frame, max_length=size)
+        else:
+            if not hasattr(self.local, "zstd"):
+                self.local.zstd = zstandard.ZstdDecompressor()
+            block = self.local.zstd.decompress(frame, max_output_size=size)
         if len(block) != size:
             raise TableFormatError(Path(str(key[0])))
         with self.lock:
@@ -220,14 +225,14 @@ BLOCKS = BlockCache(2048)
 
 
 class PackedTable(Layout):
-    """A v3 table. Legality is not stored; callers judge it with python-chess."""
+    """A v3 or v4 table. Legality is not stored; callers judge it with python-chess."""
 
     knows_legality = False
 
     def __init__(self, path: Path) -> None:
         with path.open("rb") as f:
             self.map = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        if self.map[:8] != b"TBPAWNZ1":
+        if self.map[:8] not in (b"TBPAWNZ1", b"TBPAWNZ2"):
             raise TableFormatError(path)
         length = int.from_bytes(self.map[8:16], "little")
         self.path = path
@@ -238,6 +243,7 @@ class PackedTable(Layout):
         self.words = 2 * 64**self.m
         self.rank_width = self.header["rank_width"]
         self.ranked = self.rank_width > 0
+        self.derived = self.header.get("rank_sides", "both") == "white"
         self.block = self.header["block_bytes"]
         self.groups = []
         start = 1
@@ -252,7 +258,7 @@ class PackedTable(Layout):
             at = 16 + length + s["offset"]
             index = np.frombuffer(view[at : at + 8 * (s["blocks"] + 1)], dtype="<u8")
             frames = at + 8 * (s["blocks"] + 1)
-            self.sections[s["name"]] = (frames, index, s["raw_bytes"])
+            self.sections[s["name"]] = (frames, index, s["raw_bytes"], s.get("codec", "zstd"))
         self.view = view
 
     def _mapped(self, g: int, squares: list[int]) -> list[int]:
@@ -280,24 +286,70 @@ class PackedTable(Layout):
         return word * 64 + t
 
     def _byte(self, section: str, at: int) -> bytes:
-        frames, index, raw = self.sections[section]
+        frames, index, raw, codec = self.sections[section]
         b = at // self.block
         frame = self.view[frames + int(index[b]) : frames + int(index[b + 1])]
-        block = BLOCKS.get((self.path, section, b), frame, min(self.block, raw - b * self.block))
+        size = min(self.block, raw - b * self.block)
+        block = BLOCKS.get((self.path, section, b), frame, size, codec)
         return block[at % self.block : at % self.block + 2]
+
+    def _code(self, p: int) -> int:
+        return self._byte("wdl", p // 4)[0] >> (2 * (p % 4)) & 3
+
+    def _rank(self, p: int) -> int:
+        data = self._byte("rank", p * self.rank_width)
+        return data[0] if self.rank_width == 1 else int.from_bytes(data[:2], "little")
+
+    def _derive_black(self, squares: list[int], bk: int, win: bool) -> int:
+        """Rank of a decisive black-to-move position from its white-to-move
+        children: a win is one more than its fastest losing child, a loss one
+        more than its slowest child; captures (lower material) count as 0."""
+        board = chess.Board(None)
+        board.turn = chess.BLACK
+        for (white, role), square in zip(self.pieces, squares, strict=True):
+            board.set_piece_at(square, chess.Piece(role, white))
+        board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
+        best, moved = None, False
+        for move in board.legal_moves:
+            moved = True
+            if board.piece_at(move.to_square) is not None:
+                continue
+            child, child_bk = list(squares), bk
+            if move.from_square == bk:
+                child_bk = move.to_square
+            else:
+                child[child.index(move.from_square)] = move.to_square
+            p = self.position(False, child, child_bk)
+            if win:
+                if self._code(p) == 2:
+                    r = self._rank(p)
+                    best = r if best is None else min(best, r)
+            else:
+                best = max(best or 0, self._rank(p))
+        if win:
+            if best is None:
+                raise TableFormatError(self.path)
+            return best + 1
+        return (best or 0) + 1 if moved else 0
 
     def lookup(
         self, black_to_move: bool, squares: list[int], bk: int
     ) -> tuple[int | None, int | None]:
         """(WDL for the side to move, proof rank) of a legal position."""
         p = self.position(black_to_move, squares, bk)
-        wdl = WDL_CODE[self._byte("wdl", p // 4)[0] >> (2 * (p % 4)) & 3]
-        if wdl is None:
+        code = self._code(p)
+        derived = black_to_move and self.derived
+        if code == 3 and not derived:
             raise TableFormatError(self.path)
+        wdl = WDL_CODE[code]
         rank = None
         if wdl and self.ranked:
-            data = self._byte("rank", p * self.rank_width)
-            rank = data[0] if self.rank_width == 1 else int.from_bytes(data[:2], "little")
+            if not derived:
+                rank = self._rank(p)
+            elif code == 3:
+                rank = 1
+            else:
+                rank = self._derive_black(squares, bk, wdl == 2)
         return wdl, rank
 
 

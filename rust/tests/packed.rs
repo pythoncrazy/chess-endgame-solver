@@ -1,4 +1,6 @@
-use tablebase_core::packed::{self, Canonical, Layout, PackedTable};
+use tablebase_core::packed::{
+    self, Canonical, Codec, Layout, PackedTable, RankSides, WriteOptions,
+};
 use tablebase_core::pawnless::{Material, Solved, Symmetry, Table, solve, solve_tree};
 
 fn solved(name: &str) -> Table {
@@ -7,9 +9,9 @@ fn solved(name: &str) -> Table {
     (*solve_tree(&Material::parse(name).unwrap(), &mut solved, &mut cpu).unwrap()).clone()
 }
 
-fn pack(table: &Table, path: &std::path::Path) -> PackedTable {
+fn pack(table: &Table, path: &std::path::Path, options: WriteOptions) -> PackedTable {
     let file = std::fs::File::create(path).unwrap();
-    let header = packed::write(&Canonical::from_table(table), file, "test", 3, 4).unwrap();
+    let header = packed::write(&Canonical::from_table(table), file, "test", options, 4).unwrap();
     let opened = PackedTable::open(path, true).unwrap();
     assert_eq!(opened.header, header);
     opened
@@ -47,13 +49,34 @@ fn stored_index_is_symmetric_and_onto() {
 fn packed_roundtrip_probe_and_identical_pieces() {
     let dir = std::env::temp_dir().join(format!("packed-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for name in ["KQvK", "KvKR", "KNNvK"] {
+    let both = WriteOptions {
+        level: 3,
+        wdl_codec: Codec::Zstd,
+        rank_codec: Codec::Zstd,
+        rank_sides: RankSides::Both,
+    };
+    let white = WriteOptions {
+        level: 3,
+        ..Default::default()
+    };
+    for (name, options) in [
+        ("KQvK", both),
+        ("KQvK", white),
+        ("KvKR", white),
+        ("KNNvK", white),
+        ("KRvKB", white),
+    ] {
         let table = solved(name);
         let path = dir.join(format!("{name}.tbz"));
-        let packed = pack(&table, &path);
-        assert_eq!(packed.decode(4).unwrap(), table, "{name} decode");
+        let packed = pack(&table, &path, options);
+        assert_eq!(
+            packed.decode(4).unwrap(),
+            table,
+            "{name} {options:?} decode"
+        );
         let m = table.material.skeleton_len();
-        for word in (0..table.valid.len()).step_by(if m == 2 { 1 } else { 97 }) {
+        let step = [1, 1, 1, 97, 9973][m];
+        for word in (0..table.valid.len()).step_by(step) {
             let (black, squares) = table.material.decode(word);
             for bk in 0..64u8 {
                 let value = packed.probe(black, &squares[..m], bk).unwrap();
