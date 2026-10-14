@@ -1,5 +1,5 @@
 //! Padded pawnless working index. Collisions/checks are separate legality masks.
-//! Only king pairs are quotiented; stabilizer duplicates keep quiet axes regular.
+//! The index quotients only the king pairs. Stabilizer duplicates keep quiet axes regular.
 use crate::Result;
 
 pub const KING_PAIRS: u64 = 462;
@@ -109,8 +109,8 @@ impl Dense6 {
         squares[..2].copy_from_slice(&pair);
         Ok((squares, id >= KING_PAIRS))
     }
-    /// Coordinate transition only; caller must supply/check a legal quiet move.
-    /// Canonical nonking transitions reduce to changing one base-64 digit.
+    /// Coordinate transition only. The caller must give and check a legal quiet move.
+    /// A canonical transition of a piece other than a king changes only one base-64 digit.
     pub fn relocate(&self, id: u64, axis: usize, destination: u8) -> Result<u64> {
         if id >= SLOTS || axis >= 6 || destination >= 64 {
             return Err("coordinate transition out of bounds".into());

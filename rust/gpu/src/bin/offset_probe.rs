@@ -7,8 +7,8 @@ use std::sync::Arc;
 mod kernel {
     use cutile::core::*;
 
-    /// Store each word's own index at pid * 64 + lane (index derived from the
-    /// i32 block id, as in the solver).
+    /// Store the index of each word at pid * 64 + lane. As in the solver, the
+    /// index comes from the i32 block id.
     #[cutile::entry()]
     unsafe fn store_own_index(buffer: *mut u64) {
         // 2-D grid: block = pid.1 * grid.0 + pid.0, in i64.
@@ -138,10 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .grid((1 << 20, ((words / 64) >> 20) as u32, 1))
             .sync_on(&stream)?;
     }
-    // Binary search for the first index not holding its own value.
+    // Binary search for the first index that does not hold its own value.
     let read = |index: usize| -> Result<u64, Box<dyn std::error::Error>> {
         let mut value = 0u64;
-        // SAFETY: index < elements; one u64 copied and synchronized.
+        // SAFETY: index < elements. The code copies one u64 and synchronizes.
         unsafe {
             cutile::cuda_core::memcpy_dtoh_async(&mut value, ptr + (index * 8) as u64, 1, &stream)?;
             stream.synchronize()?;
@@ -171,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         words - 1,
     ] {
         let mut value = 0u64;
-        // SAFETY: index < elements; one u64 copied and synchronized.
+        // SAFETY: index < elements. The code copies one u64 and synchronizes.
         unsafe {
             cutile::cuda_core::memcpy_dtoh_async(&mut value, ptr + (index * 8) as u64, 1, &stream)?;
             stream.synchronize()?;

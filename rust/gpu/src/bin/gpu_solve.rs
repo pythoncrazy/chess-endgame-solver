@@ -1,13 +1,14 @@
 //! GPU pawnless retrograde solver (cuTile). Same layout and synchronous rounds
-//! as `tablebase_core::pawnless`; the CPU reference is used only to compare.
+//! as `tablebase_core::pawnless`. The CPU reference is only for comparison.
 //!
-//! One tile lane handles one word: the side to move and all skeleton squares,
-//! with the 64 bits indexing the black-king square. Device state is one record
-//! per word, `[win | illegal, loss | illegal]` (both set means illegal), so a
-//! child's value is a single 16-byte pair read. A 64-word block shares the side
-//! to move, so pieces of the other side are skipped with a uniform branch and
-//! each role walks only its own directions and steps. Synchronous rounds read
-//! the previous round only, which makes the round number a proof rank.
+//! One tile lane handles one word: the side to move and all skeleton squares.
+//! The 64 bits of the word give the black-king square. Device state is one
+//! record per word, `[win | illegal, loss | illegal]`. If both bits are set, the
+//! position is illegal. Thus the value of a child is one read of a 16-byte pair.
+//! A 64-word block shares the side to move. Thus a uniform branch skips the
+//! pieces of the other side. Each role walks only its own directions and steps.
+//! Synchronous rounds read only the previous round, so the round number
+//! is a proof rank.
 use cutile::jit_cache::{self, FileSystemJitStore};
 use cutile::prelude::*;
 use serde_json::json;
@@ -17,12 +18,12 @@ use tablebase_core::pawnless::{self, Counts, Material, Solved, Table, UNRESOLVED
 
 /// Program and git revision recorded in table headers (see build.rs).
 const GENERATOR: &str = concat!("gpu_solve git:", env!("TB_SOURCE_REVISION"));
-/// Host threads converting downloaded records (the v3 writer runs beside it).
+/// Host threads that convert downloaded records. The v3 writer runs beside them.
 const CONVERT_THREADS: usize = 8;
 /// Lanes (words) per tile block.
 const BLOCK: usize = 64;
-/// i32 metadata: m at 0; piece i at 8 + 4i (role, white, directions, slides);
-/// direction d of role r at 64 + 2(8r + d) (file step, rank step).
+/// i32 metadata: m is at 0. Piece i is at 8 + 4i (role, white, directions, slides).
+/// Direction d of role r is at 64 + 2(8r + d) (file step, rank step).
 const META_LEN: usize = 64 + 5 * 8 * 2;
 
 #[cutile::module]
@@ -62,8 +63,8 @@ mod kernel {
         exti(t)
     }
 
-    /// Scalar block index of the 2-D grid (block ids above 2^24 on one axis
-    /// are unreliable in the pinned cuTile, so large launches use grid Y).
+    /// Scalar block index of the 2-D grid. Block ids above 2^24 on one axis
+    /// are unreliable in the pinned cuTile. Thus large launches use grid Y.
     fn block_id() -> i32 {
         let pid = get_tile_block_id();
         let grid = get_num_tile_blocks();
@@ -185,7 +186,7 @@ mod kernel {
         };
     }
 
-    /// Masked gather of records `[win | illegal, loss | illegal]`; masked lanes
+    /// Masked gather of records `[win | illegal, loss | illegal]`. Masked lanes
     /// read zero.
     unsafe fn gather_pair(
         records: *const u64,
@@ -198,8 +199,8 @@ mod kernel {
         let col: Tile<i64, { [2] }> = iota(shape![2]);
         let col: Tile<i64, { [64, 2] }> = col.reshape(shape![1, 2]).broadcast(shape![64, 2]);
         // Masked 2-D loads do not lower in the pinned cuTile, and bool tiles
-        // cannot be broadcast: masked-off lanes read record 0 (always valid)
-        // and are zeroed afterwards with the widened u64 lane mask.
+        // cannot be broadcast. Thus masked-off lanes read record 0, which is
+        // always valid. Then the widened u64 lane mask sets them to zero.
         let mask: Tile<u64, { [64, 2] }> = mask.reshape(shape![64, 1]).broadcast(shape![64, 2]);
         let zero2: Tile<u64, { [64, 2] }> = constant(0u64, shape![64, 2]);
         let keep: Tile<bool, { [64, 2] }> = ne_tile(mask, zero2);
@@ -407,8 +408,8 @@ mod kernel {
         tile_to_scalar(n)
     }
 
-    /// Record of the lower table after skeleton piece `j` is captured on the
-    /// move to `moved`: table j - 1, without piece j, other side to move.
+    /// Record of the lower table after a capture of skeleton piece `j` on the
+    /// move to `moved`. This is table j - 1, without piece j, with the other side to move.
     fn lower_child(
         moved: Tile<i64, { [128] }>,
         j: Tile<i64, { [128] }>,
@@ -426,7 +427,7 @@ mod kernel {
     }
 
     /// Masked gather of half `col` of record word `part` (0 win, 2 loss) of
-    /// `records` viewed as u32; masked-off lanes yield zero.
+    /// `records` as u32. Masked-off lanes give zero.
     unsafe fn gather_half(
         records: *const u32,
         record: Tile<i64, { [128] }>,
@@ -456,7 +457,7 @@ mod kernel {
     }
 
     /// Masked gather of `records` (u32 view) at block `block` (64 records,
-    /// 256 u32) plus per-element `offsets`; masked-off lanes yield zero.
+    /// 256 u32) plus per-element `offsets`. Masked-off lanes give zero.
     unsafe fn gather_block(
         records: *const u32,
         block: i32,
@@ -486,8 +487,8 @@ mod kernel {
         loaded.0
     }
 
-    /// Block of the lower table without skeleton piece `j` (1..m-1) that
-    /// block `block` of an m-piece table maps to, other side to move.
+    /// Block of the lower table without skeleton piece `j` (1..m-1), with the
+    /// other side to move. Block `block` of an m-piece table maps to it.
     fn lower_block(block: i32, j: i32, m: i32) -> i32 {
         let low_shift: i32 = 6i32 * (m - 2i32 - j);
         let hi: i32 = block >> (low_shift + 6i32);
@@ -587,8 +588,8 @@ mod kernel {
         };
     }
 
-    /// Final-state checks: `out[0]` counts words whose records differ from
-    /// any of their seven symmetric images; `out[1 + 3 * turn + k]` counts
+    /// Final-state checks. `out[0]` counts words whose records differ from
+    /// any of their seven symmetric images. `out[1 + 3 * turn + k]` counts
     /// legal (k = 0), won (1) and lost (2) positions per side to move.
     #[cutile::entry()]
     unsafe fn finish(out: *mut i64, records: *const u64, meta: *const i32) {
@@ -632,12 +633,12 @@ mod kernel {
         unsafe { atomic_add_at(out, at + 2i32, popcount_sum(rl & valid)) };
     }
 
-    /// Initial records (illegal positions marked as both win and loss) and
+    /// The start records, where illegal positions are both win and loss. Also
     /// the positions in which the side to move is in check.
     #[cutile::entry()]
     unsafe fn statics(records: *mut u64, check_out: *mut u64, meta: *const i32) {
-        // Scalars come from device memory: scalar kernel arguments enter the
-        // pinned cuTile's in-memory kernel key and force front-end reruns.
+        // Scalars come from device memory. Scalar kernel arguments go into the
+        // in-memory kernel key of the pinned cuTile and force front-end reruns.
         let m: i32 = unsafe { scalar_at(meta, 0i32) };
         let blk: i32 = block_id();
         let w: Tile<i64, { [64] }> = word_index(blk);
@@ -712,11 +713,11 @@ mod kernel {
         unsafe { scatter(check_out, w, check) };
     }
 
-    /// Frontier: flag every word that must be evaluated next round because
-    /// it, or one of its children, changed in the round that set `changed`.
-    /// Parents of a word come from un-moves of the side that just moved
-    /// (sliders stop at skeleton pieces; the black king's square is ignored,
-    /// a superset).
+    /// Frontier: flag every word to evaluate in the next round. These are the
+    /// words that changed, or that have a child that changed, in the round that
+    /// set `changed`. Parents of a word come from un-moves of the side that just
+    /// moved. Sliders stop at skeleton pieces. The un-moves ignore the square of
+    /// the black king, so the result is a superset.
     #[cutile::entry()]
     unsafe fn mark(dirty: *mut i32, changed: *const i32, meta: *const i32) {
         let m: i32 = unsafe { scalar_at(meta, 0i32) };
@@ -786,13 +787,13 @@ mod kernel {
         }
     }
 
-    /// One round. MODE 0 seeds checkmates; MODE 1 commits wins and losses
-    /// derived from `input` into `output` (the same buffer when in place).
-    /// MODE 1 evaluates only blocks flagged in `dirty` and records in
-    /// `changed` which blocks changed; skipped blocks keep both buffers
-    /// valid because neither they nor their children changed last round.
-    // Occupancy 8 measured fastest on the H100 NVL (4: 50.6 ms, 8: 42.5 ms,
-    // 16: 53.1 ms, 32: 75.5 ms per KQBvKR sweep).
+    /// One round. MODE 0 seeds checkmates. MODE 1 derives wins and losses from
+    /// `input` and commits them into `output`. In place, these are the same buffer.
+    /// MODE 1 evaluates only the blocks that `dirty` flags. It records in
+    /// `changed` which blocks changed. Skipped blocks keep both buffers valid,
+    /// because they and their children did not change in the last round.
+    // On the H100 NVL, occupancy 8 was the fastest. Time per KQBvKR sweep:
+    // 4: 50.6 ms, 8: 42.5 ms, 16: 53.1 ms, 32: 75.5 ms.
     #[cutile::entry(optimization_hints = (sm_90 = (occupancy = 12, num_worker_warps_per_cta = 2,),))]
     unsafe fn sweep<const MODE: i32, const RANKED: i32>(
         output: *mut u64,
@@ -844,7 +845,7 @@ mod kernel {
             let mut any: Tile<u64, { [64] }> = zero;
             if count_lanes(live_words) > 0i64 {
                 // Skeleton moves never shift bits across the black king
-                // bitboard, so they run on its 32-bit halves: element 2 * lane
+                // bitboard. Thus they run on its 32-bit halves: element 2 * lane
                 // + half of a [128] u32 tile.
                 let col: Tile<i32, { [128] }> = col_index();
                 let col64: Tile<i64, { [128] }> = exti(col);
@@ -855,8 +856,8 @@ mod kernel {
                 let zero_i32h: Tile<i32, { [128] }> = constant(0i32, shape![128]);
                 let w_h: Tile<i64, { [128] }> = i64h(blk) * i64h(64i32) + exti(row);
                 let live_h: Tile<u32, { [128] }> = halves(live_words);
-                // Per-element u32 offsets of the win and loss halves of a lane's
-                // record in its block, and the block bit of the side to move.
+                // Per-element u32 offsets of the win and loss halves of the record
+                // of a lane in its block. Also the block bit of the side to move.
                 let four_h: Tile<i32, { [128] }> = i32h(4i32);
                 let win_off: Tile<i32, { [128] }> = four_h * row + col;
                 let loss_off: Tile<i32, { [128] }> = win_off + i32h(2i32);
@@ -864,8 +865,8 @@ mod kernel {
                 let mut win_h: Tile<u32, { [128] }> = zero_h;
                 let mut nonwin_h: Tile<u32, { [128] }> = zero_h;
                 let mut any_h: Tile<u32, { [128] }> = zero_h;
-                // Pieces 0..m-1 stand on the same squares in every lane (lanes
-                // differ in the last piece only): trace their rays with scalars.
+                // Pieces 0..m-1 stand on the same squares in every lane. Lanes
+                // differ only in the last piece. Trace the rays of these pieces with scalars.
                 let last_white: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * (m - 1i32)) };
                 let mut occ_lo: u32 = 0u32;
                 let mut occ_hi: u32 = 0u32;
@@ -881,7 +882,7 @@ mod kernel {
                         own_hi = own_hi | hi_bit(sq_j);
                     }
                 }
-                // The white king (piece 0) is never captured and always blocks.
+                // No move captures the white king (piece 0), and it always blocks.
                 let wk_sq: i32 = if m > 1i32 {
                     (blk >> (6i32 * (m - 2i32))) & 63i32
                 } else {
@@ -938,8 +939,9 @@ mod kernel {
                                         let reach_hi: u32 = path_hi | t_hi;
                                         let reach: Tile<u32, { [128] }> =
                                             pick(col, reach_lo, reach_hi);
-                                        // The last piece blocks lanes where it stands on the
-                                        // path; where it stands on t (an enemy) it is captured.
+                                        // The last piece blocks lanes where it stands on
+                                        // the path. Where it stands on t (an enemy), this
+                                        // piece captures it.
                                         let free: Tile<u32, { [128] }> =
                                             live_h & (test_bit(reach_lo, reach_hi, row) ^ ones_h);
                                         let at_t: Tile<u32, { [128] }> =
@@ -1018,7 +1020,7 @@ mod kernel {
                         }
                     }
                 }
-                // The last piece stands on the lane's square: per-lane rays.
+                // The last piece stands on the square of the lane: per-lane rays.
                 let i: i32 = m - 1i32;
                 let white_last: i32 = unsafe { scalar_at(meta, 9i32 + 4i32 * i) };
                 if white_last == mover_white {
@@ -1062,8 +1064,8 @@ mod kernel {
                         }
                         let mut alive: Tile<u32, { [128] }> = live_h;
                         let mut path: Tile<u32, { [128] }> = zero_h;
-                        // A ray captures at most once, at its end: collect the
-                        // capture square and path, and look up all captures after.
+                        // A ray captures at most once, at its end. Collect the
+                        // capture square and path. Look up all captures after the loop.
                         let mut cap: Tile<u32, { [128] }> = zero_h;
                         let mut cap_t: Tile<i32, { [128] }> = zero_i32h;
                         let mut cap_path: Tile<u32, { [128] }> = zero_h;
@@ -1279,8 +1281,8 @@ fn records(table: &Table) -> Vec<u64> {
 
 type Error = Box<dyn std::error::Error>;
 
-/// Largest grid X used; ids above 2^24 on one axis are unreliable in the pinned
-/// cuTile, so larger launches add a Y dimension. Word counts are powers of two.
+/// Largest grid X in use. Ids above 2^24 on one axis are unreliable in the pinned
+/// cuTile. Thus larger launches add a Y dimension. Word counts are powers of two.
 const GRID_X: usize = 1 << 20;
 
 fn launch_grid(words: usize) -> (u32, u32, u32) {
@@ -1292,9 +1294,9 @@ fn launch_grid(words: usize) -> (u32, u32, u32) {
     }
 }
 
-/// Stream-ordered device allocation. cuTile tensors are limited to fewer than
-/// 2^31 elements, while six-piece state holds more, so solver buffers use raw
-/// driver allocations; the kernels take raw pointers.
+/// Stream-ordered device allocation. cuTile tensors must have fewer than 2^31
+/// elements, but six-piece state holds more. Thus solver buffers use raw driver
+/// allocations, and the kernels take raw pointers.
 struct DeviceVec<T> {
     ptr: cutile::cuda_core::sys::CUdeviceptr,
     len: usize,
@@ -1313,7 +1315,7 @@ impl<T: Copy + Default> DeviceVec<T> {
         len: usize,
     ) -> Result<Self, Error> {
         let bytes = len.max(1) * std::mem::size_of::<T>();
-        // SAFETY: valid stream; the allocation is initialized before any use.
+        // SAFETY: valid stream. The allocation is initialized before any use.
         let ptr = unsafe { cutile::cuda_core::malloc_async(bytes, stream)? };
         unsafe { cutile::cuda_core::memset_d8_async(ptr, byte, bytes, stream)? };
         Ok(DeviceVec {
@@ -1326,8 +1328,8 @@ impl<T: Copy + Default> DeviceVec<T> {
 
     fn from_host(stream: &Arc<cutile::cuda_core::Stream>, data: &[T]) -> Result<Self, Error> {
         let v = Self::zeroed(stream, data.len())?;
-        // SAFETY: data and the allocation both hold data.len() elements; the
-        // stream is synchronized before `data` can be dropped by the caller.
+        // SAFETY: data and the allocation both hold data.len() elements. The
+        // stream is synchronized before the caller can drop `data`.
         unsafe {
             cutile::cuda_core::memcpy_htod_async(v.ptr, data.as_ptr(), data.len(), stream)?;
             stream.synchronize()?;
@@ -1339,7 +1341,7 @@ impl<T: Copy + Default> DeviceVec<T> {
         if data.len() != self.len {
             return Err("host and device lengths differ".into());
         }
-        // SAFETY: both hold len elements; synchronized before `data` is released.
+        // SAFETY: both hold len elements. The stream is synchronized before `data` is released.
         unsafe {
             cutile::cuda_core::memcpy_htod_async(
                 self.ptr,
@@ -1380,7 +1382,7 @@ impl<T: Copy + Default> DeviceVec<T> {
 
     /// The same allocation as elements of type U.
     fn view<U>(&self) -> cutile::tile_kernel::DevicePointer<U> {
-        // SAFETY: `ptr` is a live allocation; kernels index it in range for U.
+        // SAFETY: `ptr` is a live allocation. Kernels index it in range for U.
         unsafe { cutile::tile_kernel::DevicePointer::from_cu_deviceptr(self.ptr) }
     }
 
@@ -1391,7 +1393,7 @@ impl<T: Copy + Default> DeviceVec<T> {
 
 impl<T> Drop for DeviceVec<T> {
     fn drop(&mut self) {
-        // SAFETY: allocated by malloc_async on this stream; stream order puts the
+        // SAFETY: malloc_async allocated it on this stream. Stream order puts the
         // free after every kernel that used it.
         let _ = unsafe { cutile::cuda_core::free_async(self.ptr, &self.stream) };
     }
@@ -1399,21 +1401,21 @@ impl<T> Drop for DeviceVec<T> {
 
 struct Gpu {
     stream: Arc<cutile::cuda_core::Stream>,
-    /// Rounds after a round that changed at most this fraction of the words
-    /// sweep only the frontier (`TB_FRONTIER`; 0 disables).
+    /// After a round that changed at most this fraction of the words, rounds
+    /// sweep only the frontier. The value comes from `TB_FRONTIER`, and 0 disables it.
     frontier: f64,
 }
 
 impl Gpu {
-    /// Solve one material on the GPU; returns the table and phase records.
+    /// Solve one material on the GPU. Returns the table and phase records.
     ///
     /// `ranked`: synchronous double-buffered rounds with device proof ranks.
-    /// Otherwise WDL is updated in place (sound because the sets are monotone),
-    /// which halves the state but yields no proof ranks.
+    /// Otherwise, the solver updates WDL in place. This is sound because the
+    /// sets are monotone. It halves the state but gives no proof ranks.
     ///
-    /// With `stored`, the stored words (white king in the triangle) and their
-    /// proof ranks are downloaded as a `Canonical`; the full table, if `full`,
-    /// then has no rank plane. Symmetry and counts are checked on the device.
+    /// With `stored`, the solver downloads the stored words (white king in the
+    /// triangle) and their proof ranks as a `Canonical`. Then the full table, if
+    /// `full`, has no rank plane. The device checks symmetry and counts.
     fn solve(
         &self,
         material: &Material,
@@ -1455,7 +1457,7 @@ impl Gpu {
         let prepare_seconds = start.elapsed().as_secs_f64();
         let t0 = Instant::now();
         // SAFETY: every pointer addresses a live device buffer sized for this
-        // material; kernels touch words < `words` and lower records in range.
+        // material. Kernels touch words < `words` and lower records in range.
         unsafe {
             kernel::statics(state[0].ptr(), check.ptr(), meta.ptr())
                 .grid(grid)
@@ -1474,8 +1476,8 @@ impl Gpu {
             }
         }
         let statics_seconds = t0.elapsed().as_secs_f64();
-        // Per-word frontier flags: `dirty` gates the next sweep, `changed`
-        // is written by every sweep.
+        // Per-word frontier flags: `dirty` gates the next sweep, and every
+        // sweep writes `changed`.
         let dirty = DeviceVec::<i32>::filled(&self.stream, 1, words)?;
         let changed_flags = DeviceVec::<i32>::zeroed(&self.stream, words)?;
         let frontier_limit = (self.frontier * words as f64) as i64;
@@ -1500,7 +1502,7 @@ impl Gpu {
             let frontier = round >= 2 && last_changed <= frontier_limit;
             event_start.record(&self.stream)?;
             if frontier {
-                // SAFETY: flag buffers hold one i32 per block; stream ordered.
+                // SAFETY: flag buffers hold one i32 per block. Stream ordered.
                 unsafe {
                     cutile::cuda_core::memset_d8_async(dirty.ptr, 0, dirty.bytes(), &self.stream)?;
                     kernel::mark(dirty.ptr(), changed_flags.ptr(), meta.ptr())
@@ -1508,7 +1510,7 @@ impl Gpu {
                         .sync_on(&self.stream)?;
                 }
             } else if round >= 2 {
-                // SAFETY: as above; nonzero bytes flag every block.
+                // SAFETY: as above. Nonzero bytes flag every block.
                 unsafe {
                     cutile::cuda_core::memset_d8_async(dirty.ptr, 1, dirty.bytes(), &self.stream)?;
                 }
@@ -1524,8 +1526,8 @@ impl Gpu {
                 }
             }
             event_mid.record(&self.stream)?;
-            // SAFETY: as above. In place, input and output are the same buffer;
-            // monotone updates make concurrent reads of old or new values sound.
+            // SAFETY: as above. In place, input and output are the same buffer.
+            // Monotone updates make concurrent reads of old or new values sound.
             unsafe {
                 kernel::sweep(
                     state[dst].ptr(),
@@ -1565,7 +1567,7 @@ impl Gpu {
         let last = if ranked { rounds as usize % 2 } else { 0 };
         let t1 = Instant::now();
         let finish = DeviceVec::<i64>::zeroed(&self.stream, 7)?;
-        // SAFETY: `state[last]` holds 2 * words records; `finish` holds 7 counters.
+        // SAFETY: `state[last]` holds 2 * words records, and `finish` holds 7 counters.
         unsafe {
             kernel::finish(finish.ptr(), state[last].ptr(), meta.ptr())
                 .grid(grid)
@@ -1679,8 +1681,9 @@ struct Solution {
 }
 
 /// Every pawnless material of at most `pieces` pieces that a complete set
-/// needs: the side with more pieces is white (equal counts: white's pieces
-/// first in QRBN order), closed under captures, lower materials first.
+/// must have. The side with more pieces is white. For equal counts, white is
+/// the side whose pieces come first in QRBN order. The list is closed under
+/// captures, with lower materials first.
 fn all_materials(pieces: usize) -> Result<Vec<Material>, Error> {
     const ROLES: [char; 4] = ['Q', 'R', 'B', 'N'];
     fn multisets(n: usize, from: usize, prefix: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
@@ -1733,8 +1736,8 @@ struct Job {
     record: serde_json::Value,
 }
 
-/// Background writer: the v3 file (written to a temporary name and renamed
-/// when complete). Symmetry was already checked on the device.
+/// Background writer of the v3 file. It writes to a temporary name and renames
+/// the file when it is complete. The device already checked symmetry.
 fn write_jobs(
     jobs: std::sync::mpsc::Receiver<Job>,
     level: i32,
@@ -1778,7 +1781,7 @@ fn write_jobs(
 
 /// Solve every material of at most `pieces` pieces in one process and write
 /// compressed v3 tables. Tables that later materials capture into stay in
-/// memory; finished v3 files from this exact clean build are reused.
+/// memory. The solver reuses finished v3 files from this exact clean build.
 fn solve_all(
     gpu: &Gpu,
     pieces: usize,
@@ -1822,7 +1825,7 @@ fn solve_all(
                         .map(|l| solved.get(&l.name()).map(|t| t.as_ref())),
                 })
                 .collect::<tablebase_core::Result<_>>()?;
-            // Only materials that later ones capture into need the full table.
+            // Only a material that a later material captures into must keep the full table.
             gpu.solve(m, &lower, true, Some(&layout), needed_below)?
         };
         if solution.violations != 0 {
@@ -1890,14 +1893,14 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-/// Solve `material` and its capture dependencies, writing v2 files.
+/// Solve `material` and its capture dependencies, and write v2 files.
 fn solve_one_tree(
     gpu: &Gpu,
     material: &Material,
     output: &std::path::Path,
     max_ranked: Option<String>,
 ) -> Result<serde_json::Value, Error> {
-    // Proof ranks need 128 bytes per word: keep them up to five pieces.
+    // Proof ranks use 128 bytes per word: keep them up to five pieces.
     let max_ranked: usize = max_ranked.map_or(Ok(4), |v| v.parse())?;
     let mut records_out = Vec::new();
     let mut solve_one = |m: &Material, lower: &[Option<&Table>]| -> tablebase_core::Result<Table> {

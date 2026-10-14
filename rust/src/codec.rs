@@ -34,8 +34,8 @@ pub struct Page {
     reconstructed: Option<Vec<i64>>,
 }
 impl Page {
-    /// With an authenticated v3 index checksum, retain direct-access packed bodies.
-    /// Without one, reconstruct and verify every cell before returning the page.
+    /// With an authenticated v3 index checksum, keep direct-access packed bodies.
+    /// Without one, reconstruct and verify every cell before the page goes to the caller.
     pub fn parse(
         frame: &[u8],
         authenticated: Option<[u8; 16]>,

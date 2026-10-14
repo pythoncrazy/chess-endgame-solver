@@ -1,4 +1,4 @@
-//! Local archive cache-pressure benchmark. Never labels local reads as R2 latency.
+//! Benchmark of local archive cache pressure. It never labels local reads as R2 latency.
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
