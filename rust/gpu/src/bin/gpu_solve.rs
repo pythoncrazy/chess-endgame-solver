@@ -792,8 +792,8 @@ mod kernel {
     /// MODE 1 evaluates only the blocks that `dirty` flags. It records in
     /// `changed` which blocks changed. Skipped blocks keep both buffers valid,
     /// because they and their children did not change in the last round.
-    // On the H100 NVL, occupancy 8 was the fastest. Time per KQBvKR sweep:
-    // 4: 50.6 ms, 8: 42.5 ms, 16: 53.1 ms, 32: 75.5 ms.
+    // On the H100 NVL, occupancy 12 with 2 worker warps was the fastest.
+    // Time per KQBvKR sweep: occupancy 12: 10.2 ms, occupancy 16: 10.45 ms.
     #[cutile::entry(optimization_hints = (sm_90 = (occupancy = 12, num_worker_warps_per_cta = 2,),))]
     unsafe fn sweep<const MODE: i32, const RANKED: i32>(
         output: *mut u64,
