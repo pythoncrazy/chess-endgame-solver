@@ -160,3 +160,21 @@ fn format_v2_unranked_and_legacy_v1_files() {
     v1.extend_from_slice(&payload);
     assert_eq!(Table::read(v1.as_slice()).unwrap().0, t);
 }
+
+#[test]
+fn rank_width_follows_round_count() {
+    let mut t = solved_kqvk();
+    assert_eq!(t.rank_width(), 1);
+    let mut bytes = Vec::new();
+    assert_eq!(t.write(&mut bytes, "test").unwrap().planes[2], "rank:u8x64");
+    assert_eq!(Table::read(bytes.as_slice()).unwrap().0, t);
+    // A table needing 255 or more rounds stores u16 ranks.
+    t.rounds = 300;
+    t.rank[5 * 64 + 9] = 299;
+    let mut bytes = Vec::new();
+    assert_eq!(
+        t.write(&mut bytes, "test").unwrap().planes[2],
+        "rank:u16x64"
+    );
+    assert_eq!(Table::read(bytes.as_slice()).unwrap().0, t);
+}

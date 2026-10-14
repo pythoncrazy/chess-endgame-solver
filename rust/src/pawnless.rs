@@ -586,12 +586,50 @@ pub struct FileHeader {
     /// the same generator.
     #[serde(default)]
     pub generator: String,
+    /// How `payload_sha256` is computed: empty for SHA-256 of the payload,
+    /// `sha256-tree-16MiB` for SHA-256 over the SHA-256 digests of 16 MiB
+    /// chunks followed by the payload length (parallel to compute and check).
+    #[serde(default)]
+    pub digest_scheme: String,
+}
+
+const DIGEST_CHUNK: usize = 16 << 20;
+const DIGEST_TREE: &str = "sha256-tree-16MiB";
+
+/// Payload digest under `scheme`, computed in parallel for the tree scheme.
+pub fn payload_digest(payload: &[u8], scheme: &str) -> Result<String> {
+    match scheme {
+        "" => Ok(format!("{:x}", Sha256::digest(payload))),
+        DIGEST_TREE => {
+            let chunks: Vec<&[u8]> = payload.chunks(DIGEST_CHUNK).collect();
+            let digests = parallel_map(chunks.len(), 16, |i| {
+                Ok(<[u8; 32]>::from(Sha256::digest(chunks[i])))
+            })?;
+            let mut root = Sha256::new();
+            for d in &digests {
+                root.update(d);
+            }
+            root.update((payload.len() as u64).to_le_bytes());
+            Ok(format!("{:x}", root.finalize()))
+        }
+        other => Err(format!("unknown digest scheme {other:?}")),
+    }
 }
 
 impl Table {
+    /// Bytes per stored proof rank: none, u8 (255 = unresolved) when every
+    /// rank fits, else u16.
+    pub fn rank_width(&self) -> usize {
+        match (self.rank.is_empty(), self.rounds < 255) {
+            (true, _) => 0,
+            (false, true) => 1,
+            (false, false) => 2,
+        }
+    }
+
     /// Bytes per word record in the version 2 file layout.
     pub fn record_len(&self) -> usize {
-        16 + if self.rank.is_empty() { 0 } else { 128 }
+        16 + 64 * self.rank_width()
     }
 
     /// Version 2 payload, built in parallel chunks of whole records.
@@ -608,10 +646,20 @@ impl Table {
                         let illegal = !self.valid[w];
                         rec[..8].copy_from_slice(&(self.win[w] | illegal).to_le_bytes());
                         rec[8..16].copy_from_slice(&(self.loss[w] | illegal).to_le_bytes());
-                        if record > 16 {
-                            for (b, value) in self.rank[w * 64..w * 64 + 64].iter().enumerate() {
-                                rec[16 + 2 * b..18 + 2 * b].copy_from_slice(&value.to_le_bytes());
+                        let ranks = &self.rank.get(w * 64..w * 64 + 64).unwrap_or(&[]);
+                        match record {
+                            80 => {
+                                for (b, &value) in ranks.iter().enumerate() {
+                                    rec[16 + b] = value.min(255) as u8;
+                                }
                             }
+                            144 => {
+                                for (b, value) in ranks.iter().enumerate() {
+                                    rec[16 + 2 * b..18 + 2 * b]
+                                        .copy_from_slice(&value.to_le_bytes());
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 });
@@ -620,15 +668,17 @@ impl Table {
         bytes
     }
 
-    pub fn header(&self, payload: &[u8], generator: &str) -> FileHeader {
+    pub fn header(&self, payload: &[u8], generator: &str) -> Result<FileHeader> {
         let mut planes = vec![
             "win|illegal:u64".to_string(),
             "loss|illegal:u64".to_string(),
         ];
-        if !self.rank.is_empty() {
-            planes.push("rank:u16x64".to_string());
+        match self.rank_width() {
+            1 => planes.push("rank:u8x64".to_string()),
+            2 => planes.push("rank:u16x64".to_string()),
+            _ => {}
         }
-        FileHeader {
+        Ok(FileHeader {
             format: "tablebase-pawnless-v2".into(),
             material: self.material.name(),
             layout: "record per word (turn, skeleton squares; white king first); \
@@ -637,14 +687,15 @@ impl Table {
             words: self.valid.len(),
             rounds: self.rounds,
             planes,
-            payload_sha256: format!("{:x}", Sha256::digest(payload)),
+            payload_sha256: payload_digest(payload, DIGEST_TREE)?,
             generator: generator.to_string(),
-        }
+            digest_scheme: DIGEST_TREE.to_string(),
+        })
     }
 
     pub fn write(&self, mut out: impl Write, generator: &str) -> Result<FileHeader> {
         let payload = self.payload();
-        let header = self.header(&payload, generator);
+        let header = self.header(&payload, generator)?;
         let json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
         out.write_all(FILE_MAGIC).map_err(|e| e.to_string())?;
         out.write_all(&(json.len() as u64).to_le_bytes())
@@ -677,18 +728,20 @@ impl Table {
         if material.words() != words {
             return Err("table word count disagrees with its material".into());
         }
-        let ranked = match (v2, header.planes.len()) {
-            (true, 2) | (false, 3) => false,
-            (true, 3) | (false, 4) => true,
+        let rank_width = match (v2, header.planes.len()) {
+            (true, 2) | (false, 3) => 0,
+            (true, 3) if header.planes[2] == "rank:u8x64" => 1,
+            (true, 3) | (false, 4) => 2,
             _ => return Err("table header lists an unsupported plane set".into()),
         };
+        let ranked = rank_width > 0;
         let mut payload = Vec::new();
         input.read_to_end(&mut payload).map_err(|e| e.to_string())?;
-        let expected = words * if v2 { 16 } else { 24 } + if ranked { words * 128 } else { 0 };
+        let expected = words * if v2 { 16 } else { 24 } + words * 64 * rank_width;
         if payload.len() != expected {
             return Err("table payload has the wrong length".into());
         }
-        if format!("{:x}", Sha256::digest(&payload)) != header.payload_sha256 {
+        if payload_digest(&payload, &header.digest_scheme)? != header.payload_sha256 {
             return Err("table payload digest mismatch".into());
         }
         let u64_at = |offset: usize| {
@@ -708,17 +761,22 @@ impl Table {
             rounds: header.rounds,
         };
         if v2 {
-            let record = 16 + if ranked { 128 } else { 0 };
+            let record = 16 + 64 * rank_width;
             for w in 0..words {
                 let (marked_win, marked_loss) = (u64_at(w * record), u64_at(w * record + 8));
                 let valid = !(marked_win & marked_loss);
                 table.valid[w] = valid;
                 table.win[w] = marked_win & valid;
                 table.loss[w] = marked_loss & valid;
-                if ranked {
-                    for b in 0..64 {
-                        table.rank[w * 64 + b] = u16_at(w * record + 16 + 2 * b);
-                    }
+                for b in 0..64 * usize::from(ranked) {
+                    table.rank[w * 64 + b] = if rank_width == 1 {
+                        match payload[w * record + 16 + b] {
+                            255 => UNRESOLVED,
+                            r => u16::from(r),
+                        }
+                    } else {
+                        u16_at(w * record + 16 + 2 * b)
+                    };
                 }
             }
         } else {

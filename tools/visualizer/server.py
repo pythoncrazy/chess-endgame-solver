@@ -65,6 +65,7 @@ class Table:
     version: int
     data: np.ndarray
     ranked: bool
+    rank_width: int
     pieces: list[tuple[bool, int]] = field(default_factory=list)
 
     @classmethod
@@ -78,12 +79,17 @@ class Table:
         words, base = header["words"], 16 + length
         version = 2 if magic == b"TBPAWNL2" else 1
         ranked = len(header["planes"]) == (3 if version == 2 else 4)
+        rank_width = 0
+        if ranked:
+            rank_width = 1 if version == 2 and header["planes"][2] == "rank:u8x64" else 2
         if version == 2:
-            record = 16 + (128 if ranked else 0)
+            record = 16 + 64 * rank_width
             data = np.memmap(path, dtype=np.uint8, mode="r", offset=base, shape=(words, record))
         else:
             data = np.memmap(path, dtype=np.uint8, mode="r", offset=base)
-        return cls(path, header, words, version, data, ranked, skeleton(header["material"]))
+        return cls(
+            path, header, words, version, data, ranked, rank_width, skeleton(header["material"])
+        )
 
     @property
     def name(self) -> str:
@@ -111,7 +117,11 @@ class Table:
             loss = int.from_bytes(rec[8:16], "little")
             if win & loss & bit:
                 return None, None
-            rank = int.from_bytes(rec[16 + 2 * bk : 18 + 2 * bk], "little") if self.ranked else None
+            rank = None
+            if self.rank_width == 1:
+                rank = UNRESOLVED if rec[16 + bk] == 255 else rec[16 + bk]
+            elif self.rank_width == 2:
+                rank = int.from_bytes(rec[16 + 2 * bk : 18 + 2 * bk], "little")
         else:
             d, n = self.data, self.words
 
