@@ -12,7 +12,7 @@ class NotATableError(ValueError):
 
 def header(path: Path) -> dict:
     with path.open("rb") as f:
-        if f.read(8) != b"TBPAWNL1":
+        if f.read(8) not in (b"TBPAWNL1", b"TBPAWNL2"):
             raise NotATableError(path)
         length = int.from_bytes(f.read(8), "little")
         return json.loads(f.read(length))
