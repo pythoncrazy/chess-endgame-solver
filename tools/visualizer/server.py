@@ -31,6 +31,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -92,6 +93,12 @@ class Layout:
         self, black_to_move: bool, squares: list[int], bk: int
     ) -> tuple[int | None, int | None]:
         raise NotImplementedError
+
+    def candidates(
+        self, black_to_move: bool, goal: int, seed: int
+    ) -> Iterator[tuple[list[int], int]]:
+        """Positions that have the goal value, from a random start. Some can be illegal."""
+        return iter(())
 
 
 @dataclass
@@ -166,6 +173,33 @@ class Table(Layout):
         wdl = 2 if win & bit else -2 if loss & bit else 0
         return wdl, None if rank in (None, UNRESOLVED) else rank
 
+    def candidates(
+        self, black_to_move: bool, goal: int, seed: int
+    ) -> Iterator[tuple[list[int], int]]:
+        rng = np.random.default_rng(seed)
+        n, half, chunk = self.words, self.words // 2, 1 << 12
+        # Values come in clusters. Thus chunks in a random order find one sooner.
+        for start in rng.permutation(
+            np.arange(black_to_move * half, (black_to_move + 1) * half, chunk)
+        ).tolist():
+            end = min(start + chunk, n)
+            if self.version == 2:
+                planes = np.ascontiguousarray(self.data[start:end, :16]).view("<u8")
+                win, loss = planes[:, 0], planes[:, 1]
+                legal = ~(win & loss)
+            else:
+                legal, win, loss = (
+                    np.frombuffer(self.data[8 * (k * n + start) : 8 * (k * n + end)], "<u8")
+                    for k in range(3)
+                )
+            mask = legal & (win if goal == 2 else loss & ~win if goal == -2 else ~(win | loss))
+            for w in rng.permutation(np.flatnonzero(mask)):
+                bits = int(mask[w])
+                squares = self.decode(start + int(w))[1]
+                while bits:
+                    yield squares, (bits & -bits).bit_length() - 1
+                    bits &= bits - 1
+
 
 # Formats v3/v4 (rust/src/packed.rs, rust/TBZ_FORMAT.md): one position per symmetry class.
 TRIANGLE = (0, 1, 2, 3, 9, 10, 11, 18, 19, 27)
@@ -188,6 +222,16 @@ SYMMETRY = [[_symmetry(g, s) for s in range(64)] for g in range(8)]
 TRANSPOSE = SYMMETRY[1]
 TO_TRIANGLE = [next(g for g in range(8) if SYMMETRY[g][s] in TRIANGLE_INDEX) for s in range(64)]
 WDL_CODE = (0, 2, -2, 2)
+CODE_SHIFTS = np.arange(0, 8, 2, dtype=np.uint8)
+TRIANGLE_ARRAY = np.array(TRIANGLE)
+TRANSPOSE_ARRAY = np.array(TRANSPOSE)
+KING_ZONE = np.array(
+    [
+        sum(1 << t for t in range(64) if max(abs(t % 8 - s % 8), abs(t // 8 - s // 8)) <= 1)
+        for s in range(64)
+    ],
+    np.uint64,
+)
 
 
 class BlockCache:
@@ -287,13 +331,71 @@ class PackedTable(Layout):
         word = (int(black_to_move) * 10 + TRIANGLE_INDEX[stored[0]]) * self.per + rest
         return word * 64 + t
 
-    def _byte(self, section: str, at: int) -> bytes:
+    def _block(self, section: str, b: int) -> bytes:
         frames, index, raw, codec = self.sections[section]
-        b = at // self.block
         frame = self.view[frames + int(index[b]) : frames + int(index[b + 1])]
         size = min(self.block, raw - b * self.block)
-        block = BLOCKS.get((self.path, section, b), frame, size, codec)
+        return BLOCKS.get((self.path, section, b), frame, size, codec)
+
+    def _byte(self, section: str, at: int) -> bytes:
+        block = self._block(section, at // self.block)
         return block[at % self.block : at % self.block + 2]
+
+    def candidates(
+        self, black_to_move: bool, goal: int, seed: int
+    ) -> Iterator[tuple[list[int], int]]:
+        rng = np.random.default_rng(seed)
+        codes = [c for c, v in enumerate(WDL_CODE) if v == goal]
+        side = 10 * self.per * 64  # stored positions for one side to move
+        first, last = side * black_to_move, side * (black_to_move + 1)
+        for b in rng.permutation(
+            np.arange(first // (4 * self.block), (last - 1) // (4 * self.block) + 1)
+        ).tolist():
+            data = np.frombuffer(self._block("wdl", b), np.uint8)
+            code = ((data[:, None] >> CODE_SHIFTS) & 3).reshape(-1, 64)
+            words = np.arange(b * self.block // 16, b * self.block // 16 + len(code))
+            words = words[(words >= first // 64) & (words < last // 64)]
+            code = code[words - b * self.block // 16]
+            hits = np.isin(code, codes) & self._can_store(words)
+            hits = np.flatnonzero(hits) + 64 * int(words[0]) if len(words) else hits[:0]
+            yield from (self._stored(int(p), rng) for p in rng.permutation(hits))
+
+    def _can_store(self, words: np.ndarray) -> np.ndarray:
+        """For each stored word, the black king squares a writer can store.
+
+        That is: distinct squares, kings apart, canonical order. A writer fills
+        the other slots with the last stored code."""
+        triangle, rest = np.divmod(words % (10 * self.per), self.per)
+        squares = np.empty((self.m, len(words)), np.int64)
+        squares[0] = TRIANGLE_ARRAY[triangle]
+        for i in range(self.m - 1, 0, -1):
+            rest, squares[i] = np.divmod(rest, 64)
+        ordered = np.sort(squares, axis=0)
+        ok = np.all(ordered[1:] != ordered[:-1], axis=0)
+        transposed = TRANSPOSE_ARRAY[squares]
+        for a, b in self.groups:
+            ok &= np.all(squares[a + 1 : b] > squares[a : b - 1], axis=0)
+            transposed[a:b] = np.sort(transposed[a:b], axis=0)
+        difference = transposed - squares
+        first = difference[np.argmax(difference != 0, axis=0), np.arange(len(words))]
+        diagonal = squares[0] % 9 == 0
+        ok &= ~diagonal | (first >= 0)
+        occupied = np.bitwise_or.reduce(np.uint64(1) << squares.astype(np.uint64), axis=0)
+        free = ~(occupied | KING_ZONE[squares[0]])
+        free &= np.where(diagonal & (first == 0), np.uint64(LOWER_RIGHT), ~np.uint64(0))
+        free = np.where(ok, free, np.uint64(0))
+        return (free[:, None] >> np.arange(64, dtype=np.uint64)) & np.uint64(1) == 1
+
+    def _stored(self, p: int, rng: np.random.Generator) -> tuple[list[int], int]:
+        """Stored position `p` under a random symmetry."""
+        word, bk = divmod(p, 64)
+        triangle, rest = divmod(word % (10 * self.per), self.per)
+        squares = []
+        for _ in range(self.m - 1):
+            rest, s = divmod(rest, 64)
+            squares.append(s)
+        g = SYMMETRY[int(rng.integers(8))]
+        return [g[TRIANGLE[triangle]], *(g[s] for s in reversed(squares))], g[bk]
 
     def _code(self, p: int) -> int:
         return self._byte("wdl", p // 4)[0] >> (2 * (p % 4)) & 3
@@ -402,6 +504,39 @@ def accepts(header: str, token: str) -> bool:
                     return False
         return True
     return False
+
+
+def position_fen(
+    table: Layout, goal: int | None, black_to_move: bool, squares: list[int], bk: int
+) -> str | None:
+    """The FEN of a legal position with the goal value, or None."""
+    if len({*squares, bk}) != len(squares) + 1:
+        return None
+    board = chess.Board(None)
+    for (white, role), square in zip(table.pieces, squares, strict=True):
+        board.set_piece_at(square, chess.Piece(role, white))
+    board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
+    board.turn = not black_to_move
+    if not chess_legal(board):
+        return None
+    wdl, _ = table.lookup(black_to_move, squares, bk)
+    if wdl is None or (goal is not None and wdl != goal):
+        return None
+    return board.fen()
+
+
+def scan(table: Layout, goal: int, sides: list[bool], rng: random.Random) -> dict:
+    """A rare goal: scan the table from a random start. It ends in a definite answer."""
+    deadline = time.monotonic() + 20
+    rng.shuffle(sides)
+    for black_to_move in sides:
+        for squares, bk in table.candidates(black_to_move, goal, rng.getrandbits(64)):
+            fen = position_fen(table, goal, black_to_move, squares, bk)
+            if fen:
+                return {"s": "ok", "f": fen}
+            if time.monotonic() > deadline:
+                return {"s": "busy"}
+    return {"s": "none"}
 
 
 def sign(x: int) -> int:
@@ -670,7 +805,7 @@ class Store:
         out["ms"] = round((time.perf_counter() - start) * 1000, 2)
         return out
 
-    def best_line(self, fen: str, limit: int = 120) -> dict:
+    def best_line(self, fen: str, limit: int = 1000) -> dict:
         """Best play from a decided position: fastest win, longest defence."""
         try:
             board = parse_board(fen)
@@ -717,31 +852,20 @@ class Store:
             return {"s": "missing", "m": material}
         rng = random.SystemRandom()
         goal = {"win": 2, "draw": 0, "loss": -2}.get(want)
+        sides = {"w": [False], "b": [True]}.get(turn, [False, True])
         counts = table.header.get("counts")
         if goal is not None and counts:
-            sides = {"w": [0], "b": [1]}.get(turn, [0, 1])
-            if not any(counts[i][{2: "win", 0: "draw", -2: "loss"}[goal]] for i in sides):
-                return {"s": "none"}
-        for _ in range(200_000):
-            word = rng.randrange(table.words // 2)
-            if turn == "b" or (turn == "any" and rng.random() < 0.5):
-                word += table.words // 2
-            bk = rng.randrange(64)
-            black_to_move, squares = table.decode(word)
-            if len({*squares, bk}) != len(squares) + 1:
-                continue
-            board = chess.Board(None)
-            for (white, role), square in zip(table.pieces, squares, strict=True):
-                board.set_piece_at(square, chess.Piece(role, white))
-            board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
-            board.turn = not black_to_move
-            if not chess_legal(board):
-                continue
-            wdl, _ = table.lookup(black_to_move, squares, bk)
-            if wdl is None or (goal is not None and wdl != goal):
-                continue
-            return {"s": "ok", "f": board.fen()}
-        return {"s": "none"}
+            name = {2: "win", 0: "draw", -2: "loss"}[goal]
+            sides = [b for b in sides if counts[int(b)][name]]
+        for _ in range(5_000 if sides else 0):
+            black_to_move = rng.choice(sides)
+            squares = [rng.randrange(64) for _ in table.pieces]
+            fen = position_fen(table, goal, black_to_move, squares, rng.randrange(64))
+            if fen:
+                return {"s": "ok", "f": fen}
+        if goal is None or not sides:
+            return {"s": "none"}
+        return scan(table, goal, sides, rng)
 
 
 # Assets -------------------------------------------------------------------------------
