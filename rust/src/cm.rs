@@ -715,7 +715,7 @@ fn rel(x: u16, pred: u16) -> usize {
     if x == NO_RANK {
         17
     } else {
-        (i32::from(x) - i32::from(pred)).clamp(-8, 8) as usize + 8
+        ((i32::from(x) - i32::from(pred)).clamp(-8, 8) + 8) as usize
     }
 }
 
