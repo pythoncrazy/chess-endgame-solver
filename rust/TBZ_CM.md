@@ -9,14 +9,16 @@ The model is in the section. Thus each block is independent of the other blocks.
 
 ## Section layout
 
-A `cm` section has two more header fields:
+A `cm` section has three more header fields:
 
-- `block_words`: the stored words in each block. The writer uses 256 for `wdl` and 64 for `rank`.
+- `block_words`: the stored words in each block. The writer uses 256 for `wdl` and 64 for `rank` by default.
 - `model_bytes`: the length of the model blob.
+- `index_bytes`: the length of the frame index.
 
-At `offset` there is the model blob. The block index follows the model blob.
-The index has the same form as for the other codecs. Frame `b` codes the stored words `b * block_words` to `(b + 1) * block_words - 1`.
-`compressed_bytes` includes the model blob.
+At `offset` there is the model blob. The frame index follows it, and then the frames.
+The frame index is a zstd frame. It has one u32 for each block: the length of its frame.
+Frame `b` starts after the frames 0 to `b - 1`. It codes the stored words `b * block_words` to `(b + 1) * block_words - 1`.
+`compressed_bytes` is the length of the model blob, the frame index and the frames.
 
 A decoder makes the same decompressed bytes as the other codecs for each stored legal position.
 For other positions, the decoder writes the previous value of the block (0 at the start of the block).
