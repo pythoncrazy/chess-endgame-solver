@@ -2011,6 +2011,33 @@ fn solve_one_tree(
             solved.insert(header.material, Arc::new(table));
         }
     }
+    // solve_tree does not go below a resumed table. Thus resume a table only
+    // with all its lower tables, or a bad lower file stays in the output.
+    loop {
+        let incomplete: Vec<String> = solved
+            .iter()
+            .filter(|(_, t)| {
+                (1..t.material.skeleton_len()).any(|k| {
+                    t.material
+                        .without(k)
+                        .is_ok_and(|l| !solved.contains_key(&l.name()))
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if incomplete.is_empty() {
+            break;
+        }
+        for name in incomplete {
+            eprintln!("not resuming {name} (a lower table is not resumed)");
+            solved.remove(&name);
+        }
+    }
+    resumed.retain(|r| {
+        r["material"]
+            .as_str()
+            .is_some_and(|m| solved.contains_key(m))
+    });
     solve_tree(material, &mut solved, &mut solve_one)?;
     Ok(json!({"resumed_verified_tables": resumed, "tables": records_out}))
 }
