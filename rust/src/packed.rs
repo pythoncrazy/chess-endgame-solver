@@ -1119,7 +1119,7 @@ struct CmIndex {
     /// Absolute file offset and length of the model blob.
     model_at: u64,
     model_len: usize,
-    model: OnceLock<std::result::Result<Arc<cm::Model>, String>>,
+    model: OnceLock<Arc<cm::Model>>,
 }
 
 /// A v3 or v4 table that is open for probes. It reads blocks on demand and caches them.
@@ -1317,22 +1317,21 @@ impl PackedTable {
     }
 
     fn cm_model(&self, section: &SectionIndex, index: &CmIndex) -> Result<Arc<cm::Model>> {
-        index
-            .model
-            .get_or_init(|| {
-                let mut blob = vec![0u8; index.model_len];
-                self.file
-                    .read_exact_at(&mut blob, index.model_at)
-                    .map_err(|e| e.to_string())?;
-                let (sizes, sets) = if std::ptr::eq(section, &self.wdl) {
-                    (cm::wdl_sizes(), cm::WDL_SETS)
-                } else {
-                    let width = self.header.rank_width;
-                    (cm::rank_sizes(width), cm::rank_sets(width))
-                };
-                cm::Model::parse(&blob, &sizes, sets).map(Arc::new)
-            })
-            .clone()
+        if let Some(model) = index.model.get() {
+            return Ok(model.clone());
+        }
+        let mut blob = vec![0u8; index.model_len];
+        self.file
+            .read_exact_at(&mut blob, index.model_at)
+            .map_err(|e| e.to_string())?;
+        let (sizes, sets) = if std::ptr::eq(section, &self.wdl) {
+            (cm::wdl_sizes(), cm::WDL_SETS)
+        } else {
+            let width = self.header.rank_width;
+            (cm::rank_sizes(width), cm::rank_sets(width))
+        };
+        let model = Arc::new(cm::Model::parse(&blob, &sizes, sets)?);
+        Ok(index.model.get_or_init(|| model).clone())
     }
 
     /// Decode `cm` block `b` into the byte layout of the other codecs.
@@ -1386,7 +1385,7 @@ impl PackedTable {
                 prev = r;
             }
             if width == 1 {
-                out[p] = prev as u8;
+                out[p] = u8::try_from(prev).map_err(|_| "cm rank exceeds one byte")?;
             } else {
                 out[2 * p..2 * p + 2].copy_from_slice(&prev.to_le_bytes());
             }
@@ -1415,7 +1414,10 @@ impl PackedTable {
     /// Identical pieces can be in any order.
     pub fn probe(&self, black: bool, squares: &[u8], black_king: u8) -> Result<Option<Value>> {
         let material = self.material();
-        if squares.len() != material.skeleton_len() || black_king >= 64 {
+        if squares.len() != material.skeleton_len()
+            || black_king >= 64
+            || squares.iter().any(|&s| s >= 64)
+        {
             return Err("position does not fit the material".into());
         }
         let word = material.encode(black, squares);
