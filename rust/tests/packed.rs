@@ -117,3 +117,74 @@ fn packed_roundtrip_probe_and_identical_pieces() {
     assert!(PackedTable::open(&path, true).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Rewrite one header field of a packed file.
+fn with_header(bytes: &[u8], edit: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
+    let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let mut header: serde_json::Value = serde_json::from_slice(&bytes[16..16 + len]).unwrap();
+    edit(&mut header);
+    let json = serde_json::to_vec(&header).unwrap();
+    let mut out = bytes[..8].to_vec();
+    out.extend((json.len() as u64).to_le_bytes());
+    out.extend(json);
+    out.extend(&bytes[16 + len..]);
+    out
+}
+
+/// A header with sizes that disagree with the material or the file is an error.
+/// It must not cause a panic or a large allocation.
+#[test]
+fn bad_headers_are_errors() {
+    let dir = std::env::temp_dir().join(format!("packed-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let table = solved("KQvK");
+    let zstd = WriteOptions {
+        level: 3,
+        ..Default::default()
+    };
+    let cm = WriteOptions {
+        wdl_codec: Codec::Cm,
+        rank_codec: Codec::Cm,
+        ..zstd
+    };
+    let huge = u64::MAX / 3;
+    let cases: [(&str, &str, u64); 9] = [
+        ("", "rank_width", 3),
+        ("0", "blocks", 1 << 40),
+        ("0", "raw_bytes", 16),
+        ("1", "raw_bytes", 1 << 40),
+        ("1", "offset", huge),
+        ("0", "model_bytes", huge),
+        ("1", "index_bytes", huge),
+        ("0", "block_words", 0),
+        ("1", "blocks", u64::from(u32::MAX)),
+    ];
+    for (codec, options) in [("zstd", zstd), ("cm", cm)] {
+        let path = dir.join(format!("{codec}.tbz"));
+        pack(&table, &path, options);
+        let bytes = std::fs::read(&path).unwrap();
+        let bad = dir.join("bad.tbz");
+        for (section, field, value) in cases {
+            let present = std::cell::Cell::new(false);
+            let edited = with_header(&bytes, |h| {
+                let target = match section {
+                    "" => &mut *h,
+                    s => &mut h["sections"][s.parse::<usize>().unwrap()],
+                };
+                if target.get(field).is_some() {
+                    target[field] = value.into();
+                    present.set(true);
+                }
+            });
+            if !present.get() {
+                continue;
+            }
+            std::fs::write(&bad, &edited).unwrap();
+            assert!(
+                PackedTable::open(&bad, false).is_err(),
+                "{codec} {section} {field} {value}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
