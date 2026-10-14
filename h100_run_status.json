@@ -1,6 +1,0 @@
-{
-  "status": "blocked",
-  "whole_six_piece_solver": false,
-  "h100_generation_measured": false,
-  "reason": "No NVIDIA driver/GPU is exposed: nvidia-smi is unavailable."
-}
