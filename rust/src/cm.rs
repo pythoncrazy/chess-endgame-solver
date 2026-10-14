@@ -85,7 +85,13 @@ impl Model {
 
     /// Read a model blob. The sizes and the number of sets must agree.
     pub fn parse(blob: &[u8], sizes: &[usize], sets: usize) -> Result<Model> {
-        let raw = zstd::stream::decode_all(blob).map_err(|e| e.to_string())?;
+        let most = 12
+            + sizes
+                .iter()
+                .map(|&n| 4 + n.div_ceil(8) + 2 * n)
+                .sum::<usize>()
+            + 4 * sets * sizes.len();
+        let raw = zstd::bulk::decompress(blob, most).map_err(|e| e.to_string())?;
         let mut at = 0usize;
         let mut take = |n: usize| -> Result<&[u8]> {
             let s = raw.get(at..at + n).ok_or("cm model is too short")?;
@@ -105,6 +111,9 @@ impl Model {
                 return Err("cm model has the wrong table size".into());
             }
             let present = take(size.div_ceil(8))?.to_vec();
+            if size % 8 != 0 && present[size / 8] >> (size % 8) != 0 {
+                return Err("cm model has bits past its table".into());
+            }
             let count = present
                 .iter()
                 .map(|b| b.count_ones() as usize)
@@ -256,7 +265,7 @@ impl Decide for Decode<'_, '_> {
 }
 
 /// Bit counts of each context.
-struct Count(Vec<Vec<[u32; 2]>>);
+struct Count(Vec<Vec<[u64; 2]>>);
 
 impl Decide for Count {
     fn decide(&mut self, contexts: &[u32], _: usize, bit: bool) -> bool {
@@ -332,7 +341,7 @@ impl Default for Settings {
 }
 
 /// Memory limit of the bit counters of the encoder.
-const COUNT_BYTES: usize = 4 << 30;
+const COUNT_BYTES: usize = 8 << 30;
 
 /// Number of trainers. Each trainer has a fixed part of the sample, so the
 /// weights do not depend on the number of threads.
@@ -375,8 +384,8 @@ pub fn encode<B: Blocks>(
     let sizes = section.sizes();
     let sets = section.sets();
     let blocks = section.blocks();
-    let empty = || Count(sizes.iter().map(|&n| vec![[0u32; 2]; n]).collect());
-    let per_counter = 8 * sizes.iter().sum::<usize>();
+    let empty = || Count(sizes.iter().map(|&n| vec![[0u64; 2]; n]).collect());
+    let per_counter = 16 * sizes.iter().sum::<usize>();
     let counters = threads.min(COUNT_BYTES / per_counter.max(1)).max(1);
     let mut parts = per_thread(blocks, counters, empty, |b, c| section.walk(b, c));
     let mut counts = parts.pop().expect("one counter");
@@ -406,11 +415,11 @@ pub fn encode<B: Blocks>(
             .iter()
             .enumerate()
             .map(|(i, &[n0, n1])| {
-                let n = u64::from(n0) + u64::from(n1);
+                let n = n0 + n1;
                 if n < u64::from(settings.prune.max(1)) {
                     return 0;
                 }
-                let (num, den) = ((10 * u64::from(n1) + 4) * 4096, 10 * n + 8);
+                let (num, den) = ((10 * n1 + 4) * 4096, 10 * n + 8);
                 let p = ((2 * num + den) / (2 * den)).clamp(1, 4095) as u16;
                 present[i / 8] |= 1 << (i % 8);
                 probs.extend_from_slice(&p.to_le_bytes());
@@ -854,6 +863,12 @@ mod tests {
             assert!(squash(x) as usize >= p && (x == -2047 || (squash(x - 1) as usize) < p));
         }
         assert_eq!(squash(0), 2047);
+    }
+
+    #[test]
+    fn model_blob_size_is_limited() {
+        let bomb = zstd::bulk::compress(&vec![0u8; 256 << 20], 19).unwrap();
+        assert!(Model::parse(&bomb, &wdl_sizes(), WDL_SETS).is_err());
     }
 
     #[test]
