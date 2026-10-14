@@ -12,17 +12,90 @@ use shakmaty::{
     Board, CastlingMode, Chess, Color, FromSetup, Piece, Position, PositionError, Role, Setup,
     Square,
 };
-use shakmaty_syzygy::Tablebase;
+use shakmaty_syzygy::{
+    Tablebase,
+    filesystem::{Filesystem, RandomAccessFile, ReadHint},
+};
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::BufReader,
-    sync::atomic::{AtomicU64, Ordering},
+    io,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
+use tablebase_core::packed::{Layout, load_table};
 use tablebase_core::pawnless::{self, Material, Table, canonical_white_king};
 
 type Tables = BTreeMap<String, Table>;
+
+/// Syzygy files held in memory: each probe is a slice copy instead of a
+/// `pread` system call (which dominated the verifier's profile).
+struct MemoryFilesystem;
+
+struct MemoryFile(Vec<u8>);
+
+impl Filesystem for MemoryFilesystem {
+    fn regular_file_size(&self, path: &Path) -> io::Result<u64> {
+        let meta = std::fs::metadata(path)?;
+        if !meta.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(meta.len())
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        std::fs::read_dir(path)?
+            .map(|e| e.map(|e| e.path()))
+            .collect()
+    }
+
+    fn open(&self, path: &Path) -> io::Result<Box<dyn RandomAccessFile>> {
+        Ok(Box::new(MemoryFile(std::fs::read(path)?)))
+    }
+}
+
+impl RandomAccessFile for MemoryFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64, _: ReadHint) -> io::Result<usize> {
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+        let n = buf.len().min(self.0.len() - start);
+        buf[..n].copy_from_slice(&self.0[start..start + n]);
+        Ok(n)
+    }
+}
+
+/// A table and the lower tables its captures lead to, resolved once.
+struct Context<'a> {
+    table: &'a Table,
+    /// (captured piece, table without it) for every non-king skeleton piece.
+    lower: Vec<(Piece, Option<&'a Table>)>,
+}
+
+impl<'a> Context<'a> {
+    fn new(tables: &'a Tables, table: &'a Table) -> Context<'a> {
+        let m = &table.material;
+        let lower = (1..m.skeleton_len())
+            .map(|k| {
+                let below = m.without(k).ok().and_then(|l| tables.get(&l.name()));
+                (piece(m.skeleton[k]), below)
+            })
+            .collect();
+        Context { table, lower }
+    }
+}
+
+/// Per-thread counts, added to the shared tally once per chunk.
+#[derive(Default)]
+struct Counts {
+    positions: u64,
+    legal: u64,
+    syzygy_compared: u64,
+    proof_checked: u64,
+}
 
 fn white_king(material: &Material, word: usize) -> u8 {
     material.decode(word).1[0]
@@ -78,19 +151,18 @@ fn position(material: &Material, word: usize, black_king: u8) -> Option<Chess> {
 /// identical pieces is a valid duplicate cell of the working index.
 fn locate(material: &Material, board: &Board, turn: Color) -> Option<(usize, u8)> {
     let mut used = 0u64;
-    let mut squares = Vec::with_capacity(material.skeleton_len());
-    for p in &material.skeleton {
+    let mut squares = [0u8; pawnless::MAX_SKELETON];
+    for (slot, p) in squares.iter_mut().zip(&material.skeleton) {
         let free = board.by_piece(piece(*p)).0 & !used;
         if free == 0 {
             return None;
         }
-        let square = free.trailing_zeros() as u8;
-        used |= 1 << square;
-        squares.push(square);
+        *slot = free.trailing_zeros() as u8;
+        used |= 1 << *slot;
     }
     let black_king = board.king_of(Color::Black)?;
     Some((
-        material.encode(turn == Color::Black, &squares),
+        material.encode(turn == Color::Black, &squares[..material.skeleton_len()]),
         u32::from(black_king) as u8,
     ))
 }
@@ -106,23 +178,23 @@ struct Tally {
 
 /// Value and rank of a child, which may be in a lower material.
 fn child_value(
-    tables: &Tables,
-    material: &Material,
+    ctx: &Context,
     child: &Chess,
     captured: Option<Role>,
 ) -> Result<(i8, Option<u16>), String> {
     let (table, same) = match captured {
-        None => (&tables[&material.name()], true),
-        Some(r) => {
-            let color = child.turn();
-            let k = (1..material.skeleton_len())
-                .find(|&k| piece(material.skeleton[k]) == Piece { color, role: r })
+        None => (ctx.table, true),
+        Some(role) => {
+            let captured = Piece {
+                color: child.turn(),
+                role,
+            };
+            let (_, below) = ctx
+                .lower
+                .iter()
+                .find(|(p, _)| *p == captured)
                 .ok_or("captured piece absent from material")?;
-            let name = material.without(k)?.name();
-            (
-                tables.get(&name).ok_or(format!("missing table {name}"))?,
-                false,
-            )
+            (below.ok_or("missing lower table")?, false)
         }
     };
     let (word, bk) =
@@ -135,13 +207,13 @@ fn child_value(
 }
 
 fn check_position(
-    tables: &Tables,
+    ctx: &Context,
     syzygy: &Tablebase<Chess>,
-    table: &Table,
     word: usize,
     bk: u8,
-    tally: &Tally,
+    tally: &mut Counts,
 ) -> Result<(), String> {
+    let table = ctx.table;
     let material = &table.material;
     let solved = table.wdl(word, bk);
     let Some(pos) = position(material, word, bk) else {
@@ -151,7 +223,7 @@ fn check_position(
         };
     };
     let value = solved.ok_or("solver marks a legal position illegal")?;
-    tally.legal.fetch_add(1, Ordering::Relaxed);
+    tally.legal += 1;
     if material.skeleton_len() > 1 {
         let wdl = syzygy
             .probe_wdl_after_zeroing(&pos)
@@ -159,7 +231,7 @@ fn check_position(
         if value != 2 * wdl.signum() {
             return Err(format!("syzygy WDL {wdl} vs solved {value}"));
         }
-        tally.syzygy_compared.fetch_add(1, Ordering::Relaxed);
+        tally.syzygy_compared += 1;
     } else if value != 0 {
         return Err("bare kings must be a draw".into());
     }
@@ -169,24 +241,31 @@ fn check_position(
     }
     let rank = table.rank[word * 64 + usize::from(bk)];
     let moves = pos.legal_moves();
-    let mut children = Vec::with_capacity(moves.len());
+    let smaller = |r: Option<u16>| r.is_none_or(|r| r < rank);
+    // Over all children: a losing child of smaller rank, a losing child, a
+    // nonwinning child, and whether every child is a win of smaller rank.
+    let (mut proving_loss, mut any_loss, mut any_nonwin, mut all_smaller_wins) =
+        (false, false, false, true);
     for m in &moves {
         let mut child = pos.clone();
         child.play_unchecked(*m);
-        children.push(child_value(tables, material, &child, m.capture())?);
+        let (v, r) = child_value(ctx, &child, m.capture())?;
+        proving_loss |= v == -2 && smaller(r);
+        any_loss |= v == -2;
+        any_nonwin |= v != 2;
+        all_smaller_wins &= v == 2 && smaller(r);
     }
-    let smaller = |r: Option<u16>| r.is_none_or(|r| r < rank);
     let ok = match value {
-        2 => children.iter().any(|&(v, r)| v == -2 && smaller(r)),
+        2 => proving_loss,
         -2 if rank == 0 => moves.is_empty() && pos.is_check(),
-        -2 => !moves.is_empty() && children.iter().all(|&(v, r)| v == 2 && smaller(r)),
+        -2 => !moves.is_empty() && all_smaller_wins,
         _ => {
             rank == pawnless::UNRESOLVED
-                && !children.iter().any(|&(v, _)| v == -2)
+                && !any_loss
                 && (if moves.is_empty() {
                     !pos.is_check()
                 } else {
-                    children.iter().any(|&(v, _)| v != 2)
+                    any_nonwin
                 })
         }
     };
@@ -195,7 +274,7 @@ fn check_position(
             "proof obligation fails (value {value}, rank {rank})"
         ));
     }
-    tally.proof_checked.fetch_add(1, Ordering::Relaxed);
+    tally.proof_checked += 1;
     Ok(())
 }
 
@@ -217,91 +296,87 @@ fn record_failure(
     }
 }
 
+/// Material of a table file named `MATERIAL.*` (v1/v2 `.gpu.tbp`, v3 `.tbz`).
+fn material_of(path: &str) -> Result<Material, String> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split('.').next())
+        .ok_or(format!("{path}: no material in the file name"))?;
+    Material::parse(name)
+}
+
+/// The material and the lower materials its captures lead to.
+fn needs(m: &Material) -> Vec<String> {
+    let mut out = vec![m.name()];
+    out.extend((1..m.skeleton_len()).filter_map(|k| m.without(k).ok().map(|l| l.name())));
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    All,
+    /// White king in the a1-d1-d4 triangle, plus the symmetry check.
+    Canonical,
+    /// One position per symmetry class (the v3 stored set), plus the
+    /// symmetry check.
+    Stored,
+}
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: verify_pawnless SYZYGY_DIRECTORY THREADS [--canonical] TABLE_FILE...";
-    let syzygy_dir = args.next().ok_or(usage)?;
+    let usage = "usage: verify_pawnless SYZYGY_DIR[,DIR...] THREADS [--canonical|--stored] \
+                 TABLE_FILE...";
+    let syzygy_dirs = args.next().ok_or(usage)?;
     let threads: usize = args
         .next()
         .ok_or(usage)?
         .parse()
         .map_err(|e| format!("threads: {e}"))?;
     let mut args = args.peekable();
-    // Canonical: check positions with the white king in the a1-d1-d4 triangle,
-    // and check that each table is invariant under the eight symmetries.
-    let canonical = args.next_if(|a| a == "--canonical").is_some();
-    let mut tables = Tables::new();
-    let mut digests = BTreeMap::new();
+    let scope = match args.next_if(|a| a.starts_with("--")).as_deref() {
+        None => Scope::All,
+        Some("--canonical") => Scope::Canonical,
+        Some("--stored") => Scope::Stored,
+        Some(_) => return Err(usage.into()),
+    };
+    let mut paths = BTreeMap::new();
     for path in args {
-        let file = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
-        let (table, header) = Table::read(BufReader::new(file))?;
-        digests.insert(header.material.clone(), header.payload_sha256);
-        tables.insert(header.material, table);
+        paths.insert(material_of(&path)?.name(), path);
     }
-    if tables.is_empty() {
+    if paths.is_empty() {
         return Err(usage.into());
     }
-    let mut syzygy = Tablebase::new();
-    syzygy
-        .add_directory(&syzygy_dir)
-        .map_err(|e| format!("{syzygy_dir}: {e}"))?;
+    let mut order: Vec<Material> = paths
+        .keys()
+        .map(|n| Material::parse(n))
+        .collect::<Result<_, _>>()?;
+    order.sort_by_key(|m| (m.skeleton_len(), m.name()));
+    let mut syzygy = Tablebase::with_filesystem(Arc::new(MemoryFilesystem));
+    for dir in syzygy_dirs.split(',') {
+        syzygy
+            .add_directory(dir)
+            .map_err(|e| format!("{dir}: {e}"))?;
+    }
+    // Tables stay loaded only while a remaining material reads them.
+    let mut tables = Tables::new();
+    let mut digests = BTreeMap::new();
     let mut report = Vec::new();
-    for table in tables.values() {
-        let start = Instant::now();
-        let tally = Tally::default();
-        let first_failure = std::sync::Mutex::new(None::<String>);
-        let words = table.valid.len();
-        // Dynamic chunks: canonical words sit in contiguous index ranges, so a
-        // static split would leave most threads idle.
-        const CHUNK: usize = 4096;
-        let next = AtomicU64::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..threads.max(1) {
-                let (tables, syzygy, tally, first_failure, next) =
-                    (&tables, &syzygy, &tally, &first_failure, &next);
-                scope.spawn(move || {
-                    loop {
-                        let start = next.fetch_add(CHUNK as u64, Ordering::Relaxed) as usize;
-                        if start >= words {
-                            break;
-                        }
-                        for word in start..(start + CHUNK).min(words) {
-                            if canonical && !canonical_white_king(white_king(&table.material, word))
-                            {
-                                continue;
-                            }
-                            for bk in 0..64u8 {
-                                tally.positions.fetch_add(1, Ordering::Relaxed);
-                                if let Err(e) =
-                                    check_position(tables, syzygy, table, word, bk, tally)
-                                {
-                                    record_failure(table, word, bk, &e, tally, first_failure);
-                                }
-                            }
-                        }
-                    }
-                });
+    for (i, material) in order.iter().enumerate() {
+        for name in needs(material) {
+            if let (false, Some(path)) = (tables.contains_key(&name), paths.get(&name)) {
+                let (table, digest) = load_table(path.as_ref(), threads)?;
+                digests.insert(name.clone(), digest);
+                tables.insert(name, table);
             }
-        });
-        let symmetry = canonical
-            .then(|| pawnless::symmetry_violations(table, threads))
-            .transpose()?;
-        let failures = tally.failures.load(Ordering::Relaxed) + symmetry.unwrap_or(0);
-        report.push(serde_json::json!({
-            "material": table.material.name(),
-            "payload_sha256": digests[&table.material.name()],
-            "positions_examined": tally.positions.load(Ordering::Relaxed),
-            "legal_positions": tally.legal.load(Ordering::Relaxed),
-            "syzygy_wdl_compared": tally.syzygy_compared.load(Ordering::Relaxed),
-            "proof_obligations_checked": tally.proof_checked.load(Ordering::Relaxed),
-            "scope": if canonical { "canonical-white-king-triangle-plus-symmetry" } else { "all" },
-            "symmetry_violating_words": symmetry,
-            "proof_ranks_present": !table.rank.is_empty(),
-            "failures": failures,
-            "first_failure": first_failure.into_inner().expect("mutex"),
-            "seconds": start.elapsed().as_secs_f64(),
-            "status": if failures == 0 { "pass" } else { "FAIL" },
-        }));
+        }
+        let mut row = verify_table(&tables, &tables[&material.name()], &syzygy, scope, threads)?;
+        row["payload_sha256"] = digests[&material.name()].clone().into();
+        eprintln!("{row}");
+        report.push(row);
+        let keep: std::collections::BTreeSet<String> =
+            order[i + 1..].iter().flat_map(needs).collect();
+        tables.retain(|name, _| keep.contains(name));
     }
     let failed = report.iter().any(|r| r["status"] != "pass");
     println!(
@@ -312,4 +387,89 @@ fn main() -> Result<(), String> {
         return Err("verification failed".into());
     }
     Ok(())
+}
+
+fn verify_table(
+    tables: &Tables,
+    table: &Table,
+    syzygy: &Tablebase<Chess>,
+    scope: Scope,
+    threads: usize,
+) -> Result<serde_json::Value, String> {
+    let start = Instant::now();
+    let tally = Tally::default();
+    let first_failure = std::sync::Mutex::new(None::<String>);
+    let words = table.valid.len();
+    let layout = Layout::new(&table.material);
+    let ctx = Context::new(tables, table);
+    // Dynamic chunks: canonical words sit in contiguous index ranges, so a
+    // static split would leave most threads idle.
+    const CHUNK: usize = 4096;
+    let next = AtomicU64::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            let (layout, ctx, tally, first_failure, next) =
+                (&layout, &ctx, &tally, &first_failure, &next);
+            s.spawn(move || {
+                loop {
+                    let start = next.fetch_add(CHUNK as u64, Ordering::Relaxed) as usize;
+                    if start >= words {
+                        break;
+                    }
+                    let mut counts = Counts::default();
+                    for word in start..(start + CHUNK).min(words) {
+                        let mut squares = match scope {
+                            Scope::All => u64::MAX,
+                            Scope::Canonical => {
+                                if canonical_white_king(white_king(&table.material, word)) {
+                                    u64::MAX
+                                } else {
+                                    0
+                                }
+                            }
+                            Scope::Stored => layout.stored_in_word(word),
+                        };
+                        while squares != 0 {
+                            let bk = squares.trailing_zeros() as u8;
+                            squares &= squares - 1;
+                            counts.positions += 1;
+                            if let Err(e) = check_position(ctx, syzygy, word, bk, &mut counts) {
+                                record_failure(table, word, bk, &e, tally, first_failure);
+                            }
+                        }
+                    }
+                    tally
+                        .positions
+                        .fetch_add(counts.positions, Ordering::Relaxed);
+                    tally.legal.fetch_add(counts.legal, Ordering::Relaxed);
+                    let compared = counts.syzygy_compared;
+                    tally.syzygy_compared.fetch_add(compared, Ordering::Relaxed);
+                    let checked = counts.proof_checked;
+                    tally.proof_checked.fetch_add(checked, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let symmetry = (scope != Scope::All)
+        .then(|| pawnless::symmetry_violations(table, threads))
+        .transpose()?;
+    let failures = tally.failures.load(Ordering::Relaxed) + symmetry.unwrap_or(0);
+    Ok(serde_json::json!({
+        "material": table.material.name(),
+        "positions_examined": tally.positions.load(Ordering::Relaxed),
+        "legal_positions": tally.legal.load(Ordering::Relaxed),
+        "syzygy_wdl_compared": tally.syzygy_compared.load(Ordering::Relaxed),
+        "proof_obligations_checked": tally.proof_checked.load(Ordering::Relaxed),
+        "scope": match scope {
+            Scope::All => "all",
+            Scope::Canonical => "canonical-white-king-triangle-plus-symmetry",
+            Scope::Stored => "one-position-per-symmetry-class-plus-symmetry",
+        },
+        "symmetry_violating_words": symmetry,
+        "proof_ranks_present": !table.rank.is_empty(),
+        "failures": failures,
+        "first_failure": first_failure.into_inner().expect("mutex"),
+        "seconds": start.elapsed().as_secs_f64(),
+        "status": if failures == 0 { "pass" } else { "FAIL" },
+    }))
 }
