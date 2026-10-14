@@ -38,7 +38,9 @@ Each section has `name`, `offset` (from the payload start), `blocks`,
 `raw_bytes` (decompressed), `compressed_bytes` and `codec`. At `offset` there
 is an index of `blocks + 1` u64 offsets, relative to the first frame. Frame `b`
 spans `[index[b], index[b+1])`. It decompresses to `block_bytes` bytes, but the
-last block can be shorter. Codecs:
+last block can be shorter. A reader rejects a section if `raw_bytes` or `blocks`
+do not agree with the material and `block_bytes`. It also rejects a section
+that goes past the end of the file. Codecs:
 
 - `zstd`: one zstd frame per block (level 19).
 - `lzma`: one LZMA1 "alone" (`.lzma`) stream per block, preset 9e with
