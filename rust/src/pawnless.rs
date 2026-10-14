@@ -23,7 +23,12 @@ use std::thread;
 pub const MAX_SKELETON: usize = 5;
 /// Rank of a position that is not (yet) a proven win or loss.
 pub const UNRESOLVED: u16 = u16::MAX;
-const FILE_MAGIC: &[u8; 8] = b"TBPAWNL1";
+/// Version 2 stores one record per word: `[win | illegal, loss | illegal]` as
+/// little-endian u64 (both bits set means illegal), followed in ranked tables by
+/// the word's 64 u16 proof ranks. One contiguous read decides any position.
+const FILE_MAGIC: &[u8; 8] = b"TBPAWNL2";
+/// Version 1 (three separate planes, then ranks); read-only.
+const FILE_MAGIC_V1: &[u8; 8] = b"TBPAWNL1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
@@ -584,31 +589,54 @@ pub struct FileHeader {
 }
 
 impl Table {
+    /// Bytes per word record in the version 2 file layout.
+    pub fn record_len(&self) -> usize {
+        16 + if self.rank.is_empty() { 0 } else { 128 }
+    }
+
+    /// Version 2 payload, built in parallel chunks of whole records.
     pub fn payload(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.valid.len() * 24 + self.rank.len() * 2);
-        for plane in [&self.valid, &self.win, &self.loss] {
-            for word in plane {
-                bytes.extend_from_slice(&word.to_le_bytes());
+        let record = self.record_len();
+        let mut bytes = vec![0u8; self.valid.len() * record];
+        let threads = thread::available_parallelism().map_or(4, |n| n.get().min(16));
+        let chunk_words = self.valid.len().div_ceil(threads).max(1);
+        thread::scope(|scope| {
+            for (part, out) in bytes.chunks_mut(chunk_words * record).enumerate() {
+                scope.spawn(move || {
+                    for (i, rec) in out.chunks_exact_mut(record).enumerate() {
+                        let w = part * chunk_words + i;
+                        let illegal = !self.valid[w];
+                        rec[..8].copy_from_slice(&(self.win[w] | illegal).to_le_bytes());
+                        rec[8..16].copy_from_slice(&(self.loss[w] | illegal).to_le_bytes());
+                        if record > 16 {
+                            for (b, value) in self.rank[w * 64..w * 64 + 64].iter().enumerate() {
+                                rec[16 + 2 * b..18 + 2 * b].copy_from_slice(&value.to_le_bytes());
+                            }
+                        }
+                    }
+                });
             }
-        }
-        for value in &self.rank {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
+        });
         bytes
     }
 
     pub fn header(&self, payload: &[u8], generator: &str) -> FileHeader {
+        let mut planes = vec![
+            "win|illegal:u64".to_string(),
+            "loss|illegal:u64".to_string(),
+        ];
+        if !self.rank.is_empty() {
+            planes.push("rank:u16x64".to_string());
+        }
         FileHeader {
-            format: "tablebase-pawnless-v1".into(),
+            format: "tablebase-pawnless-v2".into(),
             material: self.material.name(),
-            layout: "turn,skeleton squares (white king first); bits = black king square".into(),
+            layout: "record per word (turn, skeleton squares; white king first); \
+                     bits = black king square; win and loss both set = illegal"
+                .into(),
             words: self.valid.len(),
             rounds: self.rounds,
-            planes: ["valid:u64", "win:u64", "loss:u64", "rank:u16"]
-                [..if self.rank.is_empty() { 3 } else { 4 }]
-                .iter()
-                .map(|p| p.to_string())
-                .collect(),
+            planes,
             payload_sha256: format!("{:x}", Sha256::digest(payload)),
             generator: generator.to_string(),
         }
@@ -626,11 +654,13 @@ impl Table {
         Ok(header)
     }
 
-    /// Read and authenticate a table file; corrupt or truncated data fails.
+    /// Read and authenticate a table file (version 2, or legacy version 1);
+    /// corrupt or truncated data fails.
     pub fn read(mut input: impl Read) -> Result<(Table, FileHeader)> {
         let mut magic = [0u8; 8];
         input.read_exact(&mut magic).map_err(|e| e.to_string())?;
-        if &magic != FILE_MAGIC {
+        let v2 = &magic == FILE_MAGIC;
+        if !v2 && &magic != FILE_MAGIC_V1 {
             return Err("not a pawnless table file".into());
         }
         let mut len = [0u8; 8];
@@ -643,44 +673,69 @@ impl Table {
         input.read_exact(&mut json).map_err(|e| e.to_string())?;
         let header: FileHeader = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
         let material = Material::parse(&header.material)?;
-        if material.words() != header.words {
+        let words = header.words;
+        if material.words() != words {
             return Err("table word count disagrees with its material".into());
         }
-        let mut payload = Vec::new();
-        input.read_to_end(&mut payload).map_err(|e| e.to_string())?;
-        let ranked = match header.planes.len() {
-            3 => false,
-            4 => true,
+        let ranked = match (v2, header.planes.len()) {
+            (true, 2) | (false, 3) => false,
+            (true, 3) | (false, 4) => true,
             _ => return Err("table header lists an unsupported plane set".into()),
         };
-        if payload.len() != header.words * (24 + if ranked { 128 } else { 0 }) {
+        let mut payload = Vec::new();
+        input.read_to_end(&mut payload).map_err(|e| e.to_string())?;
+        let expected = words * if v2 { 16 } else { 24 } + if ranked { words * 128 } else { 0 };
+        if payload.len() != expected {
             return Err("table payload has the wrong length".into());
         }
         if format!("{:x}", Sha256::digest(&payload)) != header.payload_sha256 {
             return Err("table payload digest mismatch".into());
         }
-        let plane = |index: usize| -> Vec<u64> {
-            payload[index * header.words * 8..(index + 1) * header.words * 8]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|&b| u64::from_le_bytes(b))
-                .collect()
+        let u64_at = |offset: usize| {
+            u64::from_le_bytes(payload[offset..offset + 8].try_into().expect("8 bytes"))
         };
-        let rank = payload[header.words * 24..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&b| u16::from_le_bytes(b))
-            .collect();
-        let table = Table {
+        let u16_at = |offset: usize| u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+        let mut table = Table {
             material,
-            valid: plane(0),
-            win: plane(1),
-            loss: plane(2),
-            rank,
+            valid: vec![0; words],
+            win: vec![0; words],
+            loss: vec![0; words],
+            rank: if ranked {
+                vec![0; words * 64]
+            } else {
+                Vec::new()
+            },
             rounds: header.rounds,
         };
+        if v2 {
+            let record = 16 + if ranked { 128 } else { 0 };
+            for w in 0..words {
+                let (marked_win, marked_loss) = (u64_at(w * record), u64_at(w * record + 8));
+                let valid = !(marked_win & marked_loss);
+                table.valid[w] = valid;
+                table.win[w] = marked_win & valid;
+                table.loss[w] = marked_loss & valid;
+                if ranked {
+                    for b in 0..64 {
+                        table.rank[w * 64 + b] = u16_at(w * record + 16 + 2 * b);
+                    }
+                }
+            }
+        } else {
+            for w in 0..words {
+                table.valid[w] = u64_at(8 * w);
+                table.win[w] = u64_at(8 * (words + w));
+                table.loss[w] = u64_at(8 * (2 * words + w));
+            }
+            if ranked {
+                for (i, r) in table.rank.iter_mut().enumerate() {
+                    *r = u16_at(24 * words + 2 * i);
+                }
+            }
+        }
+        if table.win.iter().zip(&table.loss).any(|(w, l)| w & l != 0) {
+            return Err("table marks a position both won and lost".into());
+        }
         Ok((table, header))
     }
 }

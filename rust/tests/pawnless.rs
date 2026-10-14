@@ -124,3 +124,39 @@ fn symmetries_agree_on_squares_and_bitboards() {
     broken.win[1_234] ^= 1 << 7;
     assert!(symmetry_violations(&broken, 4).unwrap() > 0);
 }
+
+#[test]
+fn format_v2_unranked_and_legacy_v1_files() {
+    use sha2::{Digest, Sha256};
+    let t = solved_kqvk();
+    // Unranked (in-place) tables store 16-byte records.
+    let mut unranked = t.clone();
+    unranked.rank.clear();
+    let mut bytes = Vec::new();
+    let header = unranked.write(&mut bytes, "test").unwrap();
+    assert_eq!(header.planes.len(), 2);
+    assert_eq!(unranked.payload().len(), unranked.valid.len() * 16);
+    assert_eq!(Table::read(bytes.as_slice()).unwrap().0, unranked);
+    // A version 1 file: three planes then ranks, same header fields.
+    let mut payload = Vec::new();
+    for plane in [&t.valid, &t.win, &t.loss] {
+        for w in plane.iter() {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    for r in &t.rank {
+        payload.extend_from_slice(&r.to_le_bytes());
+    }
+    let json = serde_json::json!({
+        "format": "tablebase-pawnless-v1", "material": "KQvK", "layout": "v1",
+        "words": t.valid.len(), "rounds": t.rounds,
+        "planes": ["valid:u64", "win:u64", "loss:u64", "rank:u16"],
+        "payload_sha256": format!("{:x}", Sha256::digest(&payload)),
+    })
+    .to_string();
+    let mut v1 = b"TBPAWNL1".to_vec();
+    v1.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    v1.extend_from_slice(json.as_bytes());
+    v1.extend_from_slice(&payload);
+    assert_eq!(Table::read(v1.as_slice()).unwrap().0, t);
+}

@@ -38,31 +38,45 @@ class KnownPositions(unittest.TestCase):
 
     def test_kqvk_mate_and_stalemate(self) -> None:
         mate = self.probe("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
-        self.assertEqual((mate["status"], mate["wdl"], mate["rank"]), ("ok", -2, 0))
-        self.assertTrue(mate["checkmate"])
+        self.assertEqual((mate["s"], mate["w"], mate["r"], mate["n"]), ("ok", -2, 0, 0))
         stale = self.probe("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
-        self.assertEqual((stale["wdl"], stale["stalemate"]), (0, True))
+        self.assertEqual((stale["w"], stale["n"]), (0, 0))
 
     def test_illegal_and_unsupported(self) -> None:
-        self.assertEqual(self.probe("8/8/8/8/8/8/1kK5/Q7 w - - 0 1")["status"], "illegal")
-        self.assertEqual(self.probe("8/8/8/8/8/8/k7/R6K w - - 0 1")["status"], "illegal")
-        self.assertEqual(self.probe("8/8/8/8/8/8/kP6/7K w - - 0 1")["status"], "unsupported")
-        self.assertEqual(self.probe("not a fen")["status"], "invalid-fen")
+        self.assertEqual(self.probe("8/8/8/8/8/8/1kK5/Q7 w - - 0 1")["s"], "illegal")
+        self.assertEqual(self.probe("8/8/8/8/8/8/k7/R6K w - - 0 1")["s"], "illegal")
+        r = self.probe("8/8/8/8/8/8/kP6/7K w - - 0 1")
+        self.assertEqual((r["s"], r["why"]), ("unsupported", "pawns"))
+        self.assertEqual(self.probe("not a fen")["s"], "fen")
 
     def test_colour_swapped_material(self) -> None:
         # White rook vs bare king is stored as KvKR with colours swapped.
         r = self.probe("8/8/3k4/8/8/8/8/R3K3 b - - 0 1")
-        self.assertEqual((r["status"], r["material"], r["wdl"]), ("ok", "KvKR", -2))
+        self.assertEqual((r["s"], r["m"], r["w"]), ("ok", "KvKR", -2))
 
-    def test_move_list_children_are_consistent(self) -> None:
-        r = self.probe("8/8/8/8/8/2k5/1r6/KQ6 w - - 0 1")
-        self.assertEqual(r["status"], "ok")
-        best = max(m["wdl"] for m in r["moves"])
-        self.assertEqual(best, r["wdl"])
-        for m in r["moves"]:
-            child = store().probe(m["fen"])
-            self.assertEqual(child["status"], "ok")
-            self.assertEqual(-child["wdl"], m["wdl"], m["san"])
+    def test_move_values_match_child_probes(self) -> None:
+        fen = "8/8/8/8/8/2k5/1r6/KQ6 w - - 0 1"
+        r = self.probe(fen)
+        self.assertEqual(r["s"], "ok")
+        board = chess.Board(fen)
+        moves = sorted(board.legal_moves, key=chess.Move.uci)
+        self.assertEqual(r["n"], len(moves))
+        self.assertEqual(max(v[0] for v in r["v"]), r["w"])
+        for move, value in zip(moves, r["v"], strict=True):
+            board.push(move)
+            child = store().probe(board.fen())
+            board.pop()
+            self.assertEqual(child["s"], "ok")
+            self.assertEqual(-child["w"], value[0], move.uci())
+
+    def test_best_line_is_consistent(self) -> None:
+        fen = "8/8/8/8/4k3/8/1Q6/K7 b - - 0 1"
+        line = store().best_line(fen)["u"]
+        board = chess.Board(fen)
+        for uci in line:
+            board.push_uci(uci)
+        self.assertTrue(board.is_checkmate())
+        self.assertEqual(len(line), store().probe(fen)["r"])
 
 
 class SampledAgreement(unittest.TestCase):

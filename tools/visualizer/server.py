@@ -4,20 +4,26 @@ Usage:
   python -I tools/visualizer/server.py --tables DIR [--tables DIR ...]
       [--syzygy DIR] [--logs DIR] [--host 127.0.0.1] [--port 8642]
 
-Tables are memory-mapped, so a probe reads a few words even from a 51.5 GB file.
-Values are never guessed: positions outside the supported domain report why.
+Network budget: the page is one self-contained document (CSS, JS and the piece
+sprite inline) revalidated by ETag; fonts are content-addressed and immutable.
+API replies are compact JSON, gzip-compressed, over keep-alive connections. The
+client generates pawnless moves itself, so a probe returns only the value of
+each move, in UCI order. Tables are memory-mapped: one record read decides a
+position (format v2). Values are never guessed.
 """
 
 from __future__ import annotations
 
 import argparse
-import functools
+import gzip
+import hashlib
 import http.server
 import json
 import random
+import re
+import subprocess
 import threading
 import time
-import typing
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,10 +34,10 @@ import chess.syzygy
 import numpy as np
 
 STATIC = Path(__file__).resolve().parent / "static"
-MAGIC = b"TBPAWNL1"
 UNRESOLVED = 0xFFFF
 ROLE_ORDER = "QRBN"
 ROLES = {"K": chess.KING, "Q": chess.QUEEN, "R": chess.ROOK, "B": chess.BISHOP, "N": chess.KNIGHT}
+GZIP_MIN = 200
 
 
 class TableFormatError(ValueError):
@@ -50,28 +56,38 @@ def skeleton(name: str) -> list[tuple[bool, int]]:
 
 @dataclass
 class Table:
+    """A memory-mapped table. Version 2 keeps one record per word, so a probe
+    is one contiguous read; version 1 (three planes) is still accepted."""
+
     path: Path
     header: dict
     words: int
-    planes: np.ndarray  # (3, words): valid, win, loss
-    rank: np.ndarray | None
+    version: int
+    data: np.ndarray
+    ranked: bool
     pieces: list[tuple[bool, int]] = field(default_factory=list)
 
     @classmethod
     def open(cls, path: Path) -> Table:
         with path.open("rb") as f:
-            if f.read(8) != MAGIC:
+            magic = f.read(8)
+            if magic not in (b"TBPAWNL1", b"TBPAWNL2"):
                 raise TableFormatError(path)
             length = int.from_bytes(f.read(8), "little")
             header = json.loads(f.read(length))
-        words = header["words"]
-        base = 16 + length
-        planes = np.memmap(path, dtype="<u8", mode="r", offset=base, shape=(3, words))
-        rank = None
-        if len(header["planes"]) == 4:
-            offset = base + 24 * words
-            rank = np.memmap(path, dtype="<u2", mode="r", offset=offset, shape=(words * 64,))
-        return cls(path, header, words, planes, rank, skeleton(header["material"]))
+        words, base = header["words"], 16 + length
+        version = 2 if magic == b"TBPAWNL2" else 1
+        ranked = len(header["planes"]) == (3 if version == 2 else 4)
+        if version == 2:
+            record = 16 + (128 if ranked else 0)
+            data = np.memmap(path, dtype=np.uint8, mode="r", offset=base, shape=(words, record))
+        else:
+            data = np.memmap(path, dtype=np.uint8, mode="r", offset=base)
+        return cls(path, header, words, version, data, ranked, skeleton(header["material"]))
+
+    @property
+    def name(self) -> str:
+        return self.header["material"]
 
     def encode(self, black_to_move: bool, squares: list[int]) -> int:
         word = int(black_to_move)
@@ -87,15 +103,30 @@ class Table:
         return word == 1, squares[::-1]
 
     def value(self, word: int, bk: int) -> tuple[int | None, int | None]:
+        """(WDL for the side to move, proof rank) or (None, None) if illegal."""
         bit = 1 << bk
-        if not int(self.planes[0, word]) & bit:
-            return None, None
-        wdl = 2 if int(self.planes[1, word]) & bit else -2 if int(self.planes[2, word]) & bit else 0
-        rank = None
-        if self.rank is not None:
-            r = int(self.rank[word * 64 + bk])
-            rank = None if r == UNRESOLVED else r
-        return wdl, rank
+        if self.version == 2:
+            rec = bytes(self.data[word])  # the single read
+            win = int.from_bytes(rec[0:8], "little")
+            loss = int.from_bytes(rec[8:16], "little")
+            if win & loss & bit:
+                return None, None
+            rank = int.from_bytes(rec[16 + 2 * bk : 18 + 2 * bk], "little") if self.ranked else None
+        else:
+            d, n = self.data, self.words
+
+            def u64(i: int) -> int:
+                return int.from_bytes(bytes(d[8 * i : 8 * i + 8]), "little")
+
+            if not u64(word) & bit:
+                return None, None
+            win, loss = u64(n + word), u64(2 * n + word)
+            rank = None
+            if self.ranked:
+                at = 24 * n + 2 * (word * 64 + bk)
+                rank = int.from_bytes(bytes(d[at : at + 2]), "little")
+        wdl = 2 if win & bit else -2 if loss & bit else 0
+        return wdl, None if rank in (None, UNRESOLVED) else rank
 
 
 def material_name(board: chess.Board, white: bool) -> str:
@@ -106,114 +137,157 @@ def material_name(board: chess.Board, white: bool) -> str:
     return f"{side(us)}v{side(them)}"
 
 
+def chess_legal(board: chess.Board) -> bool:
+    """python-chess legality, accepting check patterns that cannot arise in play
+    (the tables and the shakmaty verifier accept them too)."""
+    ignored = chess.STATUS_IMPOSSIBLE_CHECK | chess.STATUS_TOO_MANY_CHECKERS
+    return board.status() & ~ignored == chess.STATUS_VALID
+
+
+def sign(x: int) -> int:
+    return (x > 0) - (x < 0)
+
+
+def _json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 class Store:
     def __init__(self, table_dirs: list[Path], syzygy: Path | None, logs: Path | None) -> None:
         self.tables: dict[str, Table] = {}
         for directory in table_dirs:
             for path in sorted(directory.glob("*.tbp"), key=lambda p: ".gpu." not in p.name):
                 table = Table.open(path)
-                self.tables.setdefault(table.header["material"], table)
+                self.tables.setdefault(table.name, table)
         self.syzygy = chess.syzygy.open_tablebase(str(syzygy)) if syzygy else None
         self.syzygy_lock = threading.Lock()
         self.logs = logs
-        self.evidence = self._evidence()
+        self._load_evidence()
 
-    # Evidence from solver and verifier logs ------------------------------------------
-    def _evidence(self) -> dict:
-        solves: dict[str, dict] = {}
-        verifications: dict[str, dict] = {}
-        reference_checks: dict[str, dict] = {}
-        dtm_checks: dict[str, dict] = {}
-        if self.logs:
-            for path in sorted(self.logs.glob("gpu-solve-*.stdout")):
-                for t in _json(path).get("tables", []):
-                    rounds = t.get("timing", {}).get("rounds", [])
-                    solves.setdefault(t["material"], {}).update(
-                        {
-                            "log": path.name,
-                            "rounds": t["rounds"],
-                            "mode": t["timing"].get("mode"),
-                            "digest": t["payload_sha256"],
-                            "counts": [t["counts_white_to_move"], t["counts_black_to_move"]],
-                            "changed": [r["changed_words"] for r in rounds],
-                            "sweep_ms": [r.get("sweep_event_ms") for r in rounds],
-                            "rounds_seconds": t["timing"].get("rounds_seconds_total"),
-                            "device_bytes": t["timing"].get("device_bytes_allocated"),
-                        }
-                    )
-            for path in sorted(self.logs.glob("verify-*.stdout")):
-                for t in _json(path).get("tables", []):
-                    entry = {**t, "log": path.name}
-                    verifications.setdefault(t["payload_sha256"], []).append(entry)
-            online_dir = self.logs.parent / "results" / "online"
-            # lichess vs the local Syzygy reference files, grouped per material.
-            for row in _json(online_dir / "online_comparison.json").get("rows", []):
-                entry = reference_checks.setdefault(
-                    row["material"],
-                    {"agree": 0, "differ": 0, "unresolved": 0, "recorded_separately": 0},
+    # Evidence ---------------------------------------------------------------------
+    def _load_evidence(self) -> None:
+        self.solves: dict[str, dict] = {}
+        self.verifications: dict[str, list[dict]] = {}
+        self.reference_checks: dict[str, dict] = {}
+        self.dtm_checks: dict[str, dict] = {}
+        if not self.logs:
+            return
+        for path in sorted(self.logs.glob("gpu-solve-*.stdout")):
+            for t in _json(path).get("tables", []):
+                timing = t.get("timing", {})
+                rounds = timing.get("rounds", [])
+                self.solves.setdefault(t["material"], {}).update(
+                    {
+                        "log": path.name,
+                        "digest": t["payload_sha256"],
+                        "mode": timing.get("mode"),
+                        "counts": [t["counts_white_to_move"], t["counts_black_to_move"]],
+                        "changed": [r["changed_words"] for r in rounds],
+                        "sweep_ms": [
+                            round(max(r.get("sweep_event_ms") or 0, 0), 3) for r in rounds
+                        ],
+                        "seconds": timing.get("rounds_seconds_total"),
+                        "bytes": timing.get("device_bytes_allocated"),
+                    }
                 )
-                key = {
-                    "agree": "agree",
-                    "DIFFER": "differ",
-                    "unresolved": "unresolved",
-                    "recorded-separately": "recorded_separately",
-                }.get(row["result"], "unresolved")
-                entry[key] += 1
-            # lichess DTM vs a specific solved table, keyed by its payload digest.
-            dtm = _json(online_dir / "online_dtm_comparison.json")
-            if dtm.get("summary"):
-                rows = dtm.get("rows", [])
-                dtm_checks[dtm["summary"]["payload_sha256"]] = {
-                    "agree": sum(r["result"] == "agree" for r in rows),
-                    "compared": len(rows),
-                    "metric": dtm["summary"]["metric"],
-                }
-        return {
-            "solves": solves,
-            "verifications": verifications,
-            "reference_checks": reference_checks,
-            "dtm_checks": dtm_checks,
-        }
+        for path in sorted(self.logs.glob("verify-*.stdout")):
+            for t in _json(path).get("tables", []):
+                self.verifications.setdefault(t["payload_sha256"], []).append(
+                    {**t, "log": path.name}
+                )
+        online = self.logs.parent / "results" / "online"
+        names = {"agree": "a", "DIFFER": "d", "recorded-separately": "s"}
+        for row in _json(online / "online_comparison.json").get("rows", []):
+            entry = self.reference_checks.setdefault(
+                row["material"], {"a": 0, "d": 0, "u": 0, "s": 0}
+            )
+            entry[names.get(row["result"], "u")] += 1
+        dtm = _json(online / "online_dtm_comparison.json")
+        if dtm.get("summary"):
+            rows = dtm.get("rows", [])
+            self.dtm_checks[dtm["summary"]["payload_sha256"]] = {
+                "a": sum(r["result"] == "agree" for r in rows),
+                "n": len(rows),
+            }
 
-    def exact_dtm(self, material: str) -> bool:
+    def verification_state(self, table: Table) -> tuple[str, int]:
+        runs = self.verifications.get(table.header["payload_sha256"], [])
+        if not runs:
+            return "pending", 0
+        return ("pass" if all(r["status"] == "pass" for r in runs) else "fail"), len(runs)
+
+    def exact_dtm(self, name: str) -> bool:
         """Proof ranks equal distance to mate when every capture leads to a material
-        with no decisive positions (lower children then count as rank 0 correctly)."""
-        pieces = skeleton(material)
+        without decisive positions (those children then correctly count as rank 0)."""
+        pieces = skeleton(name)
         for k in range(1, len(pieces)):
             rest = pieces[:k] + pieces[k + 1 :]
-            name = "K" + "".join(_letter(r) for w, r in rest[1:] if w)
-            name += "vK" + "".join(_letter(r) for w, r in rest[1:] if not w)
-            solve = self.evidence["solves"].get(name)
+            white = "".join(chess.piece_symbol(r).upper() for w, r in rest[1:] if w)
+            black = "".join(chess.piece_symbol(r).upper() for w, r in rest[1:] if not w)
+            solve = self.solves.get(f"K{white}vK{black}")
             if solve is None or any(c["win"] or c["loss"] for c in solve["counts"]):
                 return False
-        return self.tables[material].rank is not None
+        return self.tables[name].ranked
 
-    def table_info(self, table: Table) -> dict:
-        digest = table.header["payload_sha256"]
-        checks = self.evidence["verifications"].get(digest, [])
+    def materials(self) -> dict:
+        """Compact table list: one row per table, fixed column order."""
+        rows = []
+        for name, table in sorted(self.tables.items(), key=lambda kv: (len(kv[0]), kv[0])):
+            solve = self.solves.get(name, {})
+            counts = solve.get("counts")
+            state, runs = self.verification_state(table)
+            gen = re.sub(
+                r"git:([0-9a-f]{8})[0-9a-f]+", r"git:\1", table.header.get("generator", "")
+            )
+            rows.append(
+                [
+                    name,
+                    int(table.ranked),
+                    int(self.exact_dtm(name)),
+                    table.header["rounds"],
+                    [[c["legal"], c["win"], c["draw"], c["loss"]] for c in counts]
+                    if counts
+                    else None,
+                    state,
+                    runs,
+                    gen,
+                ]
+            )
         return {
-            "material": table.header["material"],
-            "file": str(table.path),
-            "generator": table.header.get("generator", ""),
-            "digest": digest,
-            "ranked": table.rank is not None,
-            "exact_dtm": self.exact_dtm(table.header["material"]),
-            "rounds": table.header["rounds"],
-            "words": table.words,
-            "verified": [
-                {k: c.get(k) for k in ("status", "scope", "legal_positions", "log")} for c in checks
-            ],
+            "cols": ["name", "ranked", "exactDtm", "rounds", "counts", "verified", "runs", "gen"],
+            "rows": rows,
         }
 
-    def materials(self) -> list[dict]:
-        out = []
-        for name, table in sorted(self.tables.items(), key=lambda kv: (len(kv[0]), kv[0])):
-            info = self.table_info(table)
-            info["solve"] = self.evidence["solves"].get(name)
-            out.append(info)
-        return out
+    def evidence(self, name: str) -> dict:
+        table = self.tables.get(name)
+        if table is None:
+            return {}
+        digest = table.header["payload_sha256"]
+        keep = (
+            "status",
+            "scope",
+            "legal_positions",
+            "syzygy_wdl_compared",
+            "proof_obligations_checked",
+            "symmetry_violating_words",
+            "proof_ranks_present",
+            "first_failure",
+            "seconds",
+            "log",
+        )
+        return {
+            "digest": digest,
+            "generator": table.header.get("generator", ""),
+            "solve": self.solves.get(name),
+            "verify": [{k: v.get(k) for k in keep} for v in self.verifications.get(digest, [])],
+            "ref": self.reference_checks.get(name),
+            "dtm": self.dtm_checks.get(digest),
+        }
 
-    # Probing --------------------------------------------------------------------------
+    # Probing ----------------------------------------------------------------------
     def locate(self, board: chess.Board) -> tuple[Table, int, int] | None:
         """Table, word and black-king bit for a pawnless board (colours swapped if needed)."""
         for flipped in (False, True):
@@ -222,8 +296,7 @@ class Store:
                 continue
             squares, used = [], 0
             for white, role in table.pieces:
-                color = white != flipped
-                free = int(board.pieces_mask(role, color)) & ~used
+                free = int(board.pieces_mask(role, white != flipped)) & ~used
                 square = (free & -free).bit_length() - 1
                 used |= 1 << square
                 squares.append(square)
@@ -233,28 +306,22 @@ class Store:
         return None
 
     def unsupported(self, board: chess.Board) -> str | None:
-        if board.pieces_mask(chess.PAWN, chess.WHITE) | board.pieces_mask(chess.PAWN, chess.BLACK):
-            return "Pawns are outside the pawnless tables."
+        if board.pawns:
+            return "pawns"
         if board.castling_rights:
-            return "Castling rights are not represented; clear them."
-        if board.king(chess.WHITE) is None or board.king(chess.BLACK) is None:
-            return "Each side needs exactly one king."
-        if (
-            len(board.pieces(chess.KING, chess.WHITE)) != 1
-            or len(board.pieces(chess.KING, chess.BLACK)) != 1
-        ):
-            return "Each side needs exactly one king."
+            return "castling"
+        if any(len(board.pieces(chess.KING, c)) != 1 for c in chess.COLORS):
+            return "kings"
         if chess.popcount(board.occupied) > 6:
-            return "More than six pieces."
+            return "pieces"
         return None
 
-    def value(self, board: chess.Board) -> dict:
+    def value(self, board: chess.Board) -> tuple[int | None, int | None]:
         found = self.locate(board)
         if found is None:
-            return {"wdl": None, "rank": None, "table": None}
+            return None, None
         table, word, bk = found
-        wdl, rank = table.value(word, bk)
-        return {"wdl": wdl, "rank": rank, "table": table.header["material"]}
+        return table.value(word, bk)
 
     def syzygy_wdl(self, board: chess.Board) -> int | None:
         if self.syzygy is None:
@@ -268,81 +335,89 @@ class Store:
             return None
 
     def probe(self, fen: str) -> dict:
+        """Compact probe. Keys: s status, m material, w WDL, r rank, z Syzygy WDL,
+        v [[wdl, rank], ...] per legal move in sorted UCI order, n move count,
+        d indices whose child disagrees with Syzygy, x legality disagreement."""
         start = time.perf_counter()
         try:
             board = chess.Board(fen)
-        except ValueError as error:
-            return {"status": "invalid-fen", "message": str(error)}
-        result: dict = {"fen": board.fen(), "turn": "w" if board.turn else "b"}
+        except ValueError:
+            return {"s": "fen"}
         reason = self.unsupported(board)
         if reason:
-            return {**result, "status": "unsupported", "message": reason}
+            return {"s": "unsupported", "why": reason}
         found = self.locate(board)
         if found is None:
-            name = material_name(board, white=True)
-            return {**result, "status": "missing-table", "message": f"No table for {name}."}
+            return {"s": "missing", "m": material_name(board, white=True)}
         table, word, bk = found
         wdl, rank = table.value(word, bk)
-        legal_by_chess = chess_legal(board)
-        result |= {
-            "material": table.header["material"],
-            "table": self.table_info(table),
-            "check": board.is_check(),
-        }
-        if wdl is None or not legal_by_chess:
-            result |= {
-                "status": "illegal",
-                "message": "Illegal position: the side not to move is in check, or kings touch.",
-                "agrees_with_python_chess": (wdl is None) == (not legal_by_chess),
-            }
-            return result
+        out: dict = {"m": table.name}
+        if wdl is None or not chess_legal(board):
+            out["s"] = "illegal"
+            if (wdl is None) != (not chess_legal(board)):
+                out["x"] = 1
+            return out
+        out |= {"s": "ok", "w": wdl}
+        if rank is not None:
+            out["r"] = rank
         syzygy = self.syzygy_wdl(board)
-        moves = []
-        for move in board.legal_moves:
-            san = board.san(move)
-            capture = board.is_capture(move)
+        if syzygy is not None:
+            out["z"] = syzygy
+        values, disagree = [], []
+        for i, move in enumerate(sorted(board.legal_moves, key=chess.Move.uci)):
             board.push(move)
-            child = self.value(board)
-            child_syzygy = self.syzygy_wdl(board) if child["wdl"] is not None else None
-            moves.append(
-                {
-                    "fen": board.fen(),
-                    "uci": move.uci(),
-                    "san": san,
-                    "capture": capture,
-                    "checkmate": board.is_checkmate(),
-                    "stalemate": board.is_stalemate(),
-                    "wdl": None if child["wdl"] is None else -child["wdl"],
-                    "child_rank": child["rank"],
-                    "child_table": child["table"],
-                    "syzygy_agrees": None
-                    if child_syzygy is None or child["wdl"] is None
-                    else (child_syzygy > 0) - (child_syzygy < 0) == child["wdl"] // 2,
-                }
-            )
+            child_wdl, child_rank = self.value(board)
+            if child_wdl is not None:
+                child_syzygy = self.syzygy_wdl(board)
+                if child_syzygy is not None and sign(child_syzygy) != child_wdl // 2:
+                    disagree.append(i)
             board.pop()
-        moves.sort(key=move_order)
-        result |= {
-            "status": "ok",
-            "wdl": wdl,
-            "rank": rank,
-            "checkmate": board.is_checkmate(),
-            "stalemate": board.is_stalemate(),
-            "syzygy": None
-            if syzygy is None
-            else {
-                "wdl": syzygy,
-                "agrees": (syzygy > 0) - (syzygy < 0) == wdl // 2,
-            },
-            "moves": moves,
-        }
-        result["probe_ms"] = round((time.perf_counter() - start) * 1000, 2)
-        return result
+            values.append(
+                [None if child_wdl is None else -child_wdl, child_rank]
+                if child_rank is not None
+                else [None if child_wdl is None else -child_wdl]
+            )
+        out |= {"v": values, "n": len(values)}
+        if disagree:
+            out["d"] = disagree
+        out["ms"] = round((time.perf_counter() - start) * 1000, 2)
+        return out
+
+    def best_line(self, fen: str, limit: int = 120) -> dict:
+        """Best play from a decided position: fastest win, longest defence."""
+        try:
+            board = chess.Board(fen)
+        except ValueError:
+            return {"s": "fen"}
+        line = []
+        for _ in range(limit):
+            if board.is_game_over() or self.unsupported(board):
+                break
+            wdl, _ = self.value(board)
+            if wdl in (None, 0):
+                break
+            best, best_key = None, None
+            for move in board.legal_moves:
+                board.push(move)
+                child, rank = self.value(board)
+                mate = board.is_checkmate()
+                board.pop()
+                if child is None:
+                    continue
+                r = rank if rank is not None else 1 << 20
+                key = (0 if mate else 1, r) if -child == 2 else (2, -r)
+                if -child == wdl and (best_key is None or key < best_key):
+                    best, best_key = move, key
+            if best is None:
+                break
+            line.append(best.uci())
+            board.push(best)
+        return {"s": "ok", "u": line}
 
     def random_position(self, material: str, turn: str, want: str) -> dict:
         table = self.tables.get(material)
         if table is None:
-            return {"status": "missing-table", "message": f"No table for {material}."}
+            return {"s": "missing", "m": material}
         rng = random.SystemRandom()
         goal = {"win": 2, "draw": 0, "loss": -2}.get(want)
         for _ in range(200_000):
@@ -359,96 +434,136 @@ class Store:
                 board.set_piece_at(square, chess.Piece(role, white))
             board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
             board.turn = not black_to_move
-            return {"status": "ok", "fen": board.fen()}
-        return {"status": "not-found", "message": f"No {want} position found for {material}."}
+            return {"s": "ok", "f": board.fen()}
+        return {"s": "none"}
 
 
-def chess_legal(board: chess.Board) -> bool:
-    """python-chess legality, accepting check patterns that cannot arise in play
-    (the tables and the shakmaty verifier accept them too)."""
-    ignored = chess.STATUS_IMPOSSIBLE_CHECK | chess.STATUS_TOO_MANY_CHECKERS
-    return board.status() & ~ignored == chess.STATUS_VALID
+# Assets -------------------------------------------------------------------------------
+def piece_sprite() -> str:
+    """cburnett-style pieces from python-chess as one inline <symbol> sprite."""
+    symbols = []
+    for color in "wb":
+        for role in "KQRBN":
+            symbol = role if color == "w" else role.lower()
+            svg = chess.svg.piece(chess.Piece.from_symbol(symbol))
+            inner = re.sub(r"^<svg[^>]*>|</svg>$", "", svg.strip())
+            symbols.append(f'<symbol id="{color}{role}" viewBox="0 0 45 45">{inner}</symbol>')
+    return f'<svg xmlns="http://www.w3.org/2000/svg" hidden>{"".join(symbols)}</svg>'
 
 
-def move_order(m: dict) -> tuple:
-    """lichess order: wins (fastest first), draws, losses (longest first), unknown last."""
-    rank = m["child_rank"] if m["child_rank"] is not None else 1 << 20
-    if m["wdl"] == 2:
-        return (0, 0 if m["checkmate"] else 1, rank, m["san"])
-    if m["wdl"] == 0:
-        return (1, 0, 0, m["san"])
-    if m["wdl"] == -2:
-        return (2, 0, -rank, m["san"])
-    return (3, 0, 0, m["san"])
+ESBUILD = ["npx", "--no-install", "esbuild@0.25.10", "--minify"]
 
 
-def _letter(role: int) -> str:
-    return chess.piece_symbol(role).upper()
-
-
-def _json(path: Path) -> dict:
+def minify(source: str, loader: str) -> tuple[str, bool]:
+    """Minify with esbuild when it is installed locally; otherwise ship the source."""
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
+        done = subprocess.run(  # noqa: S603 - fixed argument list, no shell
+            [*ESBUILD, f"--loader={loader}"],
+            input=source,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return source, False
+    return done.stdout, True
 
 
-@functools.lru_cache(maxsize=16)
-def piece_svg(code: str) -> bytes:
-    color, role = code[0], code[1].upper()
-    symbol = role if color == "w" else role.lower()
-    return chess.svg.piece(chess.Piece.from_symbol(symbol)).encode()
+def build_assets() -> tuple[bytes, dict[str, bytes]]:
+    """The single page (CSS, JS, sprite inline) and content-addressed font files."""
+    fonts = {}
+    css = (STATIC / "app.css").read_text()
+    for path in sorted((STATIC / "fonts").glob("*.woff2")):
+        data = path.read_bytes()
+        name = f"{path.stem}.{hashlib.sha256(data).hexdigest()[:12]}.woff2"
+        fonts[name] = data
+        css = css.replace(f"/fonts/{path.name}", f"/fonts/{name}")
+    css, css_min = minify(css, "css")
+    js, js_min = minify((STATIC / "app.js").read_text(), "js")
+    state = {True: "minified", False: "source"}
+    print(f"assets: css {state[css_min]}, js {state[js_min]}")
+    page = (STATIC / "index.html").read_text()
+    page = page.replace("<!--CSS-->", f"<style>{css}</style>")
+    page = page.replace("<!--SPRITE-->", piece_sprite())
+    page = page.replace("<!--JS-->", f'<script type="module">{js}</script>')
+    return page.encode(), fonts
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive: no reconnect per request
     store: Store
-    types: typing.ClassVar[dict[str, str]] = {
-        ".html": "text/html",
-        ".js": "text/javascript",
-        ".css": "text/css",
-        ".svg": "image/svg+xml",
-        ".woff2": "font/woff2",
-        ".txt": "text/plain",
-    }
+    page: bytes
+    page_gz: bytes
+    page_etag: str
+    fonts: dict[str, bytes]
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
-    def send(self, body: bytes, kind: str, status: int = 200) -> None:
-        self.send_response(status)
-        textual = kind.startswith(("text/", "application/json", "image/svg"))
-        self.send_header("Content-Type", f"{kind}; charset=utf-8" if textual else kind)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store" if kind == "application/json" else "no-cache")
+    def reply(
+        self,
+        body: bytes,
+        kind: str,
+        cache: str,
+        etag: str | None = None,
+        compressed: bytes | None = None,
+    ) -> None:
+        if etag and self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        gz = "gzip" in self.headers.get("Accept-Encoding", "")
+        if gz and compressed is None and len(body) >= GZIP_MIN and not kind.startswith("font/"):
+            compressed = gzip.compress(body, compresslevel=6, mtime=0)
+        payload = compressed if gz and compressed is not None else body
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", cache)
+        self.send_header("Vary", "Accept-Encoding")
+        if payload is compressed:
+            self.send_header("Content-Encoding", "gzip")
+        if etag:
+            self.send_header("ETag", etag)
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(payload)
+
+    def api(self, data: dict) -> None:
+        body = json.dumps(data, separators=(",", ":")).encode()
+        self.reply(body, "application/json", "no-store")
 
     def do_GET(self) -> None:
         url = urllib.parse.urlsplit(self.path)
-        query = dict(urllib.parse.parse_qsl(url.query))
-        api = {
-            "/api/probe": lambda: self.store.probe(query.get("fen", "")),
-            "/api/materials": self.store.materials,
-            "/api/evidence": lambda: self.store.evidence,
-            "/api/random": lambda: self.store.random_position(
-                query.get("material", ""), query.get("turn", "any"), query.get("result", "any")
-            ),
-        }
-        if url.path in api:
-            self.send(json.dumps(api[url.path]()).encode(), "application/json")
-        elif url.path.startswith("/piece/") and url.path.endswith(".svg"):
-            code = url.path[len("/piece/") : -4]
-            if len(code) == 2 and code[0] in "wb" and code[1] in "KQRBNP":
-                self.send(piece_svg(code), "image/svg+xml")
-            else:
-                self.send(b"not found", "text/plain", 404)
+        q = dict(urllib.parse.parse_qsl(url.query))
+        s = self.store
+        if url.path == "/":
+            self.reply(
+                self.page, "text/html; charset=utf-8", "no-cache", self.page_etag, self.page_gz
+            )
+        elif url.path == "/api/probe":
+            self.api(s.probe(q.get("fen", "")))
+        elif url.path == "/api/line":
+            self.api(s.best_line(q.get("fen", "")))
+        elif url.path == "/api/random":
+            self.api(
+                s.random_position(q.get("m", ""), q.get("turn", "any"), q.get("result", "any"))
+            )
+        elif url.path == "/api/materials":
+            body = json.dumps(s.materials(), separators=(",", ":")).encode()
+            etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+            self.reply(body, "application/json", "no-cache", etag)
+        elif url.path == "/api/evidence":
+            self.api(s.evidence(q.get("m", "")))
+        elif url.path.startswith("/fonts/") and url.path[7:] in self.fonts:
+            self.reply(
+                self.fonts[url.path[7:]], "font/woff2", "public, max-age=31536000, immutable"
+            )
         else:
-            name = "index.html" if url.path in ("/", "") else url.path.lstrip("/")
-            path = (STATIC / name).resolve()
-            if not path.is_relative_to(STATIC) or not path.is_file():
-                self.send(b"not found", "text/plain", 404)
-                return
-            self.send(path.read_bytes(), self.types.get(path.suffix, "application/octet-stream"))
+            self.reply(b"not found", "text/plain", "no-store")
 
 
 def main() -> None:
@@ -460,6 +575,9 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default loopback)")
     args = parser.parse_args()
     Handler.store = Store(args.tables, args.syzygy, args.logs)
+    Handler.page, Handler.fonts = build_assets()
+    Handler.page_gz = gzip.compress(Handler.page, compresslevel=9, mtime=0)
+    Handler.page_etag = f'"{hashlib.sha256(Handler.page).hexdigest()[:16]}"'
     print(f"{len(Handler.store.tables)} tables; http://{args.host}:{args.port}/", flush=True)
     http.server.ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
