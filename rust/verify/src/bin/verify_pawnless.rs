@@ -11,12 +11,14 @@
 //!     largest rank of its children.
 //!   - a rank-0 loss is checkmate.
 //!   - a draw has no child that is a loss. It is a stalemate or has a child that is not a win.
+//! - with `--dtz`, each proof rank of a win or a loss that is not checkmate
+//!   equals the Syzygy DTZ. The Syzygy directories must hold the DTZ files.
 use shakmaty::{
     Board, CastlingMode, Chess, Color, FromSetup, Piece, Position, PositionError, Role, Setup,
     Square,
 };
 use shakmaty_syzygy::{
-    Tablebase,
+    Dtz, MaybeRounded, Tablebase,
     filesystem::{Filesystem, RandomAccessFile, ReadHint},
 };
 use std::{
@@ -76,10 +78,12 @@ struct Context<'a> {
     table: &'a Table,
     /// (captured piece, table without it) for every non-king skeleton piece.
     lower: Vec<(Piece, Option<&'a Table>)>,
+    /// Compare each proof rank with the Syzygy DTZ.
+    dtz: bool,
 }
 
 impl<'a> Context<'a> {
-    fn new(tables: &'a Tables, table: &'a Table) -> Context<'a> {
+    fn new(tables: &'a Tables, table: &'a Table, dtz: bool) -> Context<'a> {
         let m = &table.material;
         let lower = (1..m.skeleton_len())
             .map(|k| {
@@ -87,7 +91,7 @@ impl<'a> Context<'a> {
                 (piece(m.skeleton[k]), below)
             })
             .collect();
-        Context { table, lower }
+        Context { table, lower, dtz }
     }
 }
 
@@ -97,6 +101,7 @@ struct Counts {
     positions: u64,
     legal: u64,
     syzygy_compared: u64,
+    dtz_compared: u64,
     proof_checked: u64,
 }
 
@@ -175,6 +180,7 @@ struct Tally {
     positions: AtomicU64,
     legal: AtomicU64,
     syzygy_compared: AtomicU64,
+    dtz_compared: AtomicU64,
     proof_checked: AtomicU64,
     failures: AtomicU64,
 }
@@ -227,6 +233,7 @@ fn check_position(
     };
     let value = solved.ok_or("solver marks a legal position illegal")?;
     tally.legal += 1;
+    let mut dtz = false;
     if material.skeleton_len() > 1 {
         let wdl = syzygy
             .probe_wdl_after_zeroing(&pos)
@@ -235,6 +242,7 @@ fn check_position(
             return Err(format!("syzygy WDL {wdl} vs solved {value}"));
         }
         tally.syzygy_compared += 1;
+        dtz = ctx.dtz;
     } else if value != 0 {
         return Err("bare kings must be a draw".into());
     }
@@ -245,6 +253,10 @@ fn check_position(
     let rank = table.rank[word * 64 + usize::from(bk)];
     if value != 0 && rank == pawnless::UNRESOLVED {
         return Err(format!("value {value} has no proof rank"));
+    }
+    if dtz && value != 0 && rank != 0 {
+        check_dtz(syzygy, &pos, rank)?;
+        tally.dtz_compared += 1;
     }
     let moves = pos.legal_moves();
     // The rank is the solver round. A win is one more than its fastest child
@@ -299,6 +311,24 @@ fn check_position(
     Ok(())
 }
 
+/// Syzygy DTZ counts the plies to a capture or to mate, as the proof rank does.
+/// The 50-move rule can change the DTZ only after a capture into a cursed win
+/// or a blessed loss. Pawnless tables with four pieces or fewer have no such
+/// positions. A rounded DTZ `n` can also mean `n + 1`.
+fn check_dtz(syzygy: &Tablebase<Chess>, pos: &Chess, rank: u16) -> Result<(), String> {
+    let (dtz, rounded) = match syzygy.probe_dtz(pos).map_err(|e| format!("syzygy: {e}"))? {
+        MaybeRounded::Precise(Dtz(n)) => (n, false),
+        MaybeRounded::Rounded(Dtz(n)) => (n, true),
+    };
+    let (n, r) = (dtz.unsigned_abs(), u32::from(rank));
+    if r == n || (rounded && r == n + 1) {
+        Ok(())
+    } else {
+        let kind = if rounded { "rounded" } else { "precise" };
+        Err(format!("syzygy DTZ {dtz} ({kind}) vs proof rank {rank}"))
+    }
+}
+
 fn record_failure(
     table: &Table,
     word: usize,
@@ -347,7 +377,7 @@ enum Scope {
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: verify_pawnless SYZYGY_DIR[,DIR...] THREADS [--canonical|--stored] \
-                 TABLE_FILE...";
+                 [--dtz] TABLE_FILE...";
     let syzygy_dirs = args.next().ok_or(usage)?;
     let threads: usize = args
         .next()
@@ -355,12 +385,15 @@ fn main() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("threads: {e}"))?;
     let mut args = args.peekable();
-    let scope = match args.next_if(|a| a.starts_with("--")).as_deref() {
-        None => Scope::All,
-        Some("--canonical") => Scope::Canonical,
-        Some("--stored") => Scope::Stored,
-        Some(_) => return Err(usage.into()),
-    };
+    let (mut scope, mut dtz) = (Scope::All, false);
+    while let Some(flag) = args.next_if(|a| a.starts_with("--")) {
+        match flag.as_str() {
+            "--canonical" => scope = Scope::Canonical,
+            "--stored" => scope = Scope::Stored,
+            "--dtz" => dtz = true,
+            _ => return Err(usage.into()),
+        }
+    }
     let mut paths = BTreeMap::new();
     for path in args {
         let name = material_of(&path)?.name();
@@ -400,7 +433,14 @@ fn main() -> Result<(), String> {
                 tables.insert(name, table);
             }
         }
-        let mut row = verify_table(&tables, &tables[&material.name()], &syzygy, scope, threads)?;
+        let mut row = verify_table(
+            &tables,
+            &tables[&material.name()],
+            &syzygy,
+            scope,
+            dtz,
+            threads,
+        )?;
         row["payload_sha256"] = digests[&material.name()].clone().into();
         eprintln!("{row}");
         report.push(row);
@@ -424,6 +464,7 @@ fn verify_table(
     table: &Table,
     syzygy: &Tablebase<Chess>,
     scope: Scope,
+    dtz: bool,
     threads: usize,
 ) -> Result<serde_json::Value, String> {
     let start = Instant::now();
@@ -435,7 +476,7 @@ fn verify_table(
         Scope::Stored => layout.words(),
         _ => table.valid.len(),
     };
-    let ctx = Context::new(tables, table);
+    let ctx = Context::new(tables, table, dtz);
     // Dynamic chunks: canonical words sit in contiguous index ranges, so a
     // static split would leave most threads idle.
     const CHUNK: usize = 4096;
@@ -482,6 +523,9 @@ fn verify_table(
                     tally.legal.fetch_add(counts.legal, Ordering::Relaxed);
                     let compared = counts.syzygy_compared;
                     tally.syzygy_compared.fetch_add(compared, Ordering::Relaxed);
+                    tally
+                        .dtz_compared
+                        .fetch_add(counts.dtz_compared, Ordering::Relaxed);
                     let checked = counts.proof_checked;
                     tally.proof_checked.fetch_add(checked, Ordering::Relaxed);
                 }
@@ -497,6 +541,7 @@ fn verify_table(
         "positions_examined": tally.positions.load(Ordering::Relaxed),
         "legal_positions": tally.legal.load(Ordering::Relaxed),
         "syzygy_wdl_compared": tally.syzygy_compared.load(Ordering::Relaxed),
+        "syzygy_dtz_compared": tally.dtz_compared.load(Ordering::Relaxed),
         "proof_obligations_checked": tally.proof_checked.load(Ordering::Relaxed),
         "scope": match scope {
             Scope::All => "all",
