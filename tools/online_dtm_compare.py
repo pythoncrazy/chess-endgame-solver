@@ -1,6 +1,6 @@
 """Compare GPU-solved KQvK values and proof ranks with tablebase.lichess.ovh.
 
-Usage: python -I tools/online_dtm_compare.py TABLE_FILE OUTPUT_DIR [SAMPLES]
+Usage: uv run tools/online_dtm_compare.py TABLE_FILE OUTPUT_DIR [SAMPLES]
 
 In KQvK no capture leads to a win or loss. If Black captures the queen, the
 result is a draw. Thus the synchronous proof rank of a decided position is its

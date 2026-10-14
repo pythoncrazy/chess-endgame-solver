@@ -14,12 +14,14 @@ for h in "${HOSTS[@]}"; do HOST_ARGS+=(--host "$h"); done
 HOST=${HOSTS[0]}
 PIDFILE=${TMPDIR:-/tmp}/tablebase-visualizer-$PORT.pid
 HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
+uv sync --frozen --quiet --project "$ROOT"
 
 if [[ -f $PIDFILE ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   kill "$(cat "$PIDFILE")"
   sleep 0.5
 fi
-setsid "$TB_ROOT/venv/bin/python" -I "$HERE/server.py" \
+setsid "$ROOT/.venv/bin/python" -I "$HERE/server.py" \
   --tables "$TB_ROOT/results/all5" \
   --tables "$TB_ROOT/results/solve-KQBNvKR" \
   --syzygy "$TB_ROOT/references-345" \

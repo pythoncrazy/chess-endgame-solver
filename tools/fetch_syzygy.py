@@ -4,7 +4,7 @@ Files come from tablebase.lichess.ovh. Each file must match the MD5 that an
 independent mirror (tablebase.sesse.net) publishes. The catalog records size, MD5
 and SHA-256. This script downloads only reference data. It generates no chess result.
 
-Usage: python -I tools/fetch_syzygy.py DIRECTORY [MAX_PIECES]
+Usage: uv run tools/fetch_syzygy.py DIRECTORY [MAX_PIECES]
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """Browser smoke test of the visualizer: load, click-move, drag, editor, buttons.
 
-Usage: python -I tools/visualizer/ui_smoke.py URL
+Usage: uv run tools/visualizer/ui_smoke.py URL
 Prints every console error and failed request. Exits non-zero on any failure.
 """
 
