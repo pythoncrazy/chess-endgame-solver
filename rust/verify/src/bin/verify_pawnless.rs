@@ -4,10 +4,11 @@
 //! moves. It uses shakmaty-syzygy for the published WDL. For every position of every table:
 //! - legality agrees with shakmaty. The check accepts impossible-check positions.
 //! - the unclocked WDL equals the sign of Syzygy WDL after zeroing.
-//! - proof ranks hold:
+//! - proof ranks are exact. A lower-material child counts as rank 0:
 //!   - a win or a loss has a proof rank.
-//!   - a win has a child loss of smaller rank, or a capture into a lower-material loss.
-//!   - every child of a loss is a win of smaller rank, or a lower-material win.
+//!   - the rank of a win is one more than the smallest rank of its child losses.
+//!   - every child of a loss is a win. The rank of the loss is one more than the
+//!     largest rank of its children.
 //!   - a rank-0 loss is checkmate.
 //!   - a draw has no child that is a loss. It is a stalemate or has a child that is not a win.
 use shakmaty::{
