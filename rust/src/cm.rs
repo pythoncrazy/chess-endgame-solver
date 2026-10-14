@@ -331,6 +331,9 @@ impl Default for Settings {
     }
 }
 
+/// Memory limit of the bit counters of the encoder.
+const COUNT_BYTES: usize = 4 << 30;
+
 /// Number of trainers. Each trainer has a fixed part of the sample, so the
 /// weights do not depend on the number of threads.
 const TRAINERS: usize = 8;
@@ -373,15 +376,24 @@ pub fn encode<B: Blocks>(
     let sets = section.sets();
     let blocks = section.blocks();
     let empty = || Count(sizes.iter().map(|&n| vec![[0u32; 2]; n]).collect());
-    let mut counts = empty();
-    for part in per_thread(blocks, threads.min(8), empty, |b, c| section.walk(b, c)) {
-        for (t, u) in counts.0.iter_mut().zip(part.0) {
-            for (a, b) in t.iter_mut().zip(u) {
-                a[0] += b[0];
-                a[1] += b[1];
-            }
+    let per_counter = 8 * sizes.iter().sum::<usize>();
+    let counters = threads.min(COUNT_BYTES / per_counter.max(1)).max(1);
+    let mut parts = per_thread(blocks, counters, empty, |b, c| section.walk(b, c));
+    let mut counts = parts.pop().expect("one counter");
+    std::thread::scope(|scope| {
+        for (i, t) in counts.0.iter_mut().enumerate() {
+            let parts = &parts;
+            scope.spawn(move || {
+                for part in parts {
+                    for (a, b) in t.iter_mut().zip(&part.0[i]) {
+                        a[0] += b[0];
+                        a[1] += b[1];
+                    }
+                }
+            });
         }
-    }
+    });
+    drop(parts);
     let mut raw = Vec::new();
     raw.extend_from_slice(MAGIC);
     raw.extend_from_slice(&(sizes.len() as u32).to_le_bytes());
