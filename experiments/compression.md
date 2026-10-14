@@ -195,3 +195,64 @@ Thus the block size is not the cause. The cause is the fixed model.
 
 Decision: Use the fixed model for the rank section.
 Find a better fixed model for WDL, or use the adaptive model for WDL.
+
+## E5: block regimes
+
+Question: Does side data about each region help the fixed WDL model?
+
+Method: The encoder keeps a regime for each region of words.
+The regime is the share of draws and the share of losses, in eight buckets each.
+Three models use the regime as a context.
+The result includes the code length of the regimes.
+
+Results for the WDL sections (all five tables, TB_PRUNE 64):
+
+| Region words | Fixed model | Header | Regimes | Total |
+|---|---|---|---|---|
+| none | 15,521,613 | 341,946 | 0 | 15,863,559 |
+| 16 | 15,270,759 | 367,937 | 189,171 | 15,827,867 |
+| 64 | 15,428,410 | 357,711 | 34,372 | 15,820,493 |
+| 256 | 15,489,549 | 354,177 | 7,750 | 15,851,476 |
+
+Decision: Do not use regimes. The gain is less than 0.3%.
+The loss of the fixed model does not come from slow changes over the table.
+
+## E6: capture geometry
+
+Question: Do chess features of each position help the models?
+
+Method: The word index gives the squares of all pieces except the black king.
+The bit index in the word gives the black king square.
+A geometry context has four parts.
+
+- The white pieces that give check.
+- The white pieces that black can take without a recapture.
+- The black pieces that white can take without a recapture.
+- The distance of the two kings, in three buckets.
+
+The attack test includes the blockers on the line.
+Three WDL models and two rank models use the geometry.
+
+Results for the WDL sections:
+
+| Model | Without geometry | Near pieces and checks | Capture geometry |
+|---|---|---|---|
+| Adaptive mixer | 11,162,570 | 9,742,642 | 8,012,075 |
+| Fixed model | 15,521,613 | 13,350,176 | 11,084,767 |
+
+The second column uses a first test. It uses the pieces next to the black king instead of the loose pieces.
+
+Results for all five tables:
+
+| Section | zstd 19 | Adaptive mixer | Fixed model | Fixed header |
+|---|---|---|---|---|
+| WDL | 18,325,840 | 8,012,075 | 11,084,767 | 376,909 |
+| Rank | 32,195,889 | 18,528,316 | 20,147,255 | 328,615 |
+| Total | 50,521,729 | 26,540,391 | 31,937,546 (with header) | |
+
+The adaptive mixer is 47% smaller than zstd.
+The fixed model with small blocks and its header is 37% smaller than zstd.
+The capture geometry gives KQBvKR the largest gain: its adaptive WDL size decreases by 56%.
+
+Decision: Keep the capture geometry.
+The fixed model is now a good choice for a parallel GPU coder with fast probes.
