@@ -2,8 +2,8 @@
 
 This repository makes exact tables for pawnless chess endgames.
 A table gives the result of each position with best play: win, draw or loss.
-It also gives a proof rank: the number of plies to checkmate, or to a capture
-into a table with fewer pieces.
+It also gives a proof rank. This is the number of plies to checkmate, or to a
+capture into a table with fewer pieces.
 
 The solver runs on one NVIDIA H100 GPU. A CPU solver gives the same tables
 for comparison. A separate program checks each table against the published
