@@ -58,6 +58,18 @@ def main() -> int:  # noqa: PLR0915 - one linear browser script
         page.locator(".tb-move").first.click()
         page.wait_for_timeout(800)
         check("explorer click plays move", page.locator("#tview button").count() == before + 1)
+        # The played move's value comes from the parent reply, before the child's.
+        page.route("**/api/probe*", lambda route: (page.wait_for_timeout(1500), route.continue_()))
+        page.locator(".tb-move").first.click()
+        page.wait_for_timeout(300)
+        check(
+            "value shown while the move list loads",
+            text(page, "#pearl") not in ("", "\u2013") and "Loading" in text(page, "#ceval-sub"),
+            f"{text(page, '#pearl')} / {text(page, '#ceval-sub')}",
+        )
+        page.wait_for_timeout(2000)
+        page.unroute("**/api/probe*")
+        check("move list arrives", page.locator(".tb-move").count() > 0)
         # Navigation.
         page.click("#prev")
         page.wait_for_timeout(500)

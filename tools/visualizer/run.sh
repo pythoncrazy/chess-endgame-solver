@@ -19,8 +19,9 @@ if [[ -f $PIDFILE ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   sleep 0.5
 fi
 setsid "$TB_ROOT/venv/bin/python" -I "$HERE/server.py" \
-  --tables "$TB_ROOT/results/solve-v2-KQBvKR" \
+  --tables "$TB_ROOT/results/all5" \
   --tables "$TB_ROOT/results/solve-KQBNvKR" \
+  --syzygy "$TB_ROOT/references-345" \
   --syzygy "$TB_ROOT/references-six" \
   --logs "$TB_ROOT/logs" \
   "${HOST_ARGS[@]}" --port "$PORT" > "$TB_ROOT/logs/visualizer.log" 2>&1 < /dev/null &

@@ -149,6 +149,11 @@ async function show(fen, { push = null, reset = false } = {}) {
   const parsed = parseFen(fen);
   if (!parsed) { $("fen").classList.add("is-bad"); return; }
   $("fen").classList.remove("is-bad");
+  // A played move's value is already in the parent's reply: show it while the
+  // child's move list loads.
+  const parent = state.result;
+  const i = push ? state.moves.findIndex((m) => m.uci === push.uci) : -1;
+  const known = parent?.s === "ok" && parent.n === state.moves.length && i >= 0 ? parent.v?.[i] : null;
   Object.assign(state, { board: parsed.board, turn: parsed.turn, selected: null });
   if (push) {
     state.nodes = state.nodes.slice(0, state.index + 1);
@@ -167,6 +172,11 @@ async function show(fen, { push = null, reset = false } = {}) {
   renderBoard();
   renderTview();
   renderTurn();
+  if (known?.[0] != null) {
+    const exact = materials?.[materialOf(state.board)]?.exactDtm;
+    renderPearl(-known[0], known[1], exact, state.moves.length === 0);
+    $("ceval-sub").textContent = "Loading moves…";
+  }
   const id = ++state.request;
   const result = await probe(fen);
   if (id !== state.request) return;
@@ -387,6 +397,19 @@ function valuedMoves(r) {
   });
 }
 
+/** Headline value and gauge of the current position (w and rank for the side to move). */
+function renderPearl(w, rank, exact, terminal) {
+  const pearl = $("pearl");
+  const mate = terminal && inCheck(state.board, state.turn);
+  const whiteWins = (w === 2) === (state.turn === "w");
+  pearl.className = `pearl ${w === 0 ? "" : whiteWins ? "win" : "loss"}`;
+  if (w === 0) pearl.textContent = "½-½";
+  else if (exact && rank != null) pearl.textContent = mate ? "#" : `#${whiteWins ? "" : "-"}${Math.ceil(rank / 2)}`;
+  else pearl.textContent = whiteWins ? "1-0" : "0-1";
+  $("gauge").classList.remove("is-off");
+  $("gauge-black").style.transform = `scaleY(${w === 0 ? 0.5 : whiteWins ? 0 : 1})`;
+}
+
 function renderTools() {
   const r = state.result;
   const exact = materials?.[r?.m]?.exactDtm;
@@ -406,13 +429,7 @@ function renderTools() {
   const moves = valuedMoves(r);
   const terminal = state.moves.length === 0;
   const mate = terminal && inCheck(state.board, state.turn);
-  const whiteWins = (r.w === 2) === (state.turn === "w");
-  pearl.className = `pearl ${r.w === 0 ? "" : whiteWins ? "win" : "loss"}`;
-  if (r.w === 0) pearl.textContent = "½-½";
-  else if (exact && r.r != null) pearl.textContent = mate ? "#" : `#${whiteWins ? "" : "-"}${Math.ceil(r.r / 2)}`;
-  else pearl.textContent = whiteWins ? "1-0" : "0-1";
-  gauge.classList.remove("is-off");
-  $("gauge-black").style.transform = `scaleY(${r.w === 0 ? 0.5 : whiteWins ? 0 : 1})`;
+  renderPearl(r.w, r.r, exact, terminal);
   const z = r.z === undefined ? "no Syzygy file" : Math.sign(r.z) === r.w / 2 ? "Syzygy agrees" : `Syzygy says ${SYZ[r.z]}`;
   const rankText = r.r == null ? "no proof rank" : exact ? `mate in ${r.r} plies` : `proof rank ${r.r}`;
   sub.textContent = mate ? `Checkmate · ${z}` : terminal ? `Stalemate · ${z}` : `${r.m} · ${rankText} · ${z} · ${r.ms} ms`;

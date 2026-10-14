@@ -1,7 +1,7 @@
 """Independent checks of the tables through the visualizer's Python decoder.
 
 This path shares no code with the Rust solver or the shakmaty-based verifier:
-numpy reads the .tbp planes, python-chess judges legality and probes Syzygy.
+numpy/zstandard read the .tbp/.tbz files, python-chess judges legality and probes Syzygy.
 
 Usage: python -I tools/visualizer/test_store.py TABLE_DIR SYZYGY_DIR [SAMPLES]
 """
@@ -50,9 +50,14 @@ class KnownPositions(unittest.TestCase):
         self.assertEqual(self.probe("not a fen")["s"], "fen")
 
     def test_colour_swapped_material(self) -> None:
-        # White rook vs bare king is stored as KvKR with colours swapped.
-        r = self.probe("8/8/3k4/8/8/8/8/R3K3 b - - 0 1")
-        self.assertEqual((r["s"], r["m"], r["w"]), ("ok", "KvKR", -2))
+        # Black rook vs bare king: KvKR, or KRvK with colours swapped.
+        r = self.probe("8/8/3k4/8/8/8/8/r3K3 w - - 0 1")
+        self.assertEqual((r["s"], r["w"]), ("ok", -2))
+        self.assertIn(r["m"], ("KvKR", "KRvK"))
+        if "KvKR" in store().tables and "KRvK" in store().tables:
+            direct = store().tables["KvKR"].lookup(False, [chess.E1, chess.A1], chess.D6)
+            swapped = store().tables["KRvK"].lookup(True, [chess.D6, chess.A1], chess.E1)
+            self.assertEqual(direct, swapped)
 
     def test_move_values_match_child_probes(self) -> None:
         fen = "8/8/8/8/8/2k5/1r6/KQ6 w - - 0 1"
@@ -99,10 +104,15 @@ class SampledAgreement(unittest.TestCase):
                     board.set_piece_at(square, chess.Piece(role, white))
                 board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
                 board.turn = not black_to_move
-                wdl, _ = table.value(word, bk)
                 checked += 1
-                with self.subTest(material=name, fen=board.fen()):
-                    self.assertEqual(wdl is not None, chess_legal(board))
+                if table.knows_legality:
+                    wdl, _ = table.value(word, bk)
+                    with self.subTest(material=name, fen=board.fen()):
+                        self.assertEqual(wdl is not None, chess_legal(board))
+                elif chess_legal(board):
+                    wdl, _ = table.value(word, bk)
+                else:
+                    wdl = None
                 if wdl is None:
                     continue
                 legal += 1

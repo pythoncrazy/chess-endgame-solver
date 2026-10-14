@@ -1,15 +1,16 @@
-"""Local visualizer for pawnless working-layout tablebases (*.tbp).
+"""Local visualizer for pawnless tablebases (*.tbz format v3, *.tbp v1/v2).
 
 Usage:
   python -I tools/visualizer/server.py --tables DIR [--tables DIR ...]
-      [--syzygy DIR] [--logs DIR] [--host 127.0.0.1] [--port 8642]
+      [--syzygy DIR ...] [--logs DIR] [--host 127.0.0.1] [--port 8642]
 
 Network budget: the page is one self-contained document (CSS, JS and the piece
 sprite inline) revalidated by ETag; fonts are content-addressed and immutable.
 API replies are compact JSON, gzip-compressed, over keep-alive connections. The
 client generates pawnless moves itself, so a probe returns only the value of
-each move, in UCI order. Tables are memory-mapped: one record read decides a
-position (format v2). Values are never guessed.
+each move, in UCI order. Tables are memory-mapped. A v3 position costs one
+cached block per section (WDL, rank); a v2 position one record. Values are
+never guessed.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import gzip
 import hashlib
 import http.server
 import json
+import mmap
 import random
 import re
 import socket
@@ -26,6 +28,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +36,7 @@ import chess
 import chess.svg
 import chess.syzygy
 import numpy as np
+import zstandard
 
 STATIC = Path(__file__).resolve().parent / "static"
 UNRESOLVED = 0xFFFF
@@ -55,8 +59,41 @@ def skeleton(name: str) -> list[tuple[bool, int]]:
     return pieces
 
 
+class Layout:
+    """Full working layout: word = turn * 64^m + skeleton squares (white king first)."""
+
+    header: dict
+    pieces: list[tuple[bool, int]]
+    knows_legality = True
+
+    @property
+    def name(self) -> str:
+        return self.header["material"]
+
+    def encode(self, black_to_move: bool, squares: list[int]) -> int:
+        word = int(black_to_move)
+        for square in squares:
+            word = word * 64 + square
+        return word
+
+    def decode(self, word: int) -> tuple[bool, list[int]]:
+        squares = []
+        for _ in self.pieces:
+            squares.append(word % 64)
+            word //= 64
+        return word == 1, squares[::-1]
+
+    def value(self, word: int, bk: int) -> tuple[int | None, int | None]:
+        return self.lookup(*self.decode(word), bk)
+
+    def lookup(
+        self, black_to_move: bool, squares: list[int], bk: int
+    ) -> tuple[int | None, int | None]:
+        raise NotImplementedError
+
+
 @dataclass
-class Table:
+class Table(Layout):
     """A memory-mapped table. Version 2 keeps one record per word, so a probe
     is one contiguous read; version 1 (three planes) is still accepted."""
 
@@ -92,25 +129,11 @@ class Table:
             path, header, words, version, data, ranked, rank_width, skeleton(header["material"])
         )
 
-    @property
-    def name(self) -> str:
-        return self.header["material"]
-
-    def encode(self, black_to_move: bool, squares: list[int]) -> int:
-        word = int(black_to_move)
-        for square in squares:
-            word = word * 64 + square
-        return word
-
-    def decode(self, word: int) -> tuple[bool, list[int]]:
-        squares = []
-        for _ in self.pieces:
-            squares.append(word % 64)
-            word //= 64
-        return word == 1, squares[::-1]
-
-    def value(self, word: int, bk: int) -> tuple[int | None, int | None]:
+    def lookup(
+        self, black_to_move: bool, squares: list[int], bk: int
+    ) -> tuple[int | None, int | None]:
         """(WDL for the side to move, proof rank) or (None, None) if illegal."""
+        word = self.encode(black_to_move, squares)
         bit = 1 << bk
         if self.version == 2:
             rec = bytes(self.data[word])  # the single read
@@ -140,6 +163,148 @@ class Table:
         return wdl, None if rank in (None, UNRESOLVED) else rank
 
 
+# Format v3 (rust/src/packed.rs): one position per symmetry class.
+TRIANGLE = (0, 1, 2, 3, 9, 10, 11, 18, 19, 27)
+TRIANGLE_INDEX = {s: i for i, s in enumerate(TRIANGLE)}
+LOWER_RIGHT = 0x80C0E0F0F8FCFEFF
+
+
+def _symmetry(g: int, s: int) -> int:
+    """Bit 0 transpose (a1-h8), then bit 1 file mirror, then bit 2 rank mirror."""
+    if g & 1:
+        s = ((s & 7) << 3) | (s >> 3)
+    if g & 2:
+        s ^= 7
+    if g & 4:
+        s ^= 56
+    return s
+
+
+SYMMETRY = [[_symmetry(g, s) for s in range(64)] for g in range(8)]
+TRANSPOSE = SYMMETRY[1]
+TO_TRIANGLE = [next(g for g in range(8) if SYMMETRY[g][s] in TRIANGLE_INDEX) for s in range(64)]
+WDL_CODE = (0, 2, -2, None)
+
+
+class BlockCache:
+    """Decompressed blocks shared by every v3 table, least recently used out."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.blocks: OrderedDict[tuple, bytes] = OrderedDict()
+        self.lock = threading.Lock()
+        self.local = threading.local()
+        self.hits = self.misses = 0
+
+    def get(self, key: tuple, frame: memoryview, size: int) -> bytes:
+        with self.lock:
+            block = self.blocks.get(key)
+            if block is not None:
+                self.blocks.move_to_end(key)
+                self.hits += 1
+                return block
+            self.misses += 1
+        if not hasattr(self.local, "zstd"):
+            self.local.zstd = zstandard.ZstdDecompressor()
+        block = self.local.zstd.decompress(frame, max_output_size=size)
+        if len(block) != size:
+            raise TableFormatError(Path(str(key[0])))
+        with self.lock:
+            self.blocks[key] = block
+            if len(self.blocks) > self.capacity:
+                self.blocks.popitem(last=False)
+        return block
+
+
+BLOCKS = BlockCache(2048)
+
+
+class PackedTable(Layout):
+    """A v3 table. Legality is not stored; callers judge it with python-chess."""
+
+    knows_legality = False
+
+    def __init__(self, path: Path) -> None:
+        with path.open("rb") as f:
+            self.map = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.map[:8] != b"TBPAWNZ1":
+            raise TableFormatError(path)
+        length = int.from_bytes(self.map[8:16], "little")
+        self.path = path
+        self.header = json.loads(self.map[16 : 16 + length])
+        self.pieces = skeleton(self.header["material"])
+        self.m = len(self.pieces)
+        self.per = 64 ** (self.m - 1)
+        self.words = 2 * 64**self.m
+        self.rank_width = self.header["rank_width"]
+        self.ranked = self.rank_width > 0
+        self.block = self.header["block_bytes"]
+        self.groups = []
+        start = 1
+        for i in range(2, self.m + 1):
+            if i == self.m or self.pieces[i] != self.pieces[start]:
+                if i - start >= 2:
+                    self.groups.append((start, i))
+                start = i
+        view = memoryview(self.map)
+        self.sections = {}
+        for s in self.header["sections"]:
+            at = 16 + length + s["offset"]
+            index = np.frombuffer(view[at : at + 8 * (s["blocks"] + 1)], dtype="<u8")
+            frames = at + 8 * (s["blocks"] + 1)
+            self.sections[s["name"]] = (frames, index, s["raw_bytes"])
+        self.view = view
+
+    def _mapped(self, g: int, squares: list[int]) -> list[int]:
+        table = SYMMETRY[g]
+        out = [table[s] for s in squares]
+        for a, b in self.groups:
+            out[a:b] = sorted(out[a:b])
+        return out
+
+    def position(self, black_to_move: bool, squares: list[int], bk: int) -> int:
+        """Stored index: ((turn*10 + triangle(wk)) * 64^(m-1) + rest) * 64 + bk."""
+        g = TO_TRIANGLE[squares[0]]
+        stored = self._mapped(g, squares)
+        t = SYMMETRY[g][bk]
+        if stored[0] % 9 == 0:  # white king on the long diagonal
+            transposed = self._mapped(1, stored)
+            if transposed < stored:
+                stored, t = transposed, TRANSPOSE[t]
+            elif transposed == stored and not LOWER_RIGHT >> t & 1:
+                t = TRANSPOSE[t]
+        rest = 0
+        for s in stored[1:]:
+            rest = rest * 64 + s
+        word = (int(black_to_move) * 10 + TRIANGLE_INDEX[stored[0]]) * self.per + rest
+        return word * 64 + t
+
+    def _byte(self, section: str, at: int) -> bytes:
+        frames, index, raw = self.sections[section]
+        b = at // self.block
+        frame = self.view[frames + int(index[b]) : frames + int(index[b + 1])]
+        block = BLOCKS.get((self.path, section, b), frame, min(self.block, raw - b * self.block))
+        return block[at % self.block : at % self.block + 2]
+
+    def lookup(
+        self, black_to_move: bool, squares: list[int], bk: int
+    ) -> tuple[int | None, int | None]:
+        """(WDL for the side to move, proof rank) of a legal position."""
+        p = self.position(black_to_move, squares, bk)
+        wdl = WDL_CODE[self._byte("wdl", p // 4)[0] >> (2 * (p % 4)) & 3]
+        if wdl is None:
+            raise TableFormatError(self.path)
+        rank = None
+        if wdl and self.ranked:
+            data = self._byte("rank", p * self.rank_width)
+            rank = data[0] if self.rank_width == 1 else int.from_bytes(data[:2], "little")
+        return wdl, rank
+
+
+def open_table(path: Path) -> Layout:
+    return PackedTable(path) if path.suffix == ".tbz" else Table.open(path)
+
+
 def material_name(board: chess.Board, white: bool) -> str:
     def side(color: chess.Color) -> str:
         return "K" + "".join(c * len(board.pieces(ROLES[c], color)) for c in ROLE_ORDER)
@@ -167,13 +332,21 @@ def _json(path: Path) -> dict:
 
 
 class Store:
-    def __init__(self, table_dirs: list[Path], syzygy: Path | None, logs: Path | None) -> None:
-        self.tables: dict[str, Table] = {}
+    def __init__(
+        self, table_dirs: list[Path], syzygy: Path | list[Path] | None, logs: Path | None
+    ) -> None:
+        self.tables: dict[str, Layout] = {}
         for directory in table_dirs:
-            for path in sorted(directory.glob("*.tbp"), key=lambda p: ".gpu." not in p.name):
-                table = Table.open(path)
+            paths = sorted(directory.glob("*.tbz")) + sorted(
+                directory.glob("*.tbp"), key=lambda p: ".gpu." not in p.name
+            )
+            for path in paths:
+                table = open_table(path)
                 self.tables.setdefault(table.name, table)
-        self.syzygy = chess.syzygy.open_tablebase(str(syzygy)) if syzygy else None
+        dirs = [syzygy] if isinstance(syzygy, Path) else list(syzygy or [])
+        self.syzygy = chess.syzygy.open_tablebase(str(dirs[0])) if dirs else None
+        for directory in dirs[1:]:
+            self.syzygy.add_directory(str(directory))
         self.syzygy_lock = threading.Lock()
         self.logs = logs
         self._load_evidence()
@@ -190,6 +363,11 @@ class Store:
             for t in _json(path).get("tables", []):
                 timing = t.get("timing", {})
                 rounds = timing.get("rounds", [])
+                served = self.tables.get(t["material"])
+                if t["material"] in self.solves and (
+                    served is None or t["payload_sha256"] != served.header["payload_sha256"]
+                ):
+                    continue
                 self.solves.setdefault(t["material"], {}).update(
                     {
                         "log": path.name,
@@ -299,8 +477,9 @@ class Store:
         }
 
     # Probing ----------------------------------------------------------------------
-    def locate(self, board: chess.Board) -> tuple[Table, int, int] | None:
-        """Table, word and black-king bit for a pawnless board (colours swapped if needed)."""
+    def locate(self, board: chess.Board) -> tuple[Layout, bool, list[int], int] | None:
+        """Table, turn, skeleton squares and black king of a pawnless board (colours
+        swapped if needed)."""
         for flipped in (False, True):
             table = self.tables.get(material_name(board, white=not flipped))
             if table is None:
@@ -313,7 +492,7 @@ class Store:
                 squares.append(square)
             bk = board.king(chess.WHITE if flipped else chess.BLACK)
             black_to_move = (board.turn == chess.BLACK) != flipped
-            return table, table.encode(black_to_move, squares), bk
+            return table, black_to_move, squares, bk
         return None
 
     def unsupported(self, board: chess.Board) -> str | None:
@@ -331,8 +510,8 @@ class Store:
         found = self.locate(board)
         if found is None:
             return None, None
-        table, word, bk = found
-        return table.value(word, bk)
+        table, *position = found
+        return table.lookup(*position)
 
     def syzygy_wdl(self, board: chess.Board) -> int | None:
         if self.syzygy is None:
@@ -360,12 +539,13 @@ class Store:
         found = self.locate(board)
         if found is None:
             return {"s": "missing", "m": material_name(board, white=True)}
-        table, word, bk = found
-        wdl, rank = table.value(word, bk)
+        table = found[0]
+        legal = chess_legal(board)
+        wdl, rank = table.lookup(*found[1:]) if legal or table.knows_legality else (None, None)
         out: dict = {"m": table.name}
-        if wdl is None or not chess_legal(board):
+        if wdl is None or not legal:
             out["s"] = "illegal"
-            if (wdl is None) != (not chess_legal(board)):
+            if table.knows_legality and (wdl is None) != (not legal):
                 out["x"] = 1
             return out
         out |= {"s": "ok", "w": wdl}
@@ -436,15 +616,19 @@ class Store:
             if turn == "b" or (turn == "any" and rng.random() < 0.5):
                 word += table.words // 2
             bk = rng.randrange(64)
-            wdl, _ = table.value(word, bk)
-            if wdl is None or (goal is not None and wdl != goal):
-                continue
             black_to_move, squares = table.decode(word)
+            if len({*squares, bk}) != len(squares) + 1:
+                continue
             board = chess.Board(None)
             for (white, role), square in zip(table.pieces, squares, strict=True):
                 board.set_piece_at(square, chess.Piece(role, white))
             board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
             board.turn = not black_to_move
+            if not chess_legal(board):
+                continue
+            wdl, _ = table.lookup(black_to_move, squares, bk)
+            if wdl is None or (goal is not None and wdl != goal):
+                continue
             return {"s": "ok", "f": board.fen()}
         return {"s": "none"}
 
@@ -584,7 +768,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tables", type=Path, action="append", required=True)
-    parser.add_argument("--syzygy", type=Path)
+    parser.add_argument("--syzygy", type=Path, action="append")
     parser.add_argument("--logs", type=Path)
     parser.add_argument("--port", type=int, default=8642)
     parser.add_argument(
