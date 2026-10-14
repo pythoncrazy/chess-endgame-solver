@@ -1362,6 +1362,16 @@ impl<T: Copy + Default> DeviceVec<T> {
 
     /// Copy elements `offset..offset + out.len()` to the host.
     fn read_into(&self, offset: usize, out: &mut [T]) -> Result<(), Error> {
+        self.read_on(&self.stream, offset, out)
+    }
+
+    /// As `read_into`, on `stream`. The work that wrote the data must be complete.
+    fn read_on(
+        &self,
+        stream: &Arc<cutile::cuda_core::Stream>,
+        offset: usize,
+        out: &mut [T],
+    ) -> Result<(), Error> {
         if offset + out.len() > self.len {
             return Err("device read out of range".into());
         }
@@ -1369,8 +1379,32 @@ impl<T: Copy + Default> DeviceVec<T> {
         // SAFETY: the range lies inside the allocation (checked above) and the
         // stream is synchronized before `out` is released.
         unsafe {
-            cutile::cuda_core::memcpy_dtoh_async(out.as_mut_ptr(), at, out.len(), &self.stream)?;
-            self.stream.synchronize()?;
+            cutile::cuda_core::memcpy_dtoh_async(out.as_mut_ptr(), at, out.len(), stream)?;
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+
+    /// Copy `len` elements from `offset` of `self` to `at` of `dst`, stream ordered.
+    fn copy_to(
+        &self,
+        offset: usize,
+        dst: &DeviceVec<T>,
+        at: usize,
+        len: usize,
+    ) -> Result<(), Error> {
+        if offset + len > self.len || at + len > dst.len {
+            return Err("device copy out of range".into());
+        }
+        let size = std::mem::size_of::<T>() as u64;
+        // SAFETY: both ranges lie inside their allocations (checked above).
+        unsafe {
+            cutile::cuda_core::memcpy_dtod_async::<T>(
+                dst.ptr + at as u64 * size,
+                self.ptr + offset as u64 * size,
+                len,
+                &self.stream,
+            )?;
         }
         Ok(())
     }
@@ -1591,29 +1625,31 @@ impl Gpu {
         });
         let finish_seconds = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
-        let canonical = match stored {
+        let stored = match stored {
             None => None,
             Some(layout) => {
                 // Stored words form 20 contiguous runs of the full layout.
                 let per = layout.words() / 20;
-                let mut records = vec![[0u64; 2]; layout.words()];
-                for (run, dst) in records.chunks_mut(per).enumerate() {
-                    state[last]
-                        .read_into(2 * layout.full_word(run * per), dst.as_flattened_mut())?;
-                }
-                let mut stored_rank = Vec::new();
-                if ranked {
-                    stored_rank = vec![0u16; layout.words() * 64];
-                    for (run, dst) in stored_rank.chunks_mut(per * 64).enumerate() {
-                        rank.read_into(layout.full_word(run * per) * 64, dst)?;
+                let records = DeviceVec::<u64>::zeroed(&self.stream, 2 * layout.words())?;
+                let stored_rank = DeviceVec::<u16>::zeroed(
+                    &self.stream,
+                    if ranked { layout.words() * 64 } else { 0 },
+                )?;
+                for run in 0..20 {
+                    let word = layout.full_word(run * per);
+                    state[last].copy_to(2 * word, &records, 2 * run * per, 2 * per)?;
+                    if ranked {
+                        rank.copy_to(64 * word, &stored_rank, 64 * run * per, 64 * per)?;
                     }
                 }
-                Some(Canonical {
+                // SAFETY: the stream is live. Other streams can read the copies after this.
+                unsafe { self.stream.synchronize()? };
+                Some(Stored {
                     material: material.clone(),
                     rounds,
+                    counts,
                     records,
-                    rank: stored_rank,
-                    counts: Some(counts),
+                    rank: ranked.then_some(stored_rank),
                 })
             }
         };
@@ -1667,7 +1703,7 @@ impl Gpu {
         });
         Ok(Solution {
             table,
-            canonical,
+            stored,
             rounds,
             counts,
             violations: f[0] as u64,
@@ -1679,12 +1715,47 @@ impl Gpu {
 /// A finished solve: the full working-layout table and/or its stored form.
 struct Solution {
     table: Option<Table>,
-    canonical: Option<Canonical>,
+    stored: Option<Stored>,
     rounds: u32,
     counts: [Counts; 2],
     /// Words whose records differ from a symmetric image (zero when correct).
     violations: u64,
     record: serde_json::Value,
+}
+
+/// The stored words and proof ranks of a solve, in compact device buffers. The
+/// writer downloads them on its own stream while the GPU solves the next material.
+struct Stored {
+    material: Material,
+    rounds: u32,
+    counts: [Counts; 2],
+    records: DeviceVec<u64>,
+    rank: Option<DeviceVec<u16>>,
+}
+
+impl Stored {
+    fn download(self, stream: &Arc<cutile::cuda_core::Stream>) -> Result<Canonical, Error> {
+        // Pieces of 64 MiB or less let the small reads of the solve stream pass between them.
+        const PIECE: usize = 1 << 26;
+        let mut records = vec![[0u64; 2]; self.records.len / 2];
+        for (i, dst) in records.as_flattened_mut().chunks_mut(PIECE / 8).enumerate() {
+            self.records.read_on(stream, i * PIECE / 8, dst)?;
+        }
+        let mut rank = Vec::new();
+        if let Some(device) = &self.rank {
+            rank = vec![0u16; device.len];
+            for (i, dst) in rank.chunks_mut(PIECE / 2).enumerate() {
+                device.read_on(stream, i * PIECE / 2, dst)?;
+            }
+        }
+        Ok(Canonical {
+            material: self.material,
+            rounds: self.rounds,
+            records,
+            rank,
+            counts: Some(self.counts),
+        })
+    }
 }
 
 /// Every pawnless material of at most `pieces` pieces that a complete set
@@ -1738,7 +1809,7 @@ fn all_materials(pieces: usize) -> Result<Vec<Material>, Error> {
 
 /// A solved table on its way to the compressed file.
 struct Job {
-    stored: Canonical,
+    stored: Stored,
     path: PathBuf,
     record: serde_json::Value,
 }
@@ -1747,11 +1818,19 @@ struct Job {
 /// the file when it is complete. The device already checked symmetry.
 fn write_jobs(
     jobs: std::sync::mpsc::Receiver<Job>,
+    stream: &Arc<cutile::cuda_core::Stream>,
     level: i32,
     threads: usize,
 ) -> tablebase_core::Result<Vec<serde_json::Value>> {
+    stream
+        .device()
+        .bind_to_thread()
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for mut job in jobs {
+        let t = Instant::now();
+        let stored = job.stored.download(stream).map_err(|e| e.to_string())?;
+        job.record["stored_download_seconds"] = t.elapsed().as_secs_f64().into();
         let t = Instant::now();
         let partial = job.path.with_extension("tbz.partial");
         let file = File::create(&partial).map_err(|e| e.to_string())?;
@@ -1759,14 +1838,8 @@ fn write_jobs(
             level,
             ..Default::default()
         };
-        let header = packed::write(
-            &job.stored,
-            BufWriter::new(file),
-            GENERATOR,
-            options,
-            threads,
-        )?;
-        drop(job.stored);
+        let header = packed::write(&stored, BufWriter::new(file), GENERATOR, options, threads)?;
+        drop(stored);
         std::fs::rename(&partial, &job.path).map_err(|e| e.to_string())?;
         let r = &mut job.record;
         r["pack_seconds"] = t.elapsed().as_secs_f64().into();
@@ -1806,7 +1879,8 @@ fn solve_all(
     }
     let materials = all_materials(pieces)?;
     let (send, receive) = std::sync::mpsc::sync_channel::<Job>(2);
-    let writer = std::thread::spawn(move || write_jobs(receive, level, threads));
+    let download = gpu.stream.device().new_stream()?;
+    let writer = std::thread::spawn(move || write_jobs(receive, &download, level, threads));
     let mut resumed = Vec::new();
     let solved = solve_all_into(gpu, &materials, output, threads, &send, &mut resumed);
     drop(send);
@@ -1871,7 +1945,7 @@ fn solve_all_into(
         if let Some(table) = solution.table {
             solved.insert(name, Arc::new(table));
         }
-        let stored = solution.canonical.ok_or("stored form missing")?;
+        let stored = solution.stored.ok_or("stored form missing")?;
         if send
             .send(Job {
                 stored,
