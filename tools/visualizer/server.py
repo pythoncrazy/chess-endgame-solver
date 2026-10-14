@@ -21,6 +21,7 @@ import http.server
 import json
 import random
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -500,6 +501,10 @@ def build_assets() -> tuple[bytes, dict[str, bytes]]:
     return page.encode(), fonts
 
 
+class V6Server(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive: no reconnect per request
     store: Store
@@ -582,14 +587,25 @@ def main() -> None:
     parser.add_argument("--syzygy", type=Path)
     parser.add_argument("--logs", type=Path)
     parser.add_argument("--port", type=int, default=8642)
-    parser.add_argument("--host", default="127.0.0.1", help="bind address (default loopback)")
+    parser.add_argument(
+        "--host",
+        action="append",
+        help="bind address; repeat for several (IPv4 and IPv6); default loopback",
+    )
     args = parser.parse_args()
     Handler.store = Store(args.tables, args.syzygy, args.logs)
     Handler.page, Handler.fonts = build_assets()
     Handler.page_gz = gzip.compress(Handler.page, compresslevel=9, mtime=0)
     Handler.page_etag = f'"{hashlib.sha256(Handler.page).hexdigest()[:16]}"'
-    print(f"{len(Handler.store.tables)} tables; http://{args.host}:{args.port}/", flush=True)
-    http.server.ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    servers = []
+    for host in args.host or ["127.0.0.1"]:
+        server_class = V6Server if ":" in host else http.server.ThreadingHTTPServer
+        servers.append(server_class((host, args.port), Handler))
+        shown = f"[{host}]" if ":" in host else host
+        print(f"{len(Handler.store.tables)} tables; http://{shown}:{args.port}/", flush=True)
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    servers[0].serve_forever()
 
 
 if __name__ == "__main__":
