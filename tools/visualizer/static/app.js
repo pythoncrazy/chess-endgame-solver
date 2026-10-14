@@ -335,7 +335,7 @@ function renderPanel() {
     ["Syzygy", syzygyFact(r.syzygy, r.wdl)],
     ["Table", tableFact(r.table)],
     ["Verified", verifiedFact(r.table)],
-    ["Probe", `${r.probe_ms} ms on the server, including the Syzygy check of every move`],
+    ["Probe", `${r.probe_ms} ms, Syzygy-checked per move`],
   ]);
   renderMoves(r);
   $("best-line").disabled = !r.moves.length || r.wdl === 0;
@@ -408,11 +408,20 @@ function renderMoves(r) {
     if (!list.length) continue;
     const g = document.createElement("div");
     g.className = "move-group";
-    g.innerHTML = `<h2>${title}</h2>`;
+    g.innerHTML = `<h2>${title} · ${list.length}</h2>`;
     for (const m of list) g.append(moveRow(m));
     box.append(g);
   }
+  syncOverflow();
 }
+
+function syncOverflow() {
+  const box = $("moves");
+  const more = box.scrollHeight - box.scrollTop - box.clientHeight > 4;
+  box.classList.toggle("has-more", more);
+}
+$("moves").addEventListener("scroll", syncOverflow);
+addEventListener("resize", syncOverflow);
 
 function moveRow(m) {
   const b = document.createElement("button");
@@ -705,10 +714,13 @@ function drawCharts(solve) {
   // Sweep time: its own chart (one axis per chart), sharing the round axis.
   const times = solve.sweep_ms.map((v) => (v == null || v < 0 ? 0 : v));
   const H2 = 130;
-  const maxT = Math.max(...times, 1);
+  // Fit the domain to the data (rounded up to a 1/2/5 step), never a fixed floor.
+  const rawMax = Math.max(...times, 1e-6);
+  const mag = 10 ** Math.floor(Math.log10(rawMax));
+  const maxT = [1, 2, 5, 10].map((k) => k * mag).find((v) => v >= rawMax);
   const y2 = (v) => H2 - P.b - (v * (H2 - P.t - P.b)) / maxT;
   const svg2 = svgEl("svg", { viewBox: `0 0 ${W} ${H2}`, role: "img", "aria-label": "Sweep time per round" });
-  const fmtT = (ms) => (ms === 0 ? "0" : ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)} s` : `${ms.toFixed(ms < 10 ? 2 : 0)} ms`);
+  const fmtT = (ms) => (ms === 0 ? "0" : ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)} s` : ms >= 10 ? `${ms.toFixed(0)} ms` : `${Number(ms.toPrecision(2))} ms`);
   for (const f of [0, 0.5, 1]) {
     svg2.append(svgEl("line", { class: "grid", x1: P.l, x2: W - P.r, y1: y2(maxT * f), y2: y2(maxT * f) }));
     svg2.append(svgEl("text", { class: "axis-label", x: P.l - 8, y: y2(maxT * f) + 4, "text-anchor": "end" }, fmtT(maxT * f)));

@@ -419,9 +419,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         textual = kind.startswith(("text/", "application/json", "image/svg"))
         self.send_header("Content-Type", f"{kind}; charset=utf-8" if textual else kind)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header(
-            "Cache-Control", "no-store" if kind == "application/json" else "max-age=3600"
-        )
+        self.send_header("Cache-Control", "no-store" if kind == "application/json" else "no-cache")
         self.end_headers()
         self.wfile.write(body)
 

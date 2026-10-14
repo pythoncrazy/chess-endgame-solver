@@ -167,6 +167,8 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
 .mark { display: inline-block; width: 14px; height: 14px; vertical-align: -2px; margin-right: 4px; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
 
 .moves { overflow-y: auto; flex: 1; min-height: 120px; }
+/* Fade the last rows while more moves are hidden below. */
+.moves.has-more { mask-image: linear-gradient(to bottom, #000 calc(100% - 48px), transparent); }
 .move-group { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .move-group h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-muted); padding: 4px 18px; }
 .move {
@@ -236,7 +238,8 @@ table.data tbody tr { cursor: pointer; }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
 .card-list { display: grid; gap: 8px; }
 .report { background: var(--panel); border-radius: var(--radius); padding: 12px 14px; }
-.report-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.report-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.report-head > :last-child { color: var(--ink); }
 .report p { margin: 2px 0; color: var(--ink); }
 .report .src { color: var(--ink-muted); font-size: 12px; }
 .report.empty-report { color: var(--ink-muted); }
