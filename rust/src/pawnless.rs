@@ -703,6 +703,7 @@ impl Table {
             .map_err(|e| e.to_string())?;
         out.write_all(&json).map_err(|e| e.to_string())?;
         out.write_all(&payload).map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
         Ok(header)
     }
 
