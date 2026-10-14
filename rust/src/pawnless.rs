@@ -944,25 +944,54 @@ pub fn canonical_white_king(square: u8) -> bool {
     file <= 3 && rank <= file
 }
 
-/// Words whose valid/win/loss planes differ from their symmetric image.
-/// Pawnless positions without castling rights are invariant under all eight
-/// symmetries, so a correct table has none.
+/// Sort the squares of identical pieces, in skeleton order.
+fn sort_identical(material: &Material, squares: &mut [u8]) {
+    let skeleton = &material.skeleton;
+    for i in 1..skeleton.len() {
+        for j in i + 1..skeleton.len() {
+            if skeleton[i] == skeleton[j] && squares[j] < squares[i] {
+                squares.swap(i, j);
+            }
+        }
+    }
+}
+
+/// Words that differ from a symmetric image, or from the same position with
+/// identical pieces in a different order. The check compares the valid, win
+/// and loss planes, and the proof ranks of legal positions. Pawnless positions
+/// without castling rights are invariant under all eight symmetries, so a
+/// correct table has none.
 pub fn symmetry_violations(table: &Table, threads: usize) -> Result<u64> {
     let material = &table.material;
     let len = material.skeleton_len();
+    let ranked = !table.rank.is_empty();
     let violations = parallel_map(table.valid.len(), threads, |w| {
         let (black, squares) = material.decode(w);
-        let mut bad = 0u64;
-        for sym in Symmetry::all().skip(1) {
-            let image: Vec<u8> = squares[..len].iter().map(|&s| sym.square(s)).collect();
+        for sym in Symmetry::all() {
+            let mut image: Vec<u8> = squares[..len].iter().map(|&s| sym.square(s)).collect();
+            sort_identical(material, &mut image);
             let v = material.encode(black, &image);
+            if v == w {
+                continue;
+            }
             for plane in [&table.valid, &table.win, &table.loss] {
                 if sym.bitboard(plane[w]) != plane[v] {
-                    bad = 1;
+                    return Ok(1);
+                }
+            }
+            if ranked {
+                let mut legal = table.valid[w];
+                while legal != 0 {
+                    let bk = legal.trailing_zeros() as u8;
+                    legal &= legal - 1;
+                    let image = v * 64 + usize::from(sym.square(bk));
+                    if table.rank[w * 64 + usize::from(bk)] != table.rank[image] {
+                        return Ok(1);
+                    }
                 }
             }
         }
-        Ok(bad)
+        Ok(0u64)
     })?;
     Ok(violations.iter().sum())
 }

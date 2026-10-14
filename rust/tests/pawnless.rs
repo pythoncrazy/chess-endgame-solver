@@ -125,6 +125,37 @@ fn symmetries_agree_on_squares_and_bitboards() {
     assert!(symmetry_violations(&broken, 4).unwrap() > 0);
 }
 
+/// The symmetry check also compares proof ranks, and positions that differ
+/// only in the order of identical pieces.
+#[test]
+fn symmetry_check_covers_ranks_and_identical_pieces() {
+    use tablebase_core::pawnless::{Solved, Symmetry, solve_tree, symmetry_violations};
+    let m = Material::parse("KRRvK").unwrap();
+    let mut solved = Solved::new();
+    let mut cpu = |m: &Material, lower: &[Option<&Table>]| solve(m, lower, 8);
+    let t = (*solve_tree(&m, &mut solved, &mut cpu).unwrap()).clone();
+    assert_eq!(symmetry_violations(&t, 8).unwrap(), 0);
+    let (w, bk) = (0..t.valid.len())
+        .find_map(|w| {
+            let (_, squares) = m.decode(w);
+            let decisive = t.win[w] | t.loss[w];
+            (squares[1] > squares[2] && decisive != 0).then(|| (w, decisive.trailing_zeros() as u8))
+        })
+        .unwrap();
+    let mut one = t.clone();
+    one.rank[w * 64 + usize::from(bk)] += 1;
+    assert!(symmetry_violations(&one, 8).unwrap() > 0);
+    // The same change on all eight images keeps the rooks out of order.
+    let mut orbit = t.clone();
+    let (black, squares) = m.decode(w);
+    for sym in Symmetry::all() {
+        let image: Vec<u8> = squares[..3].iter().map(|&s| sym.square(s)).collect();
+        let v = m.encode(black, &image);
+        orbit.rank[v * 64 + usize::from(sym.square(bk))] = t.rank[w * 64 + usize::from(bk)] + 1;
+    }
+    assert!(symmetry_violations(&orbit, 8).unwrap() > 0);
+}
+
 #[test]
 fn format_v2_unranked_and_legacy_v1_files() {
     use sha2::{Digest, Sha256};
