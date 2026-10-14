@@ -830,12 +830,26 @@ impl Gpu {
             rank: if ranked { rank.to_host()? } else { Vec::new() },
             rounds,
         };
-        for w in 0..words {
-            let valid = !(wl[2 * w] & wl[2 * w + 1]);
-            table.valid[w] = valid;
-            table.win[w] = wl[2 * w] & valid;
-            table.loss[w] = wl[2 * w + 1] & valid;
-        }
+        // Records to planes, in parallel chunks.
+        let chunk = words.div_ceil(16).max(1);
+        std::thread::scope(|scope| {
+            let parts = table
+                .valid
+                .chunks_mut(chunk)
+                .zip(table.win.chunks_mut(chunk))
+                .zip(table.loss.chunks_mut(chunk))
+                .zip(wl.chunks(2 * chunk));
+            for (((valid, win), loss), rec) in parts {
+                scope.spawn(move || {
+                    for (i, pair) in rec.as_chunks::<2>().0.iter().enumerate() {
+                        let ok = !(pair[0] & pair[1]);
+                        valid[i] = ok;
+                        win[i] = pair[0] & ok;
+                        loss[i] = pair[1] & ok;
+                    }
+                });
+            }
+        });
         let record = json!({
             "mode": if ranked { "synchronous-ranked" } else { "in-place-wdl" },
             "words": words, "device_bytes_allocated": device_bytes,
@@ -863,10 +877,12 @@ fn main() -> Result<(), Error> {
     std::fs::create_dir_all(&output)?;
     // Compiled kernels persist across runs (keyed by source, generics, toolkit).
     jit_cache::enable(Arc::new(FileSystemJitStore::default_location()?));
+    let init = Instant::now();
     let device = cutile::cuda_core::Device::new(0)?;
     let gpu = Gpu {
         stream: device.new_stream()?,
     };
+    let device_init_seconds = init.elapsed().as_secs_f64();
     let mut records_out = Vec::new();
     let mut solve_one = |m: &Material, lower: &[Option<&Table>]| -> tablebase_core::Result<Table> {
         let ranked = m.skeleton_len() <= max_ranked;
@@ -875,10 +891,11 @@ fn main() -> Result<(), Error> {
         let path = output.join(format!("{}.gpu.tbp", m.name()));
         let file = File::create(&path).map_err(|e| e.to_string())?;
         let header = table.write(BufWriter::new(file), GENERATOR)?;
+        let counts = table.counts();
         records_out.push(json!({
             "material": m.name(), "rounds": table.rounds, "timing": timing,
             "write_seconds": t.elapsed().as_secs_f64(),
-            "counts_white_to_move": table.counts()[0], "counts_black_to_move": table.counts()[1],
+            "counts_white_to_move": counts[0], "counts_black_to_move": counts[1],
             "file": path, "payload_sha256": header.payload_sha256,
         }));
         Ok(table)
@@ -912,6 +929,7 @@ fn main() -> Result<(), Error> {
             "solver": "gpu-cutile", "generator": GENERATOR,
             "device": std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default(),
             "wall_seconds": wall.elapsed().as_secs_f64(),
+            "device_init_seconds": device_init_seconds,
             "resumed_verified_tables": resumed, "tables": records_out,
         })
     );
