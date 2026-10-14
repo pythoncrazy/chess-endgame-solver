@@ -99,3 +99,27 @@ fn missing_lower_table_is_an_error() {
     let m = Material::parse("KQvK").unwrap();
     assert!(solve(&m, &[None, None], 2).unwrap_err().contains("lower"));
 }
+
+#[test]
+fn symmetries_agree_on_squares_and_bitboards() {
+    use tablebase_core::pawnless::{Symmetry, canonical_white_king, symmetry_violations};
+    assert_eq!(Symmetry::all().count(), 8);
+    for sym in Symmetry::all() {
+        let mut image = 0u64;
+        for s in 0..64u8 {
+            assert_eq!(sym.bitboard(1 << s), 1 << sym.square(s));
+            image |= 1 << sym.square(s);
+        }
+        assert_eq!(image, u64::MAX, "{sym:?} is a permutation");
+    }
+    let triangle: Vec<u8> = (0..64).filter(|&s| canonical_white_king(s)).collect();
+    assert_eq!(triangle, [0, 1, 2, 3, 9, 10, 11, 18, 19, 27]);
+    for s in 0..64u8 {
+        assert!(Symmetry::all().any(|sym| canonical_white_king(sym.square(s))));
+    }
+    let t = solved_kqvk();
+    assert_eq!(symmetry_violations(&t, 4).unwrap(), 0);
+    let mut broken = t.clone();
+    broken.win[1_234] ^= 1 << 7;
+    assert!(symmetry_violations(&broken, 4).unwrap() > 0);
+}

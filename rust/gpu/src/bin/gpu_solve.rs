@@ -421,6 +421,37 @@ mod kernel {
             )
         };
     }
+
+    /// Record proof rank `round` for every bit that became a win or a loss.
+    #[cutile::entry()]
+    unsafe fn ranks(
+        rank: &mut Tensor<u16, { [64, 64] }>,
+        win_old: *const u64,
+        loss_old: *const u64,
+        win_new: *const u64,
+        loss_new: *const u64,
+        round: u16,
+    ) {
+        let w: Tile<i64, { [64] }> = word_index();
+        let zero_i: Tile<i64, { [64] }> = constant(0i64, shape![64]);
+        let all: Tile<bool, { [64] }> = eq_tile(zero_i, zero_i);
+        let wo: Tile<u64, { [64] }> = unsafe { gather(win_old, w, all) };
+        let lo: Tile<u64, { [64] }> = unsafe { gather(loss_old, w, all) };
+        let wn: Tile<u64, { [64] }> = unsafe { gather(win_new, w, all) };
+        let ln: Tile<u64, { [64] }> = unsafe { gather(loss_new, w, all) };
+        // Sets are monotone, so XOR yields exactly the new bits.
+        let fresh: Tile<u64, { [64] }> = (wn ^ wo) | (ln ^ lo);
+        let fresh: Tile<u64, { [64, 64] }> = fresh.reshape(shape![64, 1]).broadcast(shape![64, 64]);
+        let column: Tile<u64, { [64] }> = iota(shape![64]);
+        let column: Tile<u64, { [64, 64] }> =
+            column.reshape(shape![1, 64]).broadcast(shape![64, 64]);
+        let one: Tile<u64, { [64, 64] }> = constant(1u64, shape![64, 64]);
+        let zero: Tile<u64, { [64, 64] }> = constant(0u64, shape![64, 64]);
+        let set: Tile<bool, { [64, 64] }> = ne_tile((fresh >> column) & one, zero);
+        let value: Tile<u16, { [64, 64] }> = broadcast_scalar(round, shape![64, 64]);
+        let old: Tile<u16, { [64, 64] }> = rank.load();
+        rank.store(select(set, value, old));
+    }
 }
 
 fn meta_table(material: &Material, lower_offsets: &[[i64; 3]]) -> Vec<i64> {
@@ -474,11 +505,27 @@ impl Gpu {
         Ok(api::copy_host_vec_to_device(&Arc::new(data)).sync_on(&self.stream)?)
     }
 
-    /// Solve one material on the GPU; returns the table and phase timings.
+    /// Zeroed u64 plane. Tensor dimensions are i32, so large planes are 2-D
+    /// (`[words / 64, 64]`); kernels address them through raw pointers.
+    fn zeros(&self, words: usize) -> Result<Tensor<u64>, Error> {
+        let shape = if words.is_multiple_of(64) {
+            vec![words / 64, 64]
+        } else {
+            vec![words]
+        };
+        Ok(api::zeros::<u64>(&shape).sync_on(&self.stream)?)
+    }
+
+    /// Solve one material on the GPU; returns the table and phase records.
+    ///
+    /// `ranked`: synchronous double-buffered rounds with device proof ranks.
+    /// Otherwise WDL is updated in place (sound because the sets are monotone),
+    /// which needs three planes instead of six but yields no proof ranks.
     fn solve(
         &self,
         material: &Material,
         lower: &[Option<&Table>],
+        ranked: bool,
     ) -> Result<(Table, serde_json::Value), Error> {
         let start = Instant::now();
         let words = material.words();
@@ -495,47 +542,63 @@ impl Gpu {
                 return Err(format!("missing lower table for skeleton piece {k}").into());
             }
         }
+        let lower_bytes = lower_data.len() * 8;
         let meta = self.upload(meta_table(material, &offsets))?;
         let lower_dev = self.upload(lower_data)?;
-        let valid = api::zeros::<u64>(&[words]).sync_on(&self.stream)?;
-        let check = api::zeros::<u64>(&[words]).sync_on(&self.stream)?;
+        let valid = self.zeros(words)?;
         let win = [
-            api::zeros::<u64>(&[words]).sync_on(&self.stream)?,
-            api::zeros::<u64>(&[words]).sync_on(&self.stream)?,
+            self.zeros(words)?,
+            self.zeros(if ranked { words } else { 1 })?,
         ];
         let loss = [
-            api::zeros::<u64>(&[words]).sync_on(&self.stream)?,
-            api::zeros::<u64>(&[words]).sync_on(&self.stream)?,
+            self.zeros(words)?,
+            self.zeros(if ranked { words } else { 1 })?,
         ];
+        // Ranked mode keeps a separate check plane; in place, check bits live
+        // in the loss plane until the seed round replaces them by checkmates.
+        let check = if ranked {
+            Some(self.zeros(words)?)
+        } else {
+            None
+        };
+        let check_ptr = check.as_ref().unwrap_or(&loss[0]).device_pointer();
+        let mut rank = if ranked {
+            Some(api::full::<u16>(UNRESOLVED, &[words, 64]).sync_on(&self.stream)?)
+        } else {
+            None
+        };
+        let planes = if ranked { 6 } else { 3 };
+        let device_bytes = planes * words * 8 + lower_bytes + if ranked { words * 128 } else { 0 };
         let grid = ((words / BLOCK) as u32, 1, 1);
-        let prepared = start.elapsed().as_secs_f64();
+        let device = self.stream.device();
+        let (event_start, event_end) = (device.new_event()?, device.new_event()?);
+        let prepare_seconds = start.elapsed().as_secs_f64();
         let t0 = Instant::now();
-        // SAFETY: all pointers address live device tensors sized for this
-        // material; kernels index words < words and lower offsets in range.
+        // SAFETY: every pointer addresses a live device tensor sized for this
+        // material; kernels touch words < `words` and lower offsets in range.
         unsafe {
-            kernel::statics(
-                valid.device_pointer(),
-                check.device_pointer(),
-                meta.device_pointer(),
-                m,
-            )
-            .grid(grid)
-            .sync_on(&self.stream)?;
+            kernel::statics(valid.device_pointer(), check_ptr, meta.device_pointer(), m)
+                .grid(grid)
+                .sync_on(&self.stream)?;
         }
         let statics_seconds = t0.elapsed().as_secs_f64();
-        let host_valid = valid.dup().to_host_vec().sync_on(&self.stream)?;
-        let mut rank = vec![UNRESOLVED; words * 64];
-        let mut host_win = vec![0u64; words];
-        let mut host_loss = vec![0u64; words];
-        let t1 = Instant::now();
         let mut rounds = 0u32;
-        let mut round_seconds = Vec::new();
+        let mut records = Vec::new();
         for round in 0u32.. {
+            if round >= u32::from(UNRESOLVED) {
+                return Err("proof rank exceeds the 16-bit representation".into());
+            }
             let r0 = Instant::now();
-            let (src, dst) = ((round as usize + 1) % 2, round as usize % 2);
+            let (src, dst) = if ranked {
+                ((round as usize + 1) % 2, round as usize % 2)
+            } else {
+                (0, 0)
+            };
             let counter = api::zeros::<i64>(&[1]).sync_on(&self.stream)?;
             let mode = if round == 0 { "0" } else { "1" };
-            // SAFETY: as above; win/loss[src] are read and win/loss[dst] written.
+            event_start.record(&self.stream)?;
+            // SAFETY: as above. Ranked mode reads [src] and writes [dst]; in
+            // place both are [0], and monotone updates make races benign.
             unsafe {
                 kernel::sweep(
                     win[dst].device_pointer(),
@@ -544,7 +607,7 @@ impl Gpu {
                     win[src].device_pointer(),
                     loss[src].device_pointer(),
                     valid.device_pointer(),
-                    check.device_pointer(),
+                    check_ptr,
                     lower_dev.device_pointer(),
                     meta.device_pointer(),
                     m,
@@ -553,51 +616,71 @@ impl Gpu {
                 .grid(grid)
                 .sync_on(&self.stream)?;
             }
-            let changed = counter.dup().to_host_vec().sync_on(&self.stream)?[0];
-            let new_win = win[dst].dup().to_host_vec().sync_on(&self.stream)?;
-            let new_loss = loss[dst].dup().to_host_vec().sync_on(&self.stream)?;
-            for w in 0..words {
-                let fresh = (new_win[w] & !host_win[w]) | (new_loss[w] & !host_loss[w]);
-                let mut bits = fresh;
-                while bits != 0 {
-                    rank[w * 64 + bits.trailing_zeros() as usize] = round as u16;
-                    bits &= bits - 1;
+            event_end.record(&self.stream)?;
+            event_end.synchronize()?;
+            let sweep_event_ms = event_start.elapsed_time(&event_end)?;
+            if let Some(rank) = rank.as_mut() {
+                // SAFETY: the four planes hold `words` words each.
+                unsafe {
+                    kernel::ranks(
+                        rank.partition([64, 64]),
+                        win[src].device_pointer(),
+                        loss[src].device_pointer(),
+                        win[dst].device_pointer(),
+                        loss[dst].device_pointer(),
+                        round as u16,
+                    )
+                    .grid(grid)
+                    .sync_on(&self.stream)?;
                 }
             }
-            host_win = new_win;
-            host_loss = new_loss;
-            round_seconds.push(r0.elapsed().as_secs_f64());
+            let changed = counter.to_host_vec().sync_on(&self.stream)?[0];
+            records.push(json!({
+                "round": round, "changed_words": changed,
+                "host_seconds": r0.elapsed().as_secs_f64(), "sweep_event_ms": sweep_event_ms,
+            }));
             if round > 0 && changed == 0 {
                 break;
             }
-            if round > 0 {
-                rounds = round;
-            }
+            rounds = round;
         }
-        let solve_seconds = t1.elapsed().as_secs_f64();
+        let rounds_seconds = t0.elapsed().as_secs_f64() - statics_seconds;
+        let t2 = Instant::now();
+        let last = if ranked { rounds as usize % 2 } else { 0 };
         let table = Table {
             material: material.clone(),
-            valid: host_valid,
-            win: host_win,
-            loss: host_loss,
-            rank,
+            valid: valid.to_host_vec().sync_on(&self.stream)?,
+            win: win[last].dup().to_host_vec().sync_on(&self.stream)?,
+            loss: loss[last].dup().to_host_vec().sync_on(&self.stream)?,
+            rank: match rank {
+                Some(r) => r.to_host_vec().sync_on(&self.stream)?,
+                None => Vec::new(),
+            },
             rounds,
         };
-        let timing = json!({
-            "prepare_seconds": prepared,
+        let record = json!({
+            "mode": if ranked { "synchronous-ranked" } else { "in-place-wdl" },
+            "words": words, "device_bytes_allocated": device_bytes,
+            "prepare_seconds": prepare_seconds,
             "statics_seconds_including_jit": statics_seconds,
-            "rounds_seconds_including_jit_and_host_rank_copy": solve_seconds,
-            "round_seconds": round_seconds,
+            "rounds_seconds_total": rounds_seconds,
+            "download_seconds": t2.elapsed().as_secs_f64(),
+            "rounds": records,
         });
-        Ok((table, timing))
+        Ok((table, record))
     }
 }
 
 fn main() -> Result<(), Error> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: gpu_solve MATERIAL OUTPUT_DIRECTORY";
+    let usage = "usage: gpu_solve MATERIAL OUTPUT_DIRECTORY [MAX_RANKED_SKELETON]";
     let material = Material::parse(&args.next().ok_or(usage)?)?;
     let output = PathBuf::from(args.next().ok_or(usage)?);
+    // Proof ranks need 128 bytes per word: keep them up to five pieces.
+    let max_ranked: usize = match args.next() {
+        Some(v) => v.parse()?,
+        None => 4,
+    };
     std::fs::create_dir_all(&output)?;
     let device = cutile::cuda_core::Device::new(0)?;
     let gpu = Gpu {
@@ -605,7 +688,8 @@ fn main() -> Result<(), Error> {
     };
     let mut records = Vec::new();
     let mut solve_one = |m: &Material, lower: &[Option<&Table>]| -> tablebase_core::Result<Table> {
-        let (table, timing) = gpu.solve(m, lower).map_err(|e| e.to_string())?;
+        let ranked = m.skeleton_len() <= max_ranked;
+        let (table, timing) = gpu.solve(m, lower, ranked).map_err(|e| e.to_string())?;
         let path = output.join(format!("{}.gpu.tbp", m.name()));
         let file = File::create(&path).map_err(|e| e.to_string())?;
         let header = table.write(BufWriter::new(file))?;

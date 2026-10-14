@@ -282,7 +282,8 @@ pub struct Table {
     pub valid: Vec<u64>,
     pub win: Vec<u64>,
     pub loss: Vec<u64>,
-    /// Proof rank per position (`word * 64 + black king square`).
+    /// Proof rank per position (`word * 64 + black king square`); empty when
+    /// the table was solved in place without proof ranks.
     pub rank: Vec<u16>,
     /// Number of synchronous rounds after the checkmate seed.
     pub rounds: u32,
@@ -599,8 +600,10 @@ impl Table {
             words: self.valid.len(),
             rounds: self.rounds,
             planes: ["valid:u64", "win:u64", "loss:u64", "rank:u16"]
-                .map(String::from)
-                .to_vec(),
+                [..if self.rank.is_empty() { 3 } else { 4 }]
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
             payload_sha256: format!("{:x}", Sha256::digest(payload)),
         }
     }
@@ -639,7 +642,12 @@ impl Table {
         }
         let mut payload = Vec::new();
         input.read_to_end(&mut payload).map_err(|e| e.to_string())?;
-        if payload.len() != header.words * (24 + 128) {
+        let ranked = match header.planes.len() {
+            3 => false,
+            4 => true,
+            _ => return Err("table header lists an unsupported plane set".into()),
+        };
+        if payload.len() != header.words * (24 + if ranked { 128 } else { 0 }) {
             return Err("table payload has the wrong length".into());
         }
         if format!("{:x}", Sha256::digest(&payload)) != header.payload_sha256 {
@@ -733,4 +741,86 @@ impl Table {
             Some(0)
         }
     }
+}
+
+/// One of the eight board symmetries: optional transpose (a1-h8 diagonal),
+/// then optional file mirror, then optional rank mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Symmetry {
+    pub transpose: bool,
+    pub mirror_files: bool,
+    pub mirror_ranks: bool,
+}
+
+impl Symmetry {
+    pub fn all() -> impl Iterator<Item = Symmetry> {
+        (0..8u8).map(|b| Symmetry {
+            transpose: b & 1 != 0,
+            mirror_files: b & 2 != 0,
+            mirror_ranks: b & 4 != 0,
+        })
+    }
+
+    pub fn square(self, mut s: u8) -> u8 {
+        if self.transpose {
+            s = ((s & 7) << 3) | (s >> 3);
+        }
+        if self.mirror_files {
+            s ^= 7;
+        }
+        if self.mirror_ranks {
+            s ^= 56;
+        }
+        s
+    }
+
+    pub fn bitboard(self, mut x: u64) -> u64 {
+        if self.transpose {
+            let t = 0x0f0f_0f0f_0000_0000 & (x ^ (x << 28));
+            x ^= t ^ (t >> 28);
+            let t = 0x3333_0000_3333_0000 & (x ^ (x << 14));
+            x ^= t ^ (t >> 14);
+            let t = 0x5500_5500_5500_5500 & (x ^ (x << 7));
+            x ^= t ^ (t >> 7);
+        }
+        if self.mirror_files {
+            x = ((x >> 1) & 0x5555_5555_5555_5555) | ((x & 0x5555_5555_5555_5555) << 1);
+            x = ((x >> 2) & 0x3333_3333_3333_3333) | ((x & 0x3333_3333_3333_3333) << 2);
+            x = ((x >> 4) & 0x0f0f_0f0f_0f0f_0f0f) | ((x & 0x0f0f_0f0f_0f0f_0f0f) << 4);
+        }
+        if self.mirror_ranks {
+            x = x.swap_bytes();
+        }
+        x
+    }
+}
+
+/// White-king squares of the a1-d1-d4 triangle; every position has a
+/// symmetric image with the white king there.
+pub fn canonical_white_king(square: u8) -> bool {
+    let (file, rank) = (square % 8, square / 8);
+    file <= 3 && rank <= file
+}
+
+/// Words whose valid/win/loss planes differ from their symmetric image.
+/// Pawnless positions without castling rights are invariant under all eight
+/// symmetries, so a correct table has none.
+pub fn symmetry_violations(table: &Table, threads: usize) -> Result<u64> {
+    let material = &table.material;
+    let len = material.skeleton_len();
+    let violations = parallel_map(table.valid.len(), threads, |w| {
+        let (black, squares) = material.decode(w);
+        let mut bad = 0u64;
+        for sym in Symmetry::all().skip(1) {
+            let image: Vec<u8> = squares[..len].iter().map(|&s| sym.square(s)).collect();
+            let v = material.encode(black, &image);
+            for plane in [&table.valid, &table.win, &table.loss] {
+                if sym.bitboard(plane[w]) != plane[v] {
+                    bad = 1;
+                }
+            }
+        }
+        Ok(bad)
+    })?;
+    Ok(violations.iter().sum())
 }

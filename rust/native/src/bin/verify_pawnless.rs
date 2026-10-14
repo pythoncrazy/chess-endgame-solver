@@ -20,9 +20,13 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
-use tablebase_core::pawnless::{self, Material, Table};
+use tablebase_core::pawnless::{self, Material, Table, canonical_white_king};
 
 type Tables = BTreeMap<String, Table>;
+
+fn white_king(material: &Material, word: usize) -> u8 {
+    material.decode(word).1[0]
+}
 
 fn role(role: pawnless::Role) -> Role {
     match role {
@@ -126,7 +130,8 @@ fn child_value(
     let value = table
         .wdl(word, bk)
         .ok_or("legal child is invalid in table")?;
-    Ok((value, same.then(|| table.rank[word * 64 + usize::from(bk)])))
+    let rank = table.rank.get(word * 64 + usize::from(bk)).copied();
+    Ok((value, if same { rank } else { None }))
 }
 
 fn check_position(
@@ -157,6 +162,10 @@ fn check_position(
         tally.syzygy_compared.fetch_add(1, Ordering::Relaxed);
     } else if value != 0 {
         return Err("bare kings must be a draw".into());
+    }
+    if table.rank.is_empty() {
+        // Solved in place: no proof ranks to check; legality and WDL only.
+        return Ok(());
     }
     let rank = table.rank[word * 64 + usize::from(bk)];
     let moves = pos.legal_moves();
@@ -192,13 +201,17 @@ fn check_position(
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: verify_pawnless SYZYGY_DIRECTORY THREADS TABLE_FILE...";
+    let usage = "usage: verify_pawnless SYZYGY_DIRECTORY THREADS [--canonical] TABLE_FILE...";
     let syzygy_dir = args.next().ok_or(usage)?;
     let threads: usize = args
         .next()
         .ok_or(usage)?
         .parse()
         .map_err(|e| format!("threads: {e}"))?;
+    let mut args = args.peekable();
+    // Canonical: check positions with the white king in the a1-d1-d4 triangle,
+    // and check that each table is invariant under the eight symmetries.
+    let canonical = args.next_if(|a| a == "--canonical").is_some();
     let mut tables = Tables::new();
     let mut digests = BTreeMap::new();
     for path in args {
@@ -227,6 +240,9 @@ fn main() -> Result<(), String> {
                     (&tables, &syzygy, &tally, &first_failure);
                 scope.spawn(move || {
                     for word in part * chunk..((part + 1) * chunk).min(words) {
+                        if canonical && !canonical_white_king(white_king(&table.material, word)) {
+                            continue;
+                        }
                         for bk in 0..64u8 {
                             tally.positions.fetch_add(1, Ordering::Relaxed);
                             if let Err(e) = check_position(tables, syzygy, table, word, bk, tally) {
@@ -248,7 +264,10 @@ fn main() -> Result<(), String> {
                 });
             }
         });
-        let failures = tally.failures.load(Ordering::Relaxed);
+        let symmetry = canonical
+            .then(|| pawnless::symmetry_violations(table, threads))
+            .transpose()?;
+        let failures = tally.failures.load(Ordering::Relaxed) + symmetry.unwrap_or(0);
         report.push(serde_json::json!({
             "material": table.material.name(),
             "payload_sha256": digests[&table.material.name()],
@@ -256,6 +275,9 @@ fn main() -> Result<(), String> {
             "legal_positions": tally.legal.load(Ordering::Relaxed),
             "syzygy_wdl_compared": tally.syzygy_compared.load(Ordering::Relaxed),
             "proof_obligations_checked": tally.proof_checked.load(Ordering::Relaxed),
+            "scope": if canonical { "canonical-white-king-triangle-plus-symmetry" } else { "all" },
+            "symmetry_violating_words": symmetry,
+            "proof_ranks_present": !table.rank.is_empty(),
             "failures": failures,
             "first_failure": first_failure.into_inner().expect("mutex"),
             "seconds": start.elapsed().as_secs_f64(),
