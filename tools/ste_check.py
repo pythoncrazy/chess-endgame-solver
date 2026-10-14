@@ -125,7 +125,7 @@ CODE_SPAN = re.compile(r"`[^`]*`")
 URL = re.compile(r"https?://\S+|\b[\w.-]+\.(?:rs|py|md|json|toml|sh|js|html|css|tbz|tbp)\b")
 # Identifiers, paths, numbers with units and formulas are not prose words.
 NOT_WORD = re.compile(r"[_/\\=<>{}\[\]()|^*+~#$@0-9]|::|[a-z][A-Z]|^[A-Z]{2,}s?$")
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`\"(])")
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Za-z0-9`\"(])")
 SUFFIXES = {
     ".md": "markdown",
     ".txt": "text",
