@@ -1,4 +1,4 @@
-//! Exact quiet-move fibers. Other pieces stay fixed; captures use a separate path.
+//! Exact quiet-move fibers. Other pieces stay fixed. Captures use a separate path.
 use crate::Result;
 use serde::{Deserialize, Serialize};
 
@@ -91,8 +91,8 @@ pub fn stencil(
         legal: reach(destination_safe) & source_valid,
     })
 }
-/// INT8 RHS values 1/10/91 encode legal, nonwinning and losing child counts.
-/// Knight degree <=8, so base-9 digits cannot carry. No FP rounding is involved.
+/// INT8 RHS values 1/10/91 encode three child counts: legal, not a win, and loss.
+/// Knight degree <=8, so base-9 digits cannot carry. The result has no FP round-off.
 pub fn encoded_knight(
     w: u64,
     l: u64,
@@ -128,7 +128,7 @@ pub fn encoded_knight(
     Ok(result)
 }
 
-/// Division-free 0/16/17 encoding. Move existence is a separate static mask.
+/// Division-free 0/16/17 code. Move existence is a separate static mask.
 pub fn encoded_knight16(
     w: u64,
     l: u64,
@@ -162,8 +162,8 @@ pub fn encoded_knight16(
     Ok(result)
 }
 
-/// FP8 E4M3-compatible 0/8/9 inputs. Eight losses carry into the high digit;
-/// that case is uniquely z=72, because no knight has nine destinations.
+/// FP8 E4M3-compatible 0/8/9 inputs. Eight losses carry into the high digit.
+/// Only that case gives z=72, because no knight has nine destinations.
 pub fn encoded_knight8(
     w: u64,
     l: u64,

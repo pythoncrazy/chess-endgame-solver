@@ -1,12 +1,14 @@
-Rust is the production implementation target. The Python implementations remain
-independent correctness oracles and the current archive publisher/FEN adapter.
+Rust is the target for the production implementation. The Python implementations
+stay as independent correctness oracles. Python is now also the archive
+publisher and the FEN adapter.
 
-The implemented Rust portion is an exact page encoder, a native position-ID
-prober, authenticated range-readable indexes, global cache budgets, stable
-physical range tiles, concurrent single-flight, and finite-graph WDL oracles.
-This is a tested foundation, not a complete eight-piece generator or Rust FEN
-prober. The Rust CLI accepts archive IDs; its Python counterpart ranks FENs and
-resolves captures/promotions against the published Syzygy semantics.
+The Rust part that exists now has an exact page encoder and a native
+position-ID prober. It also has authenticated range-readable indexes, global
+cache budgets and stable physical range tiles. It also has concurrent
+single-flight and finite-graph WDL oracles. This is a tested foundation, not a
+complete eight-piece generator or Rust FEN prober. The Rust CLI accepts archive
+IDs. Its Python counterpart ranks FENs. It also resolves captures and promotions
+against the published Syzygy semantics.
 
 From this directory:
 
@@ -18,58 +20,65 @@ cargo run --locked --release --bin tb_bench -- ../pawn_examples/KPvKP fixtures/c
 printf '[0,-2,1,9223372036854775807]' | cargo run --locked --release --bin tb_encode -- example.tbc
 ```
 
-`Cargo.lock` pins CPU dependencies. Tested with Rust 1.99.0 on Linux; the declared
-1.89 minimum has not separately been tested. Own CPU Rust code forbids unsafe.
-The compression crates use native codec libraries internally.
+`Cargo.lock` pins the CPU dependencies. The tests used Rust 1.99.0 on Linux. No
+separate test used the declared minimum, 1.89. The CPU Rust code of this project
+forbids unsafe code. The compression crates use native codec libraries
+internally.
 
-`../validate_rust.py` runs formatting, Clippy, release tests and benchmarks, then
-feeds Rust-encoded pages to the independent Python decoder. The bundled fixtures
-are sufficient for Cargo tests; Python is not required just to run those tests.
-`../export_rust_fixtures.py` documents how those independent fixtures were made.
+`../validate_rust.py` runs the format check, Clippy, the release tests and the
+benchmarks. Then it sends Rust-encoded pages to the independent Python decoder.
+The bundled fixtures are enough for the Cargo tests. Python is not necessary to
+run those tests. `../export_rust_fixtures.py` is the script that made those
+independent fixtures.
 
-Cache budgets charge retained bodies, keys and a conservative entry allowance.
-They are not process RSS limits: caller output, grouping, decompressor buffers,
-allocator overhead and values borrowed by concurrent queries are additional.
-Limit admitted request/batch concurrency in a service. Reader windows default
-to 64 MiB of worst-case decoded cells plus one page. Individual origin requests
-are capped at 1 MiB; frame count, encoded bytes and codec windows are bounded.
-Catalog metadata is limited to 1,048,576 pages per object. A future complete
-collection needs a hierarchical material/object catalog, rather than a single
-in-memory vector of every object.
+Cache budgets count the kept bodies, the keys and a conservative fixed size for
+each entry. They do not limit the process RSS. The budget excludes
+caller output, query groups, decompressor buffers, allocator overhead
+and values that concurrent queries borrow. In a service, limit the number of
+concurrent requests and batches. The default reader window is 64 MiB of
+worst-case decoded cells plus one page. Each origin request has a maximum of 1
+MiB. The frame count, the encoded bytes and the codec windows also have limits.
+Catalog metadata has a limit of 1,048,576 pages for each object. A complete
+collection in the future must have a hierarchical catalog of materials and
+objects. A single in-memory vector of all objects is not enough.
 
-The supplied trusted catalog authenticates directories, index chunks and v3
-encoded frames. Selective reads rely on a writer that verifies full pages before
-publication. Authentication proves correspondence to that catalog; it does not
-prove the publisher solved chess correctly. Legacy v2 frames undergo full decoded
-checksums. Predictive modes 4/5 require an explicit predictor in the page API;
-archive Reader rejects their missing predictor instead of guessing a result.
+The trusted catalog that the caller gives authenticates directories, index
+chunks and v3 encoded frames. Selective reads rely on a writer that verifies
+full pages before publication. Authentication proves that the data agrees with
+that catalog. It does not prove that the publisher solved chess correctly.
+Legacy v2 frames get a full checksum of the decoded data. Predictive modes 4
+and 5 must have an explicit predictor in the page API. If the predictor is
+absent, the archive Reader rejects the frame and does not guess a result.
 
-GPU development uses the **current NVIDIA/cuda-rust project**, whose Tile crate
-is named `cutile`. `gpu/Cargo.toml` pins revision
-`bc46b1ffb751885073066b087594045f07f0f81b`. The independent GPU workspace avoids
-building CUDA dependencies for CPU storage tests. Its source uses the inspected
-API and has been formatted, but GPU host/JIT compilation is **unverified**:
-the attempted build stopped in cuda-bindings because this environment has no
-CUDA toolkit. The GPU lockfile records the resolved dependency graph.
+GPU development uses the **current NVIDIA/cuda-rust project**. Its Tile crate
+has the name `cutile`. `gpu/Cargo.toml` pins revision
+`bc46b1ffb751885073066b087594045f07f0f81b`. The GPU workspace is independent,
+so the CPU storage tests do not build CUDA dependencies. Its source uses the
+inspected API and has the standard format. But GPU host/JIT compilation is
+**unverified**. A trial build stopped in cuda-bindings, because this
+environment has no CUDA toolkit. The GPU lockfile records the resolved
+dependency graph.
 
-On the H100 machine, install a compatible driver and CUDA toolkit with Hopper
-Tile IR support (13.3 minimum Tile IR in this pinned upstream), then:
+On the H100 machine, install a compatible driver and a CUDA toolkit with Hopper
+Tile IR support. This pinned upstream must have Tile IR 13.3 or later. Then run:
 
 ```sh
 CUDA_TOOLKIT_PATH=/usr/local/cuda-13.3 cargo run --locked --release --manifest-path gpu/Cargo.toml
 ```
 
 This benchmark validates one million synthetic rows against the CPU predicate
-before timing. Inputs are already-built 64-child masks. It excludes move
-generation, rank computation, dependency traffic, compression and distances.
-Timing includes host launch/sync overhead. Nominal traffic is 32 bytes/row;
-cache reuse means it is not an HBM bandwidth measurement. More than 64 children
-require blockwise OR of the win predicate and AND of the all-winning predicate.
-Unknown/cyclic positions must remain unresolved until the global exact fixpoint.
+before it measures time. Inputs are already-built 64-child masks. It excludes
+move generation, rank computation, dependency traffic, compression and
+distances. The measured time includes the host launch and sync overhead. Nominal
+traffic is 32 bytes for each row. Because of cache reuse, the result is not a
+measurement of HBM bandwidth. Over 64 children, use a blockwise OR of the win
+predicate and a blockwise AND of the all-win predicate. Unknown and
+cyclic positions must stay unresolved until the global exact fixpoint.
 
 Use Tile for dense, regular operators and benchmark SIMT for irregular move
-generation/frontier traffic. Both NVIDIA models share a runtime; using Rust or
-cuTile alone does not establish which kernel is faster. Keep GPU queues/counters
-and archive IDs integer. FP16 inputs/FP32 tensor reductions are permissible only
-for bounded, exactly representable arithmetic, with a scalar/bitset oracle and
-measured useful occupancy. No one-hour full-eight result is claimed.
+generation/frontier traffic. Both NVIDIA models share a runtime. The choice of
+Rust or cuTile alone does not show which kernel is faster. Keep GPU
+queues/counters and archive IDs integer. Use FP16 inputs or FP32 tensor
+reductions only for bounded arithmetic that they represent exactly. Then also
+use a scalar or bitset oracle, and measure the useful occupancy. This project
+does not claim a one-hour result for the full eight-piece set.

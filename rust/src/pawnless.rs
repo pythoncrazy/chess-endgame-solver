@@ -2,16 +2,16 @@
 //!
 //! Layout: the skeleton holds every piece except the black king, and
 //! `skeleton[0]` is the white king. A word fixes the side to move and every
-//! skeleton square; its 64 bits are the black-king square. Kings are never
-//! captured, so a capture dependency reads either an aligned word of a lower
-//! material (a skeleton piece was captured) or a single bit of one (the black
-//! king captured a white piece).
+//! skeleton square. Its 64 bits are the black-king square. No move captures a
+//! king. Thus a capture dependency reads an aligned word of a lower material
+//! when a skeleton piece was captured. It reads a single bit of one when the
+//! black king captured a white piece.
 //!
-//! Rounds are synchronous: round `r` reads the sets of round `r - 1` only. A
-//! position committed in round `r` has proof rank `r`: a win has a legal child
-//! loss of rank `r - 1` (or a capture into a lower-material loss), and every
-//! legal child of a loss is a win of smaller rank (or a lower-material win).
-//! Checkmates have rank 0. Lower-material children count as rank 0, so ranks
+//! Rounds are synchronous: round `r` reads only the sets of round `r - 1`. A
+//! position committed in round `r` has proof rank `r`. A win has a legal child
+//! loss of rank `r - 1`, or a capture into a lower-material loss. Every legal
+//! child of a loss is a win of smaller rank, or a lower-material win.
+//! Checkmates have rank 0. Lower-material children count as rank 0. Thus ranks
 //! equal distance to mate only for materials without capture dependencies.
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -19,15 +19,16 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::thread;
 
-/// At most five skeleton pieces: six-piece materials including both kings.
+/// At most five skeleton pieces: six-piece materials, with both kings in the count.
 pub const MAX_SKELETON: usize = 5;
 /// Rank of a position that is not (yet) a proven win or loss.
 pub const UNRESOLVED: u16 = u16::MAX;
 /// Version 2 stores one record per word: `[win | illegal, loss | illegal]` as
-/// little-endian u64 (both bits set means illegal), followed in ranked tables by
-/// the word's 64 u16 proof ranks. One contiguous read decides any position.
+/// little-endian u64. If both bits are set, the position is illegal. In ranked
+/// tables, the 64 u16 proof ranks of the word follow. One contiguous read
+/// decides any position.
 const FILE_MAGIC: &[u8; 8] = b"TBPAWNL2";
-/// Version 1 (three separate planes, then ranks); read-only.
+/// Version 1 (three separate planes, then ranks). Read-only.
 const FILE_MAGIC_V1: &[u8; 8] = b"TBPAWNL1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -82,7 +83,7 @@ impl Role {
             _ => return None,
         })
     }
-    /// Movement vectors and whether the piece slides along them.
+    /// Movement vectors, and a flag that shows if the piece slides along them.
     pub fn movement(self) -> (&'static [(i8, i8)], bool) {
         match self {
             Role::King => (&ALL_DIRECTIONS, false),
@@ -107,7 +108,7 @@ pub struct Material {
 }
 
 impl Material {
-    /// Parse a name such as `KQvKR`. Both sides start with a king; pieces keep
+    /// Parse a name such as `KQvKR`. Both sides start with a king. Pieces keep
     /// their written order (white non-kings, then black non-kings).
     pub fn parse(name: &str) -> Result<Material> {
         let (white, black) = name
@@ -247,7 +248,7 @@ impl Geometry {
         self.between[usize::from(from) * 64 + usize::from(to)]
     }
 
-    /// Attacked squares, including the first occupied square on each ray.
+    /// Attacked squares, with the first occupied square on each ray.
     pub fn attacks(&self, role: Role, square: u8, occupied: u64) -> u64 {
         match role {
             Role::King => self.king[usize::from(square)],
@@ -287,7 +288,7 @@ pub struct Table {
     pub valid: Vec<u64>,
     pub win: Vec<u64>,
     pub loss: Vec<u64>,
-    /// Proof rank per position (`word * 64 + black king square`); empty when
+    /// Proof rank per position (`word * 64 + black king square`). Empty when
     /// the table was solved in place without proof ranks.
     pub rank: Vec<u16>,
     /// Number of synchronous rounds after the checkmate seed.
@@ -347,13 +348,13 @@ pub fn statics(geometry: &Geometry, material: &Material, word: usize) -> Statics
     let white_king = squares[0];
     let base = !occupied & !geometry.king(white_king);
     let mut white_attacks = 0u64;
-    // Black-king squares that leave the white king unattacked by black pieces.
+    // Black-king squares where no black piece attacks the white king.
     let mut white_king_safe = u64::MAX;
     for (piece, &square) in material.skeleton.iter().zip(&squares) {
         if piece.white {
             white_attacks |= geometry.attacks(piece.role, square, occupied);
         } else if geometry.attacks(piece.role, square, occupied) >> white_king & 1 != 0 {
-            // Only the black king can block, and only by standing between.
+            // Only the black king can block, and only on a square between the two pieces.
             white_king_safe &= geometry.between(square, white_king);
         }
     }
@@ -372,7 +373,7 @@ pub fn statics(geometry: &Geometry, material: &Material, word: usize) -> Statics
     }
 }
 
-/// Planes read by a sweep: the material's own sets and its lower tables.
+/// Planes that a sweep reads: the sets of the material and its lower tables.
 pub struct Planes<'a> {
     pub material: &'a Material,
     pub valid: &'a [u64],
@@ -398,8 +399,8 @@ pub fn moves(geometry: &Geometry, planes: &Planes, word: usize) -> Result<Moves>
         while targets != 0 {
             let to = targets.trailing_zeros() as u8;
             targets &= targets - 1;
-            // White: own king. Black: only possible from an illegal parent,
-            // because a valid parent has the black king blocking that ray.
+            // White: own king. Black: possible only from an illegal parent.
+            // In a valid parent, the black king blocks that ray.
             if to == squares[0] {
                 continue;
             }
@@ -407,7 +408,7 @@ pub fn moves(geometry: &Geometry, planes: &Planes, word: usize) -> Result<Moves>
             if captured.is_some_and(|k| material.skeleton[k].white == piece.white) {
                 continue;
             }
-            // The black king on the path blocks; on the target it is illegal.
+            // The black king on the path blocks the move. On the target, it is illegal.
             let mask = !geometry.between(from, to) & !(1u64 << to);
             let mut child = squares;
             child[index] = to;
@@ -586,9 +587,9 @@ pub struct FileHeader {
     /// the same generator.
     #[serde(default)]
     pub generator: String,
-    /// How `payload_sha256` is computed: empty for SHA-256 of the payload,
-    /// `sha256-tree-16MiB` for SHA-256 over the SHA-256 digests of 16 MiB
-    /// chunks followed by the payload length (parallel to compute and check).
+    /// The method for `payload_sha256`. Empty means SHA-256 of the payload.
+    /// `sha256-tree-16MiB` means SHA-256 over the SHA-256 digests of 16 MiB
+    /// chunks, then the payload length. The tree scheme is parallel to compute and check.
     #[serde(default)]
     pub digest_scheme: String,
 }
@@ -705,8 +706,8 @@ impl Table {
         Ok(header)
     }
 
-    /// Read and authenticate a table file (version 2, or legacy version 1);
-    /// corrupt or truncated data fails.
+    /// Read and authenticate a table file (version 2, or legacy version 1).
+    /// Corrupt or truncated data causes an error.
     pub fn read(mut input: impl Read) -> Result<(Table, FileHeader)> {
         let mut magic = [0u8; 8];
         input.read_exact(&mut magic).map_err(|e| e.to_string())?;
@@ -913,8 +914,8 @@ impl Symmetry {
         x
     }
 
-    /// Map a bitboard from the image domain back to the source domain:
-    /// bit `bk` of the result equals bit `self.square(bk)` of `y`.
+    /// Map a bitboard from the image domain back to the source domain.
+    /// Bit `bk` of the result equals bit `self.square(bk)` of `y`.
     pub fn inverse_bitboard(self, mut y: u64) -> u64 {
         if self.mirror_ranks {
             y = y.swap_bytes();
@@ -936,7 +937,7 @@ impl Symmetry {
     }
 }
 
-/// White-king squares of the a1-d1-d4 triangle; every position has a
+/// White-king squares of the a1-d1-d4 triangle. Every position has a
 /// symmetric image with the white king there.
 pub fn canonical_white_king(square: u8) -> bool {
     let (file, rank) = (square % 8, square / 8);

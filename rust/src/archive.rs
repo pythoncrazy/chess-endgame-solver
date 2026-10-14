@@ -160,7 +160,7 @@ impl Manifest {
 }
 pub trait RangeStore: Send + Sync {
     fn read(&self, key: &str, offset: u64, length: usize) -> Result<Vec<u8>>;
-    /// Planner-requested contiguous read; implementations may preserve it as one GET.
+    /// Contiguous read that the planner requests. Implementations can keep it as one GET.
     fn read_coalesced(&self, key: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         self.read(key, offset, length)
     }
@@ -219,8 +219,8 @@ impl Cached {
         }
     }
 }
-/// Global budget across materials. Charges payload, key, and 128 bytes per entry.
-/// Allocator overhead and temporary clones/in-flight buffers are additional.
+/// Global budget across materials. It charges payload, key, and 128 bytes per entry.
+/// Allocator overhead and temporary clones/in-flight buffers are not in the budget.
 pub struct SharedCache {
     budget: usize,
     used: usize,
@@ -410,8 +410,8 @@ impl Reader {
         }
         Ok(record)
     }
-    /// Sort/deduplicate pages. Process bounded windows, coalescing nearby payloads.
-    /// The caller-owned output scales with batch size; no full archive is loaded.
+    /// Sort pages and remove duplicates. Process bounded windows and merge nearby payloads.
+    /// The caller-owned output scales with batch size. No full archive goes into memory.
     pub fn probe_many(&self, positions: &[u64]) -> Result<Vec<i64>> {
         if positions.iter().any(|&p| p >= self.manifest.positions) {
             return Err("position out of range".into());

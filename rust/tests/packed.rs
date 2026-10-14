@@ -17,8 +17,8 @@ fn pack(table: &Table, path: &std::path::Path, options: WriteOptions) -> PackedT
     opened
 }
 
-/// Stored positions are exactly one per symmetry class: the eight images of
-/// any position (with identical pieces in any order) share one stored index.
+/// There is exactly one stored position for each symmetry class. The eight images
+/// of any position share one stored index, with identical pieces in any order.
 #[test]
 fn stored_index_is_symmetric_and_onto() {
     for name in ["KQvK", "KNNvK", "KRvKB"] {
@@ -108,7 +108,7 @@ fn packed_roundtrip_probe_and_identical_pieces() {
             }
         }
     }
-    // Corruption is rejected when authenticating.
+    // Authentication rejects corruption.
     let path = dir.join("KQvK.tbz");
     let mut bytes = std::fs::read(&path).unwrap();
     let last = bytes.len() - 1;

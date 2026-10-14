@@ -1,4 +1,4 @@
-//! Resident exact bitmask propagation microbenchmark; not a chess generator.
+//! Microbenchmark of resident exact bitmask propagation. It is not a chess generator.
 use cutile::prelude::*;
 use std::{sync::Arc, time::Instant};
 
@@ -76,7 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let winning = api::copy_host_vec_to_device(&Arc::new(winning)).sync()?;
     let legal = api::copy_host_vec_to_device(&Arc::new(legal)).sync()?;
     let mut output = api::zeros::<i32>(&[n]).sync()?;
-    // First launch includes JIT; validation precedes timing. Reuse all allocations.
+    // The first launch includes JIT. Validation comes before the timed runs.
+    // Reuse all allocations.
     kernels::propagate(
         (&mut output).partition([256]),
         &state,

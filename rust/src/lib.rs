@@ -1,4 +1,4 @@
-//! Exact CPU reference and range-readable archive core. GPU kernels live separately.
+//! Exact CPU reference and range-readable archive core. GPU kernels are in a separate crate.
 pub mod archive;
 pub mod cm;
 pub mod codec;

@@ -1,6 +1,6 @@
-//! Feature probe for the pinned cuTile JIT: loop-carried tiles, scalar loads
-//! from a device table, runtime scalar branches and loop bounds, i64 lane
-//! arithmetic, and [64, 2] pair gathers.
+//! Feature probe for the pinned cuTile JIT. It tests loop-carried tiles, scalar
+//! loads from a device table and runtime scalar branches. It also tests runtime
+//! loop bounds, i64 lane arithmetic, and [64, 2] pair gathers.
 use cutile::prelude::*;
 use std::sync::Arc;
 
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pairs_dev = api::copy_host_vec_to_device(&Arc::new(pairs.clone())).sync_on(&stream)?;
     let table_dev = api::copy_host_vec_to_device(&Arc::new(table.clone())).sync_on(&stream)?;
     let out = api::zeros::<u64>(&[words]).sync_on(&stream)?;
-    // SAFETY: pairs hold 2 * words values, out holds words, the table 5 entries.
+    // SAFETY: pairs hold 2 * words values, out holds words, and the table holds 5 entries.
     unsafe {
         kernel::probe(
             out.device_pointer(),

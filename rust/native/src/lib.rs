@@ -1,4 +1,4 @@
-//! Native Syzygy compression, exact FEN probing and authenticated physical ranges.
+//! Native Syzygy compression, exact FEN probes and authenticated physical ranges.
 pub mod transport;
 use lru::LruCache;
 use serde::Deserialize;
@@ -290,8 +290,8 @@ impl NativeFilesystem {
         }
         Ok(())
     }
-    /// Exact retrying batch probe. Failed reads become misses only if this
-    /// thread's recorder contains a concrete tile; other probe errors propagate.
+    /// Exact batch probe with retries. A failed read becomes a miss only if the
+    /// recorder of this thread contains a concrete tile. Other probe errors propagate.
     /// Tiny caches fall back to exact scalar reads after bounded dependency waves.
     pub fn probe_many(
         &self,
