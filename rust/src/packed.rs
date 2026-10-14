@@ -719,12 +719,9 @@ impl cm::Blocks for CmRank<'_> {
 }
 
 /// Make sure that the solver and `statics` agree on the legal stored positions.
-fn check_cm_words(
-    layout: &Layout,
-    geometry: &Geometry,
-    c: &Canonical,
-    threads: usize,
-) -> Result<()> {
+/// The cm model uses this. Also make sure that each decisive stored position
+/// has a rank. A reader of each codec uses this.
+fn check_words(layout: &Layout, geometry: &Geometry, c: &Canonical, threads: usize) -> Result<()> {
     let parts = c.records.len().div_ceil(1 << 14);
     parallel(parts, threads, |part| {
         let range = part << 14..((part + 1) << 14).min(c.records.len());
@@ -780,9 +777,7 @@ pub fn write(
     let mut infos = Vec::new();
     let mut content = Sha256::new();
     let geometry = Geometry::new();
-    if sections.iter().any(|s| s.2 == Codec::Cm) {
-        check_cm_words(&layout, &geometry, c, threads)?;
-    }
+    check_words(&layout, &geometry, c, threads)?;
     for (name, raw_bytes, codec) in sections {
         let raw_block = |b| {
             if name == "wdl" {
