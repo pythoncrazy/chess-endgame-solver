@@ -44,3 +44,5 @@ jobs:
       - run: pip install ruff==0.17.0
       - run: ruff check
       - run: ruff format --check
+      - name: ASD-STE100 prose check
+        run: python tools/ste_check.py
