@@ -37,7 +37,7 @@ use std::{
 
 pub const MAGIC: &[u8; 8] = b"TBPAWNZ1";
 /// Decompressed bytes per block (the last block of a section may be shorter).
-pub const BLOCK: usize = 1 << 16;
+pub const BLOCK: usize = 1 << 18;
 /// White-king squares of the stored domain, in index order.
 pub const TRIANGLE: [u8; 10] = [0, 1, 2, 3, 9, 10, 11, 18, 19, 27];
 const TRANSPOSE: Symmetry = Symmetry {
@@ -534,8 +534,13 @@ impl PackedTable {
         let header: PackedHeader = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
         let material = Material::parse(&header.material)?;
         let layout = Layout::new(&material);
-        if header.stored_words != layout.words() || header.block_bytes != BLOCK {
+        if header.stored_words != layout.words() {
             return Err("v3 header disagrees with its material".into());
+        }
+        if !header.block_bytes.is_power_of_two()
+            || !(1 << 12..=1 << 24).contains(&header.block_bytes)
+        {
+            return Err("v3 block size out of range".into());
         }
         let start = 16 + len;
         let size = file.metadata().map_err(err)?.len();
@@ -594,7 +599,8 @@ impl PackedTable {
         self.file
             .read_exact_at(&mut frame, section.frames + from)
             .map_err(|e| e.to_string())?;
-        let expect = BLOCK.min(section.raw_bytes - b * BLOCK);
+        let block = self.header.block_bytes;
+        let expect = block.min(section.raw_bytes - b * block);
         let raw = zstd::bulk::decompress(&frame, expect).map_err(|e| e.to_string())?;
         if raw.len() != expect {
             return Err("v3 block has the wrong length".into());
@@ -631,7 +637,8 @@ impl PackedTable {
             return Ok(None);
         }
         let p = self.layout.position(black, squares, black_king);
-        let wdl = self.block(false, p / 4 / BLOCK)?[p / 4 % BLOCK] >> (2 * (p % 4)) & 3;
+        let block = self.header.block_bytes;
+        let wdl = self.block(false, p / 4 / block)?[p / 4 % block] >> (2 * (p % 4)) & 3;
         let wdl = match wdl {
             0 => 0,
             1 => 2,
@@ -641,12 +648,12 @@ impl PackedTable {
         let width = self.header.rank_width;
         let rank = if wdl != 0 && width > 0 {
             let at = p * width;
-            let block = self.block(true, at / BLOCK)?;
-            let i = at % BLOCK;
+            let data = self.block(true, at / block)?;
+            let i = at % block;
             Some(if width == 1 {
-                u16::from(block[i])
+                u16::from(data[i])
             } else {
-                u16::from_le_bytes([block[i], block[i + 1]])
+                u16::from_le_bytes([data[i], data[i + 1]])
             })
         } else {
             None
