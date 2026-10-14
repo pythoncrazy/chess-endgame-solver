@@ -4,11 +4,30 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, edited, synchronize, reopened]
 
 permissions:
   contents: read
 
 jobs:
+  authorship:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: No co-author or tool lines in commit messages
+        run: python3 tools/strip_trailers.py --check HEAD
+      - name: No co-author or tool lines in the pull request text
+        if: github.event_name == 'pull_request'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n%s\n' "$TITLE" "$BODY" > "$RUNNER_TEMP/pr.txt"
+          python3 tools/strip_trailers.py --check-text "$RUNNER_TEMP/pr.txt"
+
   rust:
     runs-on: ubuntu-24.04
     steps:

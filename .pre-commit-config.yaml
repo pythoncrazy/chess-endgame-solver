@@ -2,7 +2,7 @@
 # To install the hooks, run `prek install`. To run all hooks, run `prek run --all-files`.
 # The code of the supplied Python oracle scripts stays as in the ZIP.
 # Thus Python lint and format apply to tools/ only. The hooks check all Rust workspaces.
-default_install_hook_types: [pre-commit]
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
   - repo: builtin
     hooks:
@@ -18,6 +18,11 @@ repos:
         files: ^(tools/|\.pre-commit-config\.yaml|ruff\.toml|rust/.*\.(rs|toml))
   - repo: local
     hooks:
+      - id: strip-trailers
+        name: remove co-author and tool trailers
+        language: system
+        entry: python3 tools/strip_trailers.py
+        stages: [commit-msg]
       - id: ruff-check
         name: ruff check (tools)
         language: python
