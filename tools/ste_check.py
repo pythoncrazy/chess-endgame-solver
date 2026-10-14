@@ -192,6 +192,8 @@ def markdown_units(path: str, text: str) -> list[Unit]:
 
 
 def text_units(path: str, text: str) -> list[Unit]:
+    if re.search(r"^```", text, re.MULTILINE):
+        return markdown_units(path, text)
     units: list[Unit] = []
     block: list[str] = []
     start = 0
