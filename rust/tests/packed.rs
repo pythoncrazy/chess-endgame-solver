@@ -161,7 +161,9 @@ fn bad_headers_are_errors() {
     ];
     for (codec, options) in [("zstd", zstd), ("cm", cm)] {
         let path = dir.join(format!("{codec}.tbz"));
-        pack(&table, &path, options);
+        let packed = pack(&table, &path, options);
+        assert!(packed.probe(false, &[0, 64], 20).is_err());
+        assert!(packed.probe(false, &[255, 9], 20).is_err());
         let bytes = std::fs::read(&path).unwrap();
         let bad = dir.join("bad.tbz");
         for (section, field, value) in cases {
