@@ -227,13 +227,19 @@ struct Mixer {
     tables: Vec<Vec<(f32, u16)>>,
     weights: Vec<f32>,
     stretched: Vec<f32>,
+    refine: Vec<(f32, u16)>,
     limit: u16,
     rate: f32,
+    sse: bool,
     bits: f64,
 }
 
 fn stretch(p: f32) -> f32 {
     (p / (1.0 - p)).ln()
+}
+
+fn squash(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 impl Mixer {
@@ -242,8 +248,10 @@ impl Mixer {
             tables: sizes.iter().map(|&n| vec![(0.5, 0); n]).collect(),
             weights: vec![0.0; sets * sizes.len()],
             stretched: vec![0.0; sizes.len()],
+            refine: vec![(0.0, 0); sets * 33],
             limit,
             rate,
+            sse: setting("TB_SSE", 1) == 1,
             bits: 0.0,
         }
     }
@@ -254,6 +262,9 @@ impl Mixer {
         }
         let start = 1.0 / self.tables.len() as f32;
         self.weights.fill(start);
+        for (i, r) in self.refine.iter_mut().enumerate() {
+            *r = (squash((i % 33) as f32 / 2.0 - 8.0), 0);
+        }
     }
 
     fn code(&mut self, contexts: &[usize], set: usize, bit: bool) {
@@ -265,10 +276,25 @@ impl Mixer {
             self.stretched[i] = s;
             dot += w[i] * s;
         }
-        let p = (1.0 / (1.0 + (-dot).exp())).clamp(1.0 / 65536.0, 1.0 - 1.0 / 65536.0);
+        let mixed = squash(dot);
         let y = f32::from(u8::from(bit));
+        let pos = ((dot.clamp(-7.999, 7.999) + 8.0) * 2.0).max(0.0);
+        let (lo, frac) = (pos as usize, pos.fract());
+        let cell = set * 33 + lo;
+        let refined = self.refine[cell].0 * (1.0 - frac) + self.refine[cell + 1].0 * frac;
+        let p = if self.sse {
+            (mixed + 3.0 * refined) / 4.0
+        } else {
+            mixed
+        }
+        .clamp(1.0 / 65536.0, 1.0 - 1.0 / 65536.0);
         self.bits -= f64::from(if bit { p } else { 1.0 - p }).log2();
-        let err = (y - p) * self.rate;
+        for (c, share) in [(cell, 1.0 - frac), (cell + 1, frac)] {
+            let (q, k) = &mut self.refine[c];
+            *q += (y - *q) * share / (f32::from(*k) + 1.5);
+            *k = (*k + 1).min(127);
+        }
+        let err = (y - mixed) * self.rate;
         for (wi, s) in w.iter_mut().zip(&self.stretched) {
             *wi += err * s;
         }
@@ -324,12 +350,20 @@ fn near<T: Copy>(
 
 const WDL_NODES: usize = 6;
 
+/// Read a number from an environment variable, or use the default.
+fn setting<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn wdl_mixing(wdl: &[u8], words: usize, limit: u16, rate: f32) -> f64 {
     let black_start = words / 2;
     let sizes = [1, 25, 625, 15625, 15625, 78125, 3125, 3125].map(|n| n * WDL_NODES);
     per_block(
         words,
-        BLOCK / 16,
+        setting("TB_WDL_BLOCK_WORDS", BLOCK / 16),
         || Mixer::new(&sizes, WDL_NODES * 5, limit, rate),
         |start, end, m| {
             let mut c = [0usize; 8];
@@ -398,7 +432,7 @@ fn rank_mixing(wdl: &[u8], rank: &[u16], words: usize, limit: u16, rate: f32) ->
     let sizes = [8, 2056, 648, 11664, 11664, 9252, 11664].map(|n| n * RANK_NODES);
     per_block(
         words,
-        BLOCK / 64,
+        setting("TB_RANK_BLOCK_WORDS", BLOCK / 64),
         || Mixer::new(&sizes, RANK_NODES * 2, limit, rate),
         |start, end, m| {
             let mut c = [0usize; 7];
@@ -470,16 +504,31 @@ fn main() -> Result<(), String> {
         let known = wdl.iter().filter(|&&v| v != UNKNOWN).count();
         let ranked = rank.iter().filter(|&&r| r != NO_RANK).count();
         let t_mix = Instant::now();
-        let wdl_mix = wdl_mixing(&wdl, words, 255, 0.02);
+        let wdl_mix = wdl_mixing(
+            &wdl,
+            words,
+            setting("TB_LIMIT", 255),
+            setting("TB_RATE", 0.005),
+        );
         let wdl_mix_s = t_mix.elapsed().as_secs_f64();
         let t_mix = Instant::now();
-        let rank_mix = rank_mixing(&wdl, &rank, words, 255, 0.02);
+        let rank_mix = rank_mixing(
+            &wdl,
+            &rank,
+            words,
+            setting("TB_LIMIT", 255),
+            setting("TB_RATE", 0.005),
+        );
         let rank_mix_s = t_mix.elapsed().as_secs_f64();
-        let (w, r) = std::thread::scope(|s| {
-            let w = s.spawn(|| wdl_bits(&wdl, words));
-            let r = s.spawn(|| rank_bits(&wdl, &rank, words));
-            (w.join().expect("wdl"), r.join().expect("rank"))
-        });
+        let (w, r) = if setting("TB_MIXER_ONLY", 0) == 1 {
+            (Vec::new(), Vec::new())
+        } else {
+            std::thread::scope(|s| {
+                let w = s.spawn(|| wdl_bits(&wdl, words));
+                let r = s.spawn(|| rank_bits(&wdl, &rank, words));
+                (w.join().expect("wdl"), r.join().expect("rank"))
+            })
+        };
         let bytes = |v: Vec<(&str, f64)>| -> serde_json::Value {
             v.into_iter()
                 .map(|(n, b)| (n.to_string(), serde_json::json!((b / 8.0).round())))
