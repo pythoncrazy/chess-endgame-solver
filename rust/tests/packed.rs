@@ -185,6 +185,18 @@ fn bad_headers_are_errors() {
                 "{codec} {section} {field} {value}"
             );
         }
+        // The payload digest does not cover the header. Decode checks the
+        // counts and the content digest of the header.
+        for edit in [
+            |h: &mut serde_json::Value| h["counts"][0]["win"] = 1.into(),
+            |h: &mut serde_json::Value| h["content_sha256"] = "00".into(),
+        ] {
+            std::fs::write(&bad, with_header(&bytes, edit)).unwrap();
+            assert!(
+                PackedTable::open(&bad, true).unwrap().decode(4).is_err(),
+                "{codec}"
+            );
+        }
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
