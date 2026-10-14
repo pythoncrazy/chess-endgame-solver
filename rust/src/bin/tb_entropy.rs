@@ -6,7 +6,10 @@
 //! again at each block, as a block coder must. The result is the size of an
 //! ideal arithmetic coder with that model, without block headers.
 use std::{path::PathBuf, time::Instant};
-use tablebase_core::packed::{self, BLOCK, Canonical, Layout, PackedTable};
+use tablebase_core::{
+    packed::{self, BLOCK, Canonical, Layout, PackedTable},
+    pawnless::{Piece, Role},
+};
 
 const UNKNOWN: u8 = 4;
 const NO_RANK: u16 = 256;
@@ -522,13 +525,113 @@ fn setting<T: std::str::FromStr>(name: &str, default: T) -> T {
 struct WdlWalk<'a> {
     wdl: &'a [u8],
     black_start: usize,
+    /// Skeleton squares of each stored word.
+    squares: &'a [[u8; 5]],
+    /// Colour and role of each skeleton piece.
+    pieces: &'a [Piece],
+}
+
+fn skeletons(layout: &Layout, words: usize) -> Vec<[u8; 5]> {
+    let m = layout.material.skeleton_len();
+    (0..words)
+        .map(|cw| {
+            let (_, sq) = layout.material.decode(layout.full_word(cw));
+            let mut out = [0u8; 5];
+            out[..m].copy_from_slice(&sq[..m]);
+            out
+        })
+        .collect()
+}
+
+/// True if a piece of this role on `from` attacks `to`, with the blockers in `occupied`.
+fn attacks(role: Role, from: u8, to: u8, occupied: u64) -> bool {
+    let (df, dr) = (
+        i32::from(to % 8) - i32::from(from % 8),
+        i32::from(to / 8) - i32::from(from / 8),
+    );
+    let (straight, diagonal) = (df == 0 || dr == 0, df.abs() == dr.abs());
+    let slides = match role {
+        Role::King => return df.abs().max(dr.abs()) == 1,
+        Role::Knight => return df.abs() * dr.abs() == 2,
+        Role::Queen => straight || diagonal,
+        Role::Rook => straight,
+        Role::Bishop => diagonal,
+    };
+    if !slides || (df == 0 && dr == 0) {
+        return false;
+    }
+    let step = df.signum() + 8 * dr.signum();
+    let mut sq = i32::from(from) + step;
+    while sq != i32::from(to) {
+        if occupied >> sq & 1 == 1 {
+            return false;
+        }
+        sq += step;
+    }
+    true
+}
+
+fn distance(a: u8, b: u8) -> i32 {
+    (i32::from(a % 8) - i32::from(b % 8))
+        .abs()
+        .max((i32::from(a / 8) - i32::from(b / 8)).abs())
+}
+
+const GEOMETRY: usize = 16 * 16 * 16 * 3;
+
+/// Geometry context: the white checks, the loose pieces and the king distance.
+/// A loose piece is a piece that the other side can take without a recapture.
+fn geometry(pieces: &[Piece], squares: &[u8], bk: u8) -> usize {
+    let occupied = squares.iter().fold(1u64 << bk, |o, &s| o | 1 << s);
+    let attackers = |white: bool, target: usize| {
+        let to = if target == usize::MAX {
+            bk
+        } else {
+            squares[target]
+        };
+        let king = !white && target != usize::MAX && distance(bk, to) == 1;
+        king || pieces.iter().zip(squares).enumerate().any(|(j, (p, &sq))| {
+            j != target && p.white == white && attacks(p.role, sq, to, occupied)
+        })
+    };
+    let (mut check, mut white_loose, mut black_loose) = (0, 0, 0);
+    for (j, p) in pieces.iter().enumerate().skip(1) {
+        let bit = 1 << (j - 1);
+        if p.white && attacks(p.role, squares[j], bk, occupied) {
+            check |= bit;
+        }
+        if attackers(!p.white, j) && !attackers(p.white, j) {
+            if p.white {
+                white_loose |= bit;
+            } else {
+                black_loose |= bit;
+            }
+        }
+    }
+    let kings = (distance(squares[0], bk) - 2).clamp(0, 2) as usize;
+    ((check * 16 + white_loose) * 16 + black_loose) * 3 + kings
 }
 
 impl Walk for WdlWalk<'_> {
     fn sizes(&self) -> Vec<usize> {
-        [1, 25, 625, 15625, 15625, 78125, 3125, 3125, 200, 1000, 200]
-            .map(|n| n * WDL_NODES)
-            .to_vec()
+        [
+            1,
+            25,
+            625,
+            15625,
+            15625,
+            78125,
+            3125,
+            3125,
+            200,
+            1000,
+            200,
+            GEOMETRY,
+            GEOMETRY * 25,
+            GEOMETRY * 25,
+        ]
+        .map(|n| n * WDL_NODES)
+        .to_vec()
     }
 
     fn sets(&self) -> usize {
@@ -537,16 +640,18 @@ impl Walk for WdlWalk<'_> {
 
     fn walk<S: Sink>(&self, start: usize, end: usize, m: &mut S) {
         let (wdl, black_start) = (self.wdl, self.black_start);
-        let mut c = [0usize; 11];
+        let mut c = [0usize; 14];
         let (mut previous, mut run_prev, mut run_w1, mut run_left) =
             (usize::from(UNKNOWN), 0, 0, 0);
         for cw in start..end {
             let turn = usize::from(cw >= black_start) * 3;
+            let squares = &self.squares[cw][..self.pieces.len()];
             for bk in 0..64 {
                 let v = wdl[cw * 64 + bk];
                 if v == UNKNOWN {
                     continue;
                 }
+                let geo = geometry(self.pieces, squares, bk as u8);
                 let at =
                     |dw, df, dr| usize::from(near(wdl, UNKNOWN, start, (cw, bk), (dw, df, dr)));
                 let (left, up, ul, ur) = (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
@@ -572,6 +677,9 @@ impl Walk for WdlWalk<'_> {
                     (w1 * 8 + run_bucket(run_w1)) * 5 + left,
                     ((board * 8 + run_bucket(run_left)) * 5) + w1,
                     (previous * 8 + run_bucket(run_prev)) * 5 + up,
+                    geo,
+                    geo * 25 + board,
+                    geo * 25 + w1 * 5 + w8,
                 ];
                 let mut node = |n: usize, bit: bool| {
                     for (ci, b) in c.iter_mut().zip(base) {
@@ -615,11 +723,19 @@ fn rel(x: u16, pred: u16) -> usize {
 struct RankWalk<'a> {
     wdl: &'a [u8],
     rank: &'a [u16],
+    squares: &'a [[u8; 5]],
+    pieces: &'a [Piece],
+}
+
+/// Small geometry context: a check, a loose white piece, a loose black piece and the king distance.
+fn small_geometry(geo: usize) -> usize {
+    let (kings, black, white, check) = (geo % 3, geo / 3 % 16, geo / 48 % 16, geo / 768);
+    ((usize::from(check > 0) * 2 + usize::from(white > 0)) * 2 + usize::from(black > 0)) * 3 + kings
 }
 
 impl Walk for RankWalk<'_> {
     fn sizes(&self) -> Vec<usize> {
-        [8, 2056, 648, 11664, 11664, 9252, 11664]
+        [8, 2056, 648, 11664, 11664, 9252, 11664, 2 * GEOMETRY, 15552]
             .map(|n| n * RANK_NODES)
             .to_vec()
     }
@@ -630,13 +746,15 @@ impl Walk for RankWalk<'_> {
 
     fn walk<S: Sink>(&self, start: usize, end: usize, m: &mut S) {
         let (wdl, rank) = (self.wdl, self.rank);
-        let mut c = [0usize; 7];
+        let mut c = [0usize; 9];
         for cw in start..end {
+            let squares = &self.squares[cw][..self.pieces.len()];
             for bk in 0..64 {
                 let r = rank[cw * 64 + bk];
                 if r == NO_RANK {
                     continue;
                 }
+                let geo = geometry(self.pieces, squares, bk as u8);
                 let win = usize::from(wdl[cw * 64 + bk] == 1);
                 let at = |dw, df, dr| near(rank, NO_RANK, start, (cw, bk), (dw, df, dr));
                 let (left, up, ul, ur) = (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
@@ -654,6 +772,8 @@ impl Walk for RankWalk<'_> {
                     ((win * 18 + rel(w1, pred)) * 18 + rel(w8, pred)) * 18 + rel(w64, pred),
                     (win * 257 + p) * 18 + rel(up, pred),
                     ((win * 18 + rel(left, pred)) * 18 + rel(w1, pred)) * 18 + rel(w8, pred),
+                    win * GEOMETRY + geo,
+                    ((win * 24 + small_geometry(geo)) * 18 + rel(left, pred)) * 18 + rel(up, pred),
                 ];
                 let mut node = |n: usize, bit: bool| {
                     for (ci, b) in c.iter_mut().zip(base) {
@@ -696,13 +816,19 @@ fn main() -> Result<(), String> {
         let words = stored.records.len();
         let known = wdl.iter().filter(|&&v| v != UNKNOWN).count();
         let ranked = rank.iter().filter(|&&r| r != NO_RANK).count();
+        let squares = skeletons(&layout, words);
+        let pieces = &table.material.skeleton;
         let wdl_walk = WdlWalk {
             wdl: &wdl,
             black_start: words / 2,
+            squares: &squares,
+            pieces,
         };
         let rank_walk = RankWalk {
             wdl: &wdl,
             rank: &rank,
+            squares: &squares,
+            pieces,
         };
         let (wdl_block, rank_block) = (
             setting("TB_WDL_BLOCK_WORDS", BLOCK / 16),
