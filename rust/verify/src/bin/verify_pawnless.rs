@@ -246,39 +246,42 @@ fn check_position(
         return Err(format!("value {value} has no proof rank"));
     }
     let moves = pos.legal_moves();
-    let smaller = |r: Option<u16>| r.is_none_or(|r| r < rank);
-    // Over all children, look for a loss of smaller rank, any loss and any child
-    // that is not a win. Also find if every child is a win of smaller rank.
-    // The loop stops when the outcome of the obligation is known. The stored
-    // image of a skipped child and the symmetry check cover its legality.
-    // A checkmate (rank 0) has no child to probe.
-    let (mut proving_loss, mut any_loss, mut any_nonwin, mut all_smaller_wins) =
-        (false, false, false, true);
+    // The rank is the solver round: a win is one more than its fastest child
+    // that is a loss, and a loss is one more than its slowest child. A child in
+    // a lower material counts as 0. Thus a rank is the distance to mate in
+    // plies, if no capture is on the path. Over all children, find the fastest
+    // loss, the slowest child, and any child that is not a win. The loop stops
+    // when the obligation fails. The stored image of a skipped child and the
+    // symmetry check cover its legality. A checkmate (rank 0) has no child.
+    let rank = u32::from(rank);
+    let (mut fastest_loss, mut slowest, mut any_nonwin) = (None::<u32>, 0u32, false);
     let probe_children = !(value == -2 && rank == 0);
     for m in moves.iter().filter(|_| probe_children) {
         let mut child = pos.clone();
         child.play_unchecked(*m);
         let (v, r) = child_value(ctx, &child, m.capture())?;
-        proving_loss |= v == -2 && smaller(r);
-        any_loss |= v == -2;
+        let r = u32::from(r.unwrap_or(0));
+        if v == -2 {
+            fastest_loss = Some(fastest_loss.map_or(r, |f| f.min(r)));
+        }
+        slowest = slowest.max(r);
         any_nonwin |= v != 2;
-        all_smaller_wins &= v == 2 && smaller(r);
-        let settled = match value {
-            2 => proving_loss,
-            -2 => !all_smaller_wins,
-            _ => any_loss,
+        let failed = match value {
+            2 => fastest_loss.is_some_and(|f| f + 1 < rank),
+            -2 => any_nonwin || slowest + 1 > rank,
+            _ => fastest_loss.is_some(),
         };
-        if settled {
+        if failed {
             break;
         }
     }
     let ok = match value {
-        2 => proving_loss,
+        2 => fastest_loss.is_some_and(|f| f + 1 == rank),
         -2 if rank == 0 => moves.is_empty() && pos.is_check(),
-        -2 => !moves.is_empty() && all_smaller_wins,
+        -2 => !moves.is_empty() && !any_nonwin && slowest + 1 == rank,
         _ => {
-            rank == pawnless::UNRESOLVED
-                && !any_loss
+            rank == u32::from(pawnless::UNRESOLVED)
+                && fastest_loss.is_none()
                 && (if moves.is_empty() {
                     !pos.is_check()
                 } else {
