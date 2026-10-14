@@ -306,31 +306,192 @@ impl Mixer {
     }
 }
 
-/// Code each block in parallel with a fresh mixer and add the code lengths.
-fn per_block<M, F>(words: usize, per_block: usize, make: M, block: F) -> f64
-where
-    M: Fn() -> Mixer + Sync,
-    F: Fn(usize, usize, &mut Mixer) + Sync,
-{
+/// A consumer of binary decisions with their contexts.
+trait Sink {
+    fn code(&mut self, contexts: &[usize], set: usize, bit: bool);
+    fn block(&mut self) {}
+}
+
+impl Sink for Mixer {
+    fn code(&mut self, contexts: &[usize], set: usize, bit: bool) {
+        Mixer::code(self, contexts, set, bit);
+    }
+    fn block(&mut self) {
+        self.reset();
+    }
+}
+
+/// A source of binary decisions: one section of a table.
+trait Walk: Sync {
+    /// Number of contexts of each model.
+    fn sizes(&self) -> Vec<usize>;
+    /// Number of mixer weight sets.
+    fn sets(&self) -> usize;
+    /// Send the decisions of the words start..end to the sink.
+    fn walk<S: Sink>(&self, start: usize, end: usize, sink: &mut S);
+}
+
+/// Walk each block in parallel with one sink for each thread.
+fn per_block<W: Walk, S: Sink + Send>(
+    walk: &W,
+    words: usize,
+    per_block: usize,
+    blocks: impl Iterator<Item = usize> + Clone + Send,
+    make: impl Fn() -> S + Sync,
+) -> Vec<S> {
     let threads = 24;
-    let blocks = words.div_ceil(per_block);
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let (make, block) = (&make, &block);
+                let (make, blocks) = (&make, blocks.clone());
                 s.spawn(move || {
-                    let mut m = make();
-                    for b in (t..blocks).step_by(threads) {
-                        m.reset();
+                    let mut sink = make();
+                    for b in blocks.skip(t).step_by(threads) {
+                        sink.block();
                         let start = b * per_block;
-                        block(start, (start + per_block).min(words), &mut m);
+                        walk.walk(start, (start + per_block).min(words), &mut sink);
                     }
-                    m.bits
+                    sink
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("block")).sum()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("block"))
+            .collect()
     })
+}
+
+/// Code each block with an adaptive mixer that starts again at each block.
+fn adaptive<W: Walk>(walk: &W, words: usize, block_words: usize) -> f64 {
+    let (limit, rate) = (setting("TB_LIMIT", 255), setting("TB_RATE", 0.005));
+    let sizes = walk.sizes();
+    per_block(
+        walk,
+        words,
+        block_words,
+        0..words.div_ceil(block_words),
+        || Mixer::new(&sizes, walk.sets(), limit, rate),
+    )
+    .iter()
+    .map(|m| m.bits)
+    .sum()
+}
+
+/// Bit counts of each context.
+struct Counts(Vec<Vec<[u32; 2]>>);
+
+impl Sink for Counts {
+    fn code(&mut self, contexts: &[usize], _: usize, bit: bool) {
+        for (t, &c) in self.0.iter_mut().zip(contexts) {
+            t[c][usize::from(bit)] += 1;
+        }
+    }
+}
+
+/// A fixed model: one quantized probability per context and fixed weights.
+struct Frozen<'a> {
+    stretched: &'a [Vec<f32>],
+    weights: Vec<f32>,
+    rate: f32,
+    bits: f64,
+}
+
+impl Sink for Frozen<'_> {
+    fn code(&mut self, contexts: &[usize], set: usize, bit: bool) {
+        let n = self.stretched.len();
+        let w = &mut self.weights[set * n..(set + 1) * n];
+        let dot: f32 = contexts
+            .iter()
+            .zip(self.stretched)
+            .zip(w.iter())
+            .map(|((&c, t), wi)| wi * t[c])
+            .sum();
+        let p = squash(dot).clamp(1.0 / 4096.0, 1.0 - 1.0 / 4096.0);
+        self.bits -= f64::from(if bit { p } else { 1.0 - p }).log2();
+        if self.rate > 0.0 {
+            let err = (f32::from(u8::from(bit)) - p) * self.rate;
+            for ((wi, &c), t) in w.iter_mut().zip(contexts).zip(self.stretched) {
+                *wi += err * t[c];
+            }
+        }
+    }
+}
+
+/// Size of a semi-static model: the code length and the header size.
+/// One pass counts the bits of each context over the full table.
+/// The header keeps a 12-bit probability for each context with TB_PRUNE bits or more.
+/// The header size is the zstd size of these values and of a presence bitmap.
+/// A second pass trains the mixer weights on a sample of the blocks.
+/// A third pass finds the code length with the fixed model.
+fn semi_static<W: Walk>(walk: &W, words: usize, block_words: usize) -> (f64, usize) {
+    let sizes = walk.sizes();
+    let blocks = words.div_ceil(block_words);
+    let parts = per_block(walk, words, block_words, 0..blocks, || {
+        Counts(sizes.iter().map(|&n| vec![[0; 2]; n]).collect())
+    });
+    let mut counts = Counts(sizes.iter().map(|&n| vec![[0; 2]; n]).collect());
+    for part in parts {
+        for (t, u) in counts.0.iter_mut().zip(part.0) {
+            for (a, b) in t.iter_mut().zip(u) {
+                a[0] += b[0];
+                a[1] += b[1];
+            }
+        }
+    }
+    let prune = setting("TB_PRUNE", 1u32);
+    let mut header = Vec::new();
+    let stretched: Vec<Vec<f32>> = counts
+        .0
+        .iter()
+        .map(|t| {
+            let mut present = vec![0u8; t.len().div_ceil(8)];
+            let mut probs = Vec::new();
+            let out = t
+                .iter()
+                .enumerate()
+                .map(|(i, &[n0, n1])| {
+                    if n0 + n1 < prune {
+                        return 0.0;
+                    }
+                    let p = (f64::from(n1) + 0.4) / (f64::from(n0 + n1) + 0.8);
+                    let q = (p * 4096.0).round().clamp(1.0, 4095.0) as u16;
+                    present[i / 8] |= 1 << (i % 8);
+                    probs.extend_from_slice(&q.to_le_bytes());
+                    stretch(f32::from(q) / 4096.0)
+                })
+                .collect();
+            header.extend_from_slice(&present);
+            header.extend_from_slice(&probs);
+            out
+        })
+        .collect();
+    let used = zstd::bulk::compress(&header, 19).map_or(header.len(), |h| h.len());
+    let n = sizes.len();
+    let mut trainer = Frozen {
+        stretched: &stretched,
+        weights: vec![1.0 / n as f32; walk.sets() * n],
+        rate: setting("TB_STATIC_RATE", 0.002),
+        bits: 0.0,
+    };
+    let sample = setting("TB_SAMPLE", 8);
+    for _ in 0..setting("TB_EPOCHS", 2) {
+        for b in (0..blocks).step_by(sample) {
+            let start = b * block_words;
+            walk.walk(start, (start + block_words).min(words), &mut trainer);
+        }
+    }
+    let weights = trainer.weights;
+    let bits = per_block(walk, words, block_words, 0..blocks, || Frozen {
+        stretched: &stretched,
+        weights: weights.clone(),
+        rate: 0.0,
+        bits: 0.0,
+    })
+    .iter()
+    .map(|f| f.bits)
+    .sum();
+    (bits, used)
 }
 
 /// Value at (file + df, rank + dr) of word cw - dw, if the block has it.
@@ -358,63 +519,86 @@ fn setting<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn wdl_mixing(wdl: &[u8], words: usize, limit: u16, rate: f32) -> f64 {
-    let black_start = words / 2;
-    let sizes = [1, 25, 625, 15625, 15625, 78125, 3125, 3125].map(|n| n * WDL_NODES);
-    per_block(
-        words,
-        setting("TB_WDL_BLOCK_WORDS", BLOCK / 16),
-        || Mixer::new(&sizes, WDL_NODES * 5, limit, rate),
-        |start, end, m| {
-            let mut c = [0usize; 8];
-            for cw in start..end {
-                let turn = usize::from(cw >= black_start) * 3;
-                for bk in 0..64 {
-                    let v = wdl[cw * 64 + bk];
-                    if v == UNKNOWN {
-                        continue;
+struct WdlWalk<'a> {
+    wdl: &'a [u8],
+    black_start: usize,
+}
+
+impl Walk for WdlWalk<'_> {
+    fn sizes(&self) -> Vec<usize> {
+        [1, 25, 625, 15625, 15625, 78125, 3125, 3125, 200, 1000, 200]
+            .map(|n| n * WDL_NODES)
+            .to_vec()
+    }
+
+    fn sets(&self) -> usize {
+        WDL_NODES * 5
+    }
+
+    fn walk<S: Sink>(&self, start: usize, end: usize, m: &mut S) {
+        let (wdl, black_start) = (self.wdl, self.black_start);
+        let mut c = [0usize; 11];
+        let (mut previous, mut run_prev, mut run_w1, mut run_left) =
+            (usize::from(UNKNOWN), 0, 0, 0);
+        for cw in start..end {
+            let turn = usize::from(cw >= black_start) * 3;
+            for bk in 0..64 {
+                let v = wdl[cw * 64 + bk];
+                if v == UNKNOWN {
+                    continue;
+                }
+                let at =
+                    |dw, df, dr| usize::from(near(wdl, UNKNOWN, start, (cw, bk), (dw, df, dr)));
+                let (left, up, ul, ur) = (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
+                let (w1, w8, w64, w512, w4096) = (
+                    at(1, 0, 0),
+                    at(8, 0, 0),
+                    at(64, 0, 0),
+                    at(512, 0, 0),
+                    at(4096, 0, 0),
+                );
+                let (w1l, w1u) = (at(1, -1, 0), at(1, 0, -1));
+                let board = left * 5 + up;
+                let word = board * 25 + w1 * 5 + w8;
+                let base = [
+                    0,
+                    board,
+                    word,
+                    word * 25 + ul * 5 + ur,
+                    word * 25 + w64 * 5 + w512,
+                    (word * 25 + ul * 5 + ur) * 5 + w64,
+                    (((w1 * 5 + w8) * 5 + w64) * 5 + w512) * 5 + w4096,
+                    (((board * 5 + w1) * 5 + w1l) * 5) + w1u,
+                    (w1 * 8 + run_bucket(run_w1)) * 5 + left,
+                    ((board * 8 + run_bucket(run_left)) * 5) + w1,
+                    (previous * 8 + run_bucket(run_prev)) * 5 + up,
+                ];
+                let mut node = |n: usize, bit: bool| {
+                    for (ci, b) in c.iter_mut().zip(base) {
+                        *ci = b * WDL_NODES + n + turn;
                     }
-                    let at =
-                        |dw, df, dr| usize::from(near(wdl, UNKNOWN, start, (cw, bk), (dw, df, dr)));
-                    let (left, up, ul, ur) =
-                        (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
-                    let (w1, w8, w64, w512, w4096) = (
-                        at(1, 0, 0),
-                        at(8, 0, 0),
-                        at(64, 0, 0),
-                        at(512, 0, 0),
-                        at(4096, 0, 0),
-                    );
-                    let (w1l, w1u) = (at(1, -1, 0), at(1, 0, -1));
-                    let board = left * 5 + up;
-                    let word = board * 25 + w1 * 5 + w8;
-                    let base = [
-                        0,
-                        board,
-                        word,
-                        word * 25 + ul * 5 + ur,
-                        word * 25 + w64 * 5 + w512,
-                        (word * 25 + ul * 5 + ur) * 5 + w64,
-                        (((w1 * 5 + w8) * 5 + w64) * 5 + w512) * 5 + w4096,
-                        (((board * 5 + w1) * 5 + w1l) * 5) + w1u,
-                    ];
-                    let mut node = |n: usize, bit: bool| {
-                        for (ci, b) in c.iter_mut().zip(base) {
-                            *ci = b * WDL_NODES + n + turn;
-                        }
-                        m.code(&c, (n + turn) * 5 + left, bit);
-                    };
-                    node(0, v == 0);
-                    if v != 0 {
-                        node(1, v == 2);
-                        if v != 2 && turn != 0 {
-                            node(2, v == 3);
-                        }
+                    m.code(&c, (n + turn) * 5 + left, bit);
+                };
+                node(0, v == 0);
+                if v != 0 {
+                    node(1, v == 2);
+                    if v != 2 && turn != 0 {
+                        node(2, v == 3);
                     }
                 }
+                let v = usize::from(v);
+                run_prev = if v == previous { run_prev + 1 } else { 0 };
+                run_w1 = if v == w1 { run_w1 + 1 } else { 0 };
+                run_left = if v == left { run_left + 1 } else { 0 };
+                previous = v;
             }
-        },
-    )
+        }
+    }
+}
+
+/// Bucket of a run length: 0, 1, 2-3, 4-7, up to 64 and more.
+fn run_bucket(run: u32) -> usize {
+    (run + 1).ilog2().min(7) as usize
 }
 
 const RANK_NODES: usize = 160;
@@ -428,67 +612,76 @@ fn rel(x: u16, pred: u16) -> usize {
     }
 }
 
-fn rank_mixing(wdl: &[u8], rank: &[u16], words: usize, limit: u16, rate: f32) -> f64 {
-    let sizes = [8, 2056, 648, 11664, 11664, 9252, 11664].map(|n| n * RANK_NODES);
-    per_block(
-        words,
-        setting("TB_RANK_BLOCK_WORDS", BLOCK / 64),
-        || Mixer::new(&sizes, RANK_NODES * 2, limit, rate),
-        |start, end, m| {
-            let mut c = [0usize; 7];
-            for cw in start..end {
-                for bk in 0..64 {
-                    let r = rank[cw * 64 + bk];
-                    if r == NO_RANK {
-                        continue;
+struct RankWalk<'a> {
+    wdl: &'a [u8],
+    rank: &'a [u16],
+}
+
+impl Walk for RankWalk<'_> {
+    fn sizes(&self) -> Vec<usize> {
+        [8, 2056, 648, 11664, 11664, 9252, 11664]
+            .map(|n| n * RANK_NODES)
+            .to_vec()
+    }
+
+    fn sets(&self) -> usize {
+        RANK_NODES * 2
+    }
+
+    fn walk<S: Sink>(&self, start: usize, end: usize, m: &mut S) {
+        let (wdl, rank) = (self.wdl, self.rank);
+        let mut c = [0usize; 7];
+        for cw in start..end {
+            for bk in 0..64 {
+                let r = rank[cw * 64 + bk];
+                if r == NO_RANK {
+                    continue;
+                }
+                let win = usize::from(wdl[cw * 64 + bk] == 1);
+                let at = |dw, df, dr| near(rank, NO_RANK, start, (cw, bk), (dw, df, dr));
+                let (left, up, ul, ur) = (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
+                let (w1, w8, w64) = (at(1, 0, 0), at(8, 0, 0), at(64, 0, 0));
+                let (kind, pred) = [left, up, w1]
+                    .iter()
+                    .position(|&x| x != NO_RANK)
+                    .map_or((3, 0), |i| (i, [left, up, w1][i]));
+                let p = usize::from(pred);
+                let base = [
+                    win * 4 + kind,
+                    (win * 4 + kind) * 257 + p,
+                    (win * 18 + rel(up, pred)) * 18 + rel(w1, pred),
+                    ((win * 18 + rel(up, pred)) * 18 + rel(ul, pred)) * 18 + rel(ur, pred),
+                    ((win * 18 + rel(w1, pred)) * 18 + rel(w8, pred)) * 18 + rel(w64, pred),
+                    (win * 257 + p) * 18 + rel(up, pred),
+                    ((win * 18 + rel(left, pred)) * 18 + rel(w1, pred)) * 18 + rel(w8, pred),
+                ];
+                let mut node = |n: usize, bit: bool| {
+                    for (ci, b) in c.iter_mut().zip(base) {
+                        *ci = b * RANK_NODES + n;
                     }
-                    let win = usize::from(wdl[cw * 64 + bk] == 1);
-                    let at = |dw, df, dr| near(rank, NO_RANK, start, (cw, bk), (dw, df, dr));
-                    let (left, up, ul, ur) =
-                        (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
-                    let (w1, w8, w64) = (at(1, 0, 0), at(8, 0, 0), at(64, 0, 0));
-                    let (kind, pred) = [left, up, w1]
-                        .iter()
-                        .position(|&x| x != NO_RANK)
-                        .map_or((3, 0), |i| (i, [left, up, w1][i]));
-                    let p = usize::from(pred);
-                    let base = [
-                        win * 4 + kind,
-                        (win * 4 + kind) * 257 + p,
-                        (win * 18 + rel(up, pred)) * 18 + rel(w1, pred),
-                        ((win * 18 + rel(up, pred)) * 18 + rel(ul, pred)) * 18 + rel(ur, pred),
-                        ((win * 18 + rel(w1, pred)) * 18 + rel(w8, pred)) * 18 + rel(w64, pred),
-                        (win * 257 + p) * 18 + rel(up, pred),
-                        ((win * 18 + rel(left, pred)) * 18 + rel(w1, pred)) * 18 + rel(w8, pred),
-                    ];
-                    let mut node = |n: usize, bit: bool| {
-                        for (ci, b) in c.iter_mut().zip(base) {
-                            *ci = b * RANK_NODES + n;
-                        }
-                        m.code(&c, n * 2 + win, bit);
-                    };
-                    let d = i32::from(r) - i32::from(pred);
-                    node(0, d == 0);
-                    if d == 0 {
-                        continue;
-                    }
-                    let neg = usize::from(d < 0) * 80;
-                    node(1, d < 0);
-                    let mag = d.unsigned_abs();
-                    let k = mag.ilog2() as usize;
-                    for j in 0..k {
-                        node(2 + j + neg, true);
-                    }
-                    if k < 7 {
-                        node(2 + k + neg, false);
-                    }
-                    for i in (0..k).rev() {
-                        node(10 + k * 8 + i + neg, mag >> i & 1 == 1);
-                    }
+                    m.code(&c, n * 2 + win, bit);
+                };
+                let d = i32::from(r) - i32::from(pred);
+                node(0, d == 0);
+                if d == 0 {
+                    continue;
+                }
+                let neg = usize::from(d < 0) * 80;
+                node(1, d < 0);
+                let mag = d.unsigned_abs();
+                let k = mag.ilog2() as usize;
+                for j in 0..k {
+                    node(2 + j + neg, true);
+                }
+                if k < 7 {
+                    node(2 + k + neg, false);
+                }
+                for i in (0..k).rev() {
+                    node(10 + k * 8 + i + neg, mag >> i & 1 == 1);
                 }
             }
-        },
-    )
+        }
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -503,23 +696,32 @@ fn main() -> Result<(), String> {
         let words = stored.records.len();
         let known = wdl.iter().filter(|&&v| v != UNKNOWN).count();
         let ranked = rank.iter().filter(|&&r| r != NO_RANK).count();
-        let t_mix = Instant::now();
-        let wdl_mix = wdl_mixing(
-            &wdl,
-            words,
-            setting("TB_LIMIT", 255),
-            setting("TB_RATE", 0.005),
+        let wdl_walk = WdlWalk {
+            wdl: &wdl,
+            black_start: words / 2,
+        };
+        let rank_walk = RankWalk {
+            wdl: &wdl,
+            rank: &rank,
+        };
+        let (wdl_block, rank_block) = (
+            setting("TB_WDL_BLOCK_WORDS", BLOCK / 16),
+            setting("TB_RANK_BLOCK_WORDS", BLOCK / 64),
         );
+        let t_mix = Instant::now();
+        let wdl_mix = adaptive(&wdl_walk, words, wdl_block);
         let wdl_mix_s = t_mix.elapsed().as_secs_f64();
         let t_mix = Instant::now();
-        let rank_mix = rank_mixing(
-            &wdl,
-            &rank,
-            words,
-            setting("TB_LIMIT", 255),
-            setting("TB_RATE", 0.005),
-        );
+        let rank_mix = adaptive(&rank_walk, words, rank_block);
         let rank_mix_s = t_mix.elapsed().as_secs_f64();
+        let (static_wdl, static_rank) = if setting("TB_STATIC", 1) == 1 {
+            (
+                semi_static(&wdl_walk, words, setting("TB_STATIC_WDL_BLOCK_WORDS", 256)),
+                semi_static(&rank_walk, words, setting("TB_STATIC_RANK_BLOCK_WORDS", 64)),
+            )
+        } else {
+            ((0.0, 0), (0.0, 0))
+        };
         let (w, r) = if setting("TB_MIXER_ONLY", 0) == 1 {
             (Vec::new(), Vec::new())
         } else {
@@ -543,6 +745,8 @@ fn main() -> Result<(), String> {
             "wdl_bytes": bytes(w), "rank_bytes": bytes(r),
             "wdl_mixing_bytes": (wdl_mix / 8.0).round(), "rank_mixing_bytes": (rank_mix / 8.0).round(),
             "wdl_mixing_seconds": wdl_mix_s, "rank_mixing_seconds": rank_mix_s,
+            "wdl_static_bytes": (static_wdl.0 / 8.0).round(), "wdl_static_header_bytes": static_wdl.1,
+            "rank_static_bytes": (static_rank.0 / 8.0).round(), "rank_static_header_bytes": static_rank.1,
             "seconds": t.elapsed().as_secs_f64(),
         });
         eprintln!("{row}");
