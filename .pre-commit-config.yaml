@@ -1,0 +1,57 @@
+# prek (https://github.com/j178/prek) hooks. Install: prek install; run all: prek run --all-files
+# The supplied Python oracle scripts stay byte-identical to the ZIP (see FILE_HASHES.json),
+# so Python lint/format applies to tools/ only. All Rust workspaces are checked.
+default_install_hook_types: [pre-commit]
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-toml
+      - id: check-yaml
+      - id: check-json
+      - id: trailing-whitespace
+        files: ^(tools/|\.pre-commit-config\.yaml|ruff\.toml|rust/.*\.(rs|toml))
+      - id: end-of-file-fixer
+        files: ^(tools/|\.pre-commit-config\.yaml|ruff\.toml|rust/.*\.(rs|toml))
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (tools)
+        language: python
+        additional_dependencies: [ruff==0.17.0]
+        entry: ruff check --force-exclude
+        types: [python]
+        files: ^tools/
+      - id: ruff-format
+        name: ruff format (tools)
+        language: python
+        additional_dependencies: [ruff==0.17.0]
+        entry: ruff format --check --force-exclude
+        types: [python]
+        files: ^tools/
+      - id: cargo-fmt
+        name: cargo fmt (core, native, gpu)
+        language: system
+        entry: bash -c 'for m in rust/Cargo.toml rust/native/Cargo.toml rust/gpu/Cargo.toml; do cargo fmt --manifest-path "$m" --check || exit 1; done'
+        pass_filenames: false
+        files: ^rust/.*\.rs$
+      - id: clippy-core
+        name: clippy -D warnings (core)
+        language: system
+        entry: cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+        pass_filenames: false
+        files: ^rust/(src|tests|Cargo)
+      - id: clippy-native
+        name: clippy -D warnings (native)
+        language: system
+        entry: cargo clippy --locked --manifest-path rust/native/Cargo.toml --all-targets --features http -- -D warnings
+        pass_filenames: false
+        files: ^rust/native/
+      - id: clippy-gpu
+        name: clippy -D warnings (gpu, needs CUDA toolkit)
+        language: system
+        entry: bash -c 'CUDA_TOOLKIT_PATH="${CUDA_TOOLKIT_PATH:-/usr/local/cuda-13.3}" cargo clippy --locked --release --manifest-path rust/gpu/Cargo.toml --all-targets -- -D warnings'
+        pass_filenames: false
+        files: ^rust/(gpu/|src/)
