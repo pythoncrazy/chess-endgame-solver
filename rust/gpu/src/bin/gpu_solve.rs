@@ -423,9 +423,10 @@ mod kernel {
     }
 
     /// Record proof rank `round` for every bit that became a win or a loss.
+    /// `rank` holds one u16 per position: `word * 64 + black king square`.
     #[cutile::entry()]
     unsafe fn ranks(
-        rank: &mut Tensor<u16, { [64, 64] }>,
+        rank: *mut u16,
         win_old: *const u64,
         loss_old: *const u64,
         win_new: *const u64,
@@ -448,9 +449,28 @@ mod kernel {
         let one: Tile<u64, { [64, 64] }> = constant(1u64, shape![64, 64]);
         let zero: Tile<u64, { [64, 64] }> = constant(0u64, shape![64, 64]);
         let set: Tile<bool, { [64, 64] }> = ne_tile((fresh >> column) & one, zero);
+        let row: Tile<i64, { [64, 64] }> = w.reshape(shape![64, 1]).broadcast(shape![64, 64]);
+        let col: Tile<i64, { [64] }> = iota(shape![64]);
+        let col: Tile<i64, { [64, 64] }> = col.reshape(shape![1, 64]).broadcast(shape![64, 64]);
+        let width: Tile<i64, { [64, 64] }> = constant(64i64, shape![64, 64]);
+        let index: Tile<i64, { [64, 64] }> = row * width + col;
+        let base: PointerTile<*mut u16, { [] }> = pointer_to_tile(rank);
+        let base: PointerTile<*mut u16, { [1, 1] }> = base.reshape(shape![1, 1]);
+        let base: PointerTile<*mut u16, { [64, 64] }> = base.broadcast(shape![64, 64]);
+        let ptrs: PointerTile<*mut u16, { [64, 64] }> = base.offset_tile(index);
         let value: Tile<u16, { [64, 64] }> = broadcast_scalar(round, shape![64, 64]);
-        let old: Tile<u16, { [64, 64] }> = rank.load();
-        rank.store(select(set, value, old));
+        // SAFETY: index < words * 64, the length of `rank`; only set lanes write.
+        unsafe {
+            store_ptr_tko(
+                ptrs,
+                value,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(set),
+                None,
+                Latency::<0>,
+            )
+        };
     }
 }
 
@@ -496,24 +516,94 @@ fn role_code(role: pawnless::Role) -> i64 {
 
 type Error = Box<dyn std::error::Error>;
 
+/// Stream-ordered device allocation. cuTile tensors are limited to fewer than
+/// 2^31 elements, while six-piece planes hold 2^31 words, so solver buffers use
+/// raw driver allocations; the kernels take raw pointers.
+struct DeviceVec<T> {
+    ptr: cutile::cuda_core::sys::CUdeviceptr,
+    len: usize,
+    stream: Arc<cutile::cuda_core::Stream>,
+    _type: std::marker::PhantomData<T>,
+}
+
+impl<T: Copy + Default> DeviceVec<T> {
+    fn zeroed(stream: &Arc<cutile::cuda_core::Stream>, len: usize) -> Result<Self, Error> {
+        let bytes = len.max(1) * std::mem::size_of::<T>();
+        // SAFETY: valid stream; the allocation is zeroed before any use.
+        let ptr = unsafe { cutile::cuda_core::malloc_async(bytes, stream)? };
+        unsafe { cutile::cuda_core::memset_d8_async(ptr, 0, bytes, stream)? };
+        Ok(DeviceVec {
+            ptr,
+            len,
+            stream: stream.clone(),
+            _type: std::marker::PhantomData,
+        })
+    }
+
+    fn filled(
+        stream: &Arc<cutile::cuda_core::Stream>,
+        byte: u8,
+        len: usize,
+    ) -> Result<Self, Error> {
+        let v = Self::zeroed(stream, len)?;
+        // SAFETY: the allocation holds len elements.
+        unsafe {
+            cutile::cuda_core::memset_d8_async(v.ptr, byte, len * std::mem::size_of::<T>(), stream)?
+        };
+        Ok(v)
+    }
+
+    fn from_host(stream: &Arc<cutile::cuda_core::Stream>, data: &[T]) -> Result<Self, Error> {
+        let v = Self::zeroed(stream, data.len())?;
+        // SAFETY: data and the allocation both hold data.len() elements; the
+        // stream is synchronized before `data` can be dropped by the caller.
+        unsafe {
+            cutile::cuda_core::memcpy_htod_async(v.ptr, data.as_ptr(), data.len(), stream)?;
+            stream.synchronize()?;
+        }
+        Ok(v)
+    }
+
+    fn to_host(&self) -> Result<Vec<T>, Error> {
+        let mut out = vec![T::default(); self.len];
+        // SAFETY: both buffers hold len elements; synchronized before return.
+        unsafe {
+            cutile::cuda_core::memcpy_dtoh_async(
+                out.as_mut_ptr(),
+                self.ptr,
+                self.len,
+                &self.stream,
+            )?;
+            self.stream.synchronize()?;
+        }
+        Ok(out)
+    }
+
+    fn ptr(&self) -> cutile::tile_kernel::DevicePointer<T> {
+        // SAFETY: `ptr` is a live allocation of `len` values of T.
+        unsafe { cutile::tile_kernel::DevicePointer::from_cu_deviceptr(self.ptr) }
+    }
+
+    fn bytes(&self) -> usize {
+        self.len * std::mem::size_of::<T>()
+    }
+}
+
+impl<T> Drop for DeviceVec<T> {
+    fn drop(&mut self) {
+        // SAFETY: allocated by malloc_async on this stream; stream order puts the
+        // free after every kernel that used it.
+        let _ = unsafe { cutile::cuda_core::free_async(self.ptr, &self.stream) };
+    }
+}
+
 struct Gpu {
     stream: Arc<cutile::cuda_core::Stream>,
 }
 
 impl Gpu {
-    fn upload<T: DType + Clone>(&self, data: Vec<T>) -> Result<Tensor<T>, Error> {
-        Ok(api::copy_host_vec_to_device(&Arc::new(data)).sync_on(&self.stream)?)
-    }
-
-    /// Zeroed u64 plane. Tensor dimensions are i32, so large planes are 2-D
-    /// (`[words / 64, 64]`); kernels address them through raw pointers.
-    fn zeros(&self, words: usize) -> Result<Tensor<u64>, Error> {
-        let shape = if words.is_multiple_of(64) {
-            vec![words / 64, 64]
-        } else {
-            vec![words]
-        };
-        Ok(api::zeros::<u64>(&shape).sync_on(&self.stream)?)
+    fn zeros<T: Copy + Default>(&self, len: usize) -> Result<DeviceVec<T>, Error> {
+        DeviceVec::zeroed(&self.stream, len)
     }
 
     /// Solve one material on the GPU; returns the table and phase records.
@@ -542,33 +632,38 @@ impl Gpu {
                 return Err(format!("missing lower table for skeleton piece {k}").into());
             }
         }
-        let lower_bytes = lower_data.len() * 8;
-        let meta = self.upload(meta_table(material, &offsets))?;
-        let lower_dev = self.upload(lower_data)?;
-        let valid = self.zeros(words)?;
+        let meta = DeviceVec::from_host(&self.stream, &meta_table(material, &offsets))?;
+        let lower_dev = DeviceVec::from_host(&self.stream, &lower_data)?;
+        drop(lower_data);
+        let valid = self.zeros::<u64>(words)?;
         let win = [
-            self.zeros(words)?,
-            self.zeros(if ranked { words } else { 1 })?,
+            self.zeros::<u64>(words)?,
+            self.zeros::<u64>(if ranked { words } else { 1 })?,
         ];
         let loss = [
-            self.zeros(words)?,
-            self.zeros(if ranked { words } else { 1 })?,
+            self.zeros::<u64>(words)?,
+            self.zeros::<u64>(if ranked { words } else { 1 })?,
         ];
         // Ranked mode keeps a separate check plane; in place, check bits live
         // in the loss plane until the seed round replaces them by checkmates.
         let check = if ranked {
-            Some(self.zeros(words)?)
+            Some(self.zeros::<u64>(words)?)
         } else {
             None
         };
-        let check_ptr = check.as_ref().unwrap_or(&loss[0]).device_pointer();
-        let mut rank = if ranked {
-            Some(api::full::<u16>(UNRESOLVED, &[words, 64]).sync_on(&self.stream)?)
+        let check_ptr = check.as_ref().unwrap_or(&loss[0]).ptr();
+        let rank = if ranked {
+            // UNRESOLVED is 0xffff: fill every byte with 0xff.
+            Some(DeviceVec::<u16>::filled(&self.stream, 0xff, words * 64)?)
         } else {
             None
         };
-        let planes = if ranked { 6 } else { 3 };
-        let device_bytes = planes * words * 8 + lower_bytes + if ranked { words * 128 } else { 0 };
+        let device_bytes = [&valid, &win[0], &win[1], &loss[0], &loss[1], &lower_dev]
+            .iter()
+            .map(|v| v.bytes())
+            .sum::<usize>()
+            + check.as_ref().map_or(0, |c| c.bytes())
+            + rank.as_ref().map_or(0, |r| r.bytes());
         let grid = ((words / BLOCK) as u32, 1, 1);
         let device = self.stream.device();
         let (event_start, event_end) = (device.new_event()?, device.new_event()?);
@@ -577,7 +672,7 @@ impl Gpu {
         // SAFETY: every pointer addresses a live device tensor sized for this
         // material; kernels touch words < `words` and lower offsets in range.
         unsafe {
-            kernel::statics(valid.device_pointer(), check_ptr, meta.device_pointer(), m)
+            kernel::statics(valid.ptr(), check_ptr, meta.ptr(), m)
                 .grid(grid)
                 .sync_on(&self.stream)?;
         }
@@ -594,22 +689,22 @@ impl Gpu {
             } else {
                 (0, 0)
             };
-            let counter = api::zeros::<i64>(&[1]).sync_on(&self.stream)?;
+            let counter = self.zeros::<i64>(1)?;
             let mode = if round == 0 { "0" } else { "1" };
             event_start.record(&self.stream)?;
             // SAFETY: as above. Ranked mode reads [src] and writes [dst]; in
             // place both are [0], and monotone updates make races benign.
             unsafe {
                 kernel::sweep(
-                    win[dst].device_pointer(),
-                    loss[dst].device_pointer(),
-                    counter.device_pointer(),
-                    win[src].device_pointer(),
-                    loss[src].device_pointer(),
-                    valid.device_pointer(),
+                    win[dst].ptr(),
+                    loss[dst].ptr(),
+                    counter.ptr(),
+                    win[src].ptr(),
+                    loss[src].ptr(),
+                    valid.ptr(),
                     check_ptr,
-                    lower_dev.device_pointer(),
-                    meta.device_pointer(),
+                    lower_dev.ptr(),
+                    meta.ptr(),
                     m,
                 )
                 .generics(vec![mode.into()])
@@ -619,22 +714,22 @@ impl Gpu {
             event_end.record(&self.stream)?;
             event_end.synchronize()?;
             let sweep_event_ms = event_start.elapsed_time(&event_end)?;
-            if let Some(rank) = rank.as_mut() {
+            if let Some(rank) = rank.as_ref() {
                 // SAFETY: the four planes hold `words` words each.
                 unsafe {
                     kernel::ranks(
-                        rank.partition([64, 64]),
-                        win[src].device_pointer(),
-                        loss[src].device_pointer(),
-                        win[dst].device_pointer(),
-                        loss[dst].device_pointer(),
+                        rank.ptr(),
+                        win[src].ptr(),
+                        loss[src].ptr(),
+                        win[dst].ptr(),
+                        loss[dst].ptr(),
                         round as u16,
                     )
                     .grid(grid)
                     .sync_on(&self.stream)?;
                 }
             }
-            let changed = counter.to_host_vec().sync_on(&self.stream)?[0];
+            let changed = counter.to_host()?[0];
             records.push(json!({
                 "round": round, "changed_words": changed,
                 "host_seconds": r0.elapsed().as_secs_f64(), "sweep_event_ms": sweep_event_ms,
@@ -649,11 +744,11 @@ impl Gpu {
         let last = if ranked { rounds as usize % 2 } else { 0 };
         let table = Table {
             material: material.clone(),
-            valid: valid.to_host_vec().sync_on(&self.stream)?,
-            win: win[last].dup().to_host_vec().sync_on(&self.stream)?,
-            loss: loss[last].dup().to_host_vec().sync_on(&self.stream)?,
+            valid: valid.to_host()?,
+            win: win[last].to_host()?,
+            loss: loss[last].to_host()?,
             rank: match rank {
-                Some(r) => r.to_host_vec().sync_on(&self.stream)?,
+                Some(r) => r.to_host()?,
                 None => Vec::new(),
             },
             rounds,
