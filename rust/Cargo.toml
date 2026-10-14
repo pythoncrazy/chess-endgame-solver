@@ -19,4 +19,3 @@ codegen-units = 1
 
 [lints.rust]
 unsafe_code = "forbid"
-

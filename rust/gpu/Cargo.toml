@@ -13,4 +13,3 @@ cutile = { git = "https://github.com/NVIDIA/cuda-rust", rev = "bc46b1ffb75188507
 tablebase-core = { path = ".." }
 serde_json = "1"
 half = "2"
-
