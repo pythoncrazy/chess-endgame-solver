@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import chess
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from server import Store, chess_legal
+from server import PackedTable, Store, TableFormatError, chess_legal
 
 TABLES = Path(sys.argv[1]) if len(sys.argv) > 1 else None
 SYZYGY = Path(sys.argv[2]) if len(sys.argv) > 2 else None
@@ -83,6 +84,22 @@ class KnownPositions(unittest.TestCase):
             board.push_uci(uci)
         self.assertTrue(board.is_checkmate())
         self.assertEqual(len(line), store().probe(fen)["r"])
+
+
+class Codecs(unittest.TestCase):
+    def test_unknown_codec_is_rejected_at_open(self) -> None:
+        source = next(iter(sorted(TABLES.glob("*.tbz"))), None)
+        if source is None:
+            self.skipTest("no .tbz table")
+        data = source.read_bytes()
+        changed = data.replace(b'"codec":"zstd"', b'"codec":"cm"  ', 1)
+        changed = changed.replace(b'"codec":"lzma"', b'"codec":"cm"  ', 1)
+        self.assertNotEqual(data, changed)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / source.name
+            path.write_bytes(changed)
+            with self.assertRaisesRegex(TableFormatError, "codec cm"):
+                PackedTable(path)
 
 
 class SampledAgreement(unittest.TestCase):
