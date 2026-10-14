@@ -107,3 +107,9 @@ Its input is the SHA-256 digests of consecutive 16 MiB payload chunks. The
 payload length as u64 little-endian follows them. `content_sha256` is the
 SHA-256 of the SHA-256 digests of all decompressed blocks, with sections in
 header order. It identifies the content independently of codec and level.
+
+`payload_sha256` does not cover the header. Thus a catalog that trusts a file
+by its payload digest must also compare the material. A full decode checks
+`content_sha256` and `counts` against the decoded table. The decoded blocks of
+a `cm` section are different in positions without a value. Thus the decoder
+uses the blocks that the writer makes from the decoded table.
