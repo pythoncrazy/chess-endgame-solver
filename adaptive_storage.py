@@ -1,9 +1,10 @@
 """Exact signed-32-bit blocks and compact immutable range-readable objects.
 
-Research codec, not a chess indexer or a Syzygy-compatible prober. Encodings
-are selected by actual bytes including headers; external predictions require
-the identical deterministic predictor at decode time and are hash-checked.
-No value rounding, no learned-only answers and no cloud mutations.
+Research codec, not a chess indexer or a Syzygy-compatible prober. The writer
+selects each codec mode by its actual bytes, with headers. An external prediction
+must have the identical deterministic predictor at decode time. A hash checks
+each prediction. The codec does not round values. It gives no learned-only
+answers and does not change cloud data.
 """
 from collections import OrderedDict, defaultdict
 import hashlib
@@ -274,10 +275,11 @@ def write_archive(values,directory,page_positions=65536,object_bytes=1<<30,metri
 
 def write_archive_pages(pages,directory,page_positions=65536,object_bytes=1<<30,metric='integer',
                         level=12,allow_lzma=True,index_page_records=2048,max_pages_per_object=65536,catalog_fields=None):
-    """One-pass streaming writer; at most 16 MiB of payload spool stays in RAM.
+    """One-pass stream writer. At most 16 MiB of payload spool stays in RAM.
 
     Except the last page, every input page must have page_positions cells.
-    Local root replacement is atomic; distributed ownership/CAS is separate.
+    The local root replacement is atomic. Distributed ownership and CAS are a
+    separate problem.
     """
     import os,tempfile
     page_positions=integer(page_positions,'page size',1,MAX_PAGE)

@@ -1,7 +1,8 @@
 """Lossless standard/Chess960 board snapshots and history-aware cache keys.
 
-This represents state and checks draw-claim context; it does not solve a FIDE
-history-state tablebase. A FEN alone cannot certify the prior repetition count.
+This module represents state and checks the context of draw claims. It does
+not solve a FIDE tablebase of history states. A FEN alone cannot certify the
+earlier repetition count.
 """
 from collections import Counter
 import hashlib

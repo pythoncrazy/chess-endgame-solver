@@ -1,8 +1,8 @@
-"""Complete eight-piece budgets and current R2 public rate-card scenarios.
+"""Complete eight-piece budgets and scenarios for the current public R2 rate card.
 
 Dataset count: Kirill Kryukov NULP, 2025-03-05. Storage estimate: tb8gen README.
 Rates checked 2026-10-13 UTC. Units are decimal GB/TB/PB, not GiB/TiB/PiB.
-No prediction of symbolic compression or GPU runtime is made.
+This script does not predict symbolic compression or GPU runtime.
 """
 import json
 import math

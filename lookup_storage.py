@@ -1,8 +1,8 @@
 """Paged authenticated indexes, bounded caches and coalesced range queries.
 
-Single-reader synchronous batch API. Optional bounded parallel range fetches
-require a thread-safe store. Concurrent callers should use separate readers or
-serialize calls; a production shared service still needs single-flight logic.
+Synchronous batch API for one reader. Optional bounded parallel range fetches
+must have a thread-safe store. Concurrent callers should use separate readers or
+serialize calls. A shared production service must also have single-flight logic.
 """
 from collections import OrderedDict,defaultdict
 from concurrent.futures import ThreadPoolExecutor

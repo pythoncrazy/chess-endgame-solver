@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Usage: logrun.sh NAME CMD... ; saves stdout, stderr, exit status and command to $TB_ROOT/logs/NAME.*
+# Usage: logrun.sh NAME CMD...
+# Saves stdout, stderr, exit status and command to $TB_ROOT/logs/NAME.*
 set -u
 TB_ROOT=${TB_ROOT:?set TB_ROOT to the data directory}
 name=$1; shift

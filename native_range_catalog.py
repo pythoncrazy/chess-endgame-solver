@@ -1,8 +1,9 @@
-"""Preserve native Syzygy compression; authenticate physical range tiles.
+"""Keep native Syzygy compression and authenticate physical range tiles.
 
 Adds 32 bytes per 16 KiB source tile and a paged hash directory. Files are
-content-addressed. This publisher never claims a table's chess solution was
-generated or verified merely because its source bytes have been authenticated.
+content-addressed. Authenticated source bytes alone do not prove that someone
+generated or verified the chess solution of a table. This publisher never
+makes that claim.
 """
 import argparse,hashlib,json,os,tempfile,shutil
 from pathlib import Path

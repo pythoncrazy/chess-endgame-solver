@@ -1,9 +1,9 @@
-"""Exact WDL research kernels; this is not a production chess tablebase generator.
+"""Exact WDL research kernels. This is not a production generator of chess tablebases.
 
-States are from the player-to-move perspective: -1 loss, 0 unresolved/draw,
-1 win. Terminal losses and wins are trusted seeds. Terminal draws have no
-outgoing edges and remain zero. Every array must describe a complete legal
-successor relation, including any external dependency represented as a seed.
+States use the view of the player to move: -1 loss, 0 unresolved/draw, 1 win.
+Terminal losses and wins are trusted seeds. Terminal draws have no edges out
+and stay at zero. Every array must describe a complete legal successor
+relation. Represent each external dependency in that relation as a seed.
 """
 from collections import deque
 import random
@@ -11,7 +11,7 @@ import numpy as np
 
 
 def counter_oracle(adjacency, seeds):
-    """Independent linear-edge retrograde reference using predecessor counters."""
+    """Independent retrograde reference with predecessor counters, linear in edges."""
     a = np.asarray(adjacency, dtype=bool)
     state = np.asarray(seeds, dtype=np.int8).copy()
     remaining = a.sum(axis=1).astype(np.int64)
@@ -36,12 +36,14 @@ def counter_oracle(adjacency, seeds):
 def encoded_float_predicates(adjacency, state, block=64):
     """FP16 operand / FP32 accumulator emulation of bounded exact reductions.
 
-    z = 65 * count(nonwinning children) + count(losing children).
-    Each reduction has at most 64 children. z % 65 detects a losing child;
-    z == 0 means every child in that block is winning. Never sum z values
-    across blocks before decoding: the low digit would overflow its radix.
-    NumPy casts the FP16 operands back to FP32 for the multiplication, so
-    this validates the arithmetic, not CUDA tensor-core execution/speed.
+    `z = 65 * nonwin + loss`. Here `nonwin` counts the children that are not
+    a win. `loss` counts the children that are a loss.
+    Each reduction has at most 64 children. `z % 65` finds a child that is a
+    loss. `z == 0` means that every child in that block is a win. Never add z
+    values across blocks before you decode them. The low digit would overflow
+    its radix. NumPy casts the FP16 operands back to FP32 for the
+    multiplication. Thus this validates the arithmetic, not the CUDA execution
+    or speed of tensor cores.
     """
     if not 1 <= block <= 64:
         raise ValueError("block must be between 1 and 64")
@@ -89,7 +91,7 @@ def sharded_dirty_solver(adjacency, seeds, shards=4, rng_seed=0):
     """Asynchronous owner/dirty simulation with delayed duplicate notifications.
 
     Values are globally visible in this CPU model. A production implementation
-    must route proven values or required boundary snapshots with notifications.
+    must route proven values or necessary boundary snapshots with notifications.
     Notifications are idempotent dirty marks, not counter decrements.
     """
     a = np.asarray(adjacency, dtype=bool)
@@ -129,7 +131,7 @@ def sharded_dirty_solver(adjacency, seeds, shards=4, rng_seed=0):
 
 
 def verify_certificate(adjacency, seeds, state, rank):
-    """Reject self-consistent unsupported labels using finite descending ranks."""
+    """Reject self-consistent labels without support. Finite ranks must decrease."""
     a = np.asarray(adjacency, dtype=bool)
     for i, value in enumerate(state):
         children = np.flatnonzero(a[i])
@@ -146,12 +148,13 @@ def verify_certificate(adjacency, seeds, state, rank):
 
 
 def segmented_slider_predicates(occupied, safe_destination, valid_source, state, kind):
-    """Factorized quiet slider operator without constructing a 64x64 relation.
+    """Factorized operator for quiet slider moves, without a 64x64 relation.
 
-    The moving nonking piece is absent from occupied. Other pieces are fixed.
-    Source validity and destination own-king safety are supplied by a legal
-    chess implementation. Captures and other pieces' moves are not included.
-    Reuses one pair of counts for all squares in each unblocked line segment.
+    The non-king piece that moves is absent from occupied. Other pieces are
+    fixed. A legal chess implementation supplies the source validity and the
+    own-king safety of each destination. This operator does not include
+    captures or the moves of other pieces. It uses one pair of counts again
+    for all squares in each unblocked line segment.
     """
     modes = {'rook': (0, 1), 'bishop': (2, 3), 'queen': (0, 1, 2, 3)}[kind]
     occupied = set(occupied)

@@ -1,9 +1,10 @@
-"""Validate exact quotient solving on cyclic games and complete KQvK boards.
+"""Validate the exact quotient solver on cyclic games and complete KQvK boards.
 
-KQvK uses standard chess movement, all legal canonical placements, both sides
-to move, king moves, queen moves, checkmate, stalemate and queen-capture draws.
-No castling/en-passant possibilities exist. Independent Syzygy WDL comparison
-is optional. Terminal DTM ignores the halfmove clock and prior history.
+KQvK uses standard chess movement and all legal canonical placements. It has
+both sides to move, king moves, queen moves, checkmate, stalemate and draws by
+queen capture. Castling and en passant are not possible. The independent
+Syzygy WDL comparison is optional. Terminal DTM ignores the halfmove clock and
+earlier history.
 """
 import argparse
 import json
@@ -27,8 +28,8 @@ def random_checks():
         w,d,stats = solve_quotient(graph,seeds)
         assert np.array_equal(w,expected_w) and np.array_equal(d,expected_d)
         result.append(stats)
-    # Lift a small quotient into many concrete nodes with different concrete
-    # successors but the same sets of successor classes, including cycles.
+    # Lift a small quotient into many concrete nodes, with cycles. These nodes
+    # have different concrete successors but the same sets of successor classes.
     base = [[1,2],[3],[2],[4],[]]; seed = [0,0,0,0,-1]
     copies = 128
     graph=[]; seeds=[]
@@ -112,8 +113,8 @@ def chess_check(chess_path, table_path=None, on_solved=None):
     start=time.perf_counter(); ew,ed=sparse_oracle(graph,seeds); oracle_seconds=time.perf_counter()-start
     if expected: assert np.array_equal(ew[:-1],expected),'Syzygy WDL mismatch'
     if on_solved is not None:on_solved(nodes,graph,ew,ed)
-    # Exact for this exhaustively checked KQvK domain, not a general theorem
-    # about queen endings with other material or arbitrary halfmove clocks.
+    # Exact for this KQvK domain, which the check covers fully. This is not a
+    # general theorem about queen endings with other material or any halfmove clock.
     predictor_mismatches=int(np.count_nonzero(ew[:-1]!=predictor))
     assert predictor_mismatches==0,'KQvK geometric WDL predictor mismatch'
     import zstandard as zstd

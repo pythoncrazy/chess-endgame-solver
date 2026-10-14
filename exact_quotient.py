@@ -1,8 +1,9 @@
-"""Exact strong-bisimulation quotient of a finite alternating game graph.
+"""Exact strong-bisimulation quotient of a finite game graph with alternate turns.
 
-This explicit-graph prototype validates the grouping rule. It still enumerates
-the graph to construct the partition; it is NOT an implicit chess-region proof
-engine and its reduction is not a speedup prediction for eight pieces.
+This prototype uses an explicit graph and validates the group rule. It still
+enumerates the graph to construct the partition. It is NOT an implicit proof
+engine for chess regions. Its reduction does not predict a speedup for eight
+pieces.
 """
 from collections import deque
 import numpy as np
@@ -63,7 +64,7 @@ def refine(successors, seeds, progress=None):
     for i, block in enumerate(colors): blocks[block].append(i)
     quotient = [sorted({colors[j] for j in successors[block[0]]}) for block in blocks]
     qseeds = [int(seeds[block[0]]) for block in blocks]
-    # A separate full check: no grouping based merely on outcome samples.
+    # A separate full check. Outcome samples alone do not decide the groups.
     for k, block in enumerate(blocks):
         reference = tuple(quotient[k])
         for i in block:

@@ -1,5 +1,5 @@
-# Applies to new code in tools/. Supplied oracle scripts are excluded to keep them
-# byte-identical to the ZIP; FILE_HASHES.json records their digests.
+# Applies to new code in tools/. This file excludes the supplied oracle scripts.
+# Thus their code stays as in the ZIP. FILE_HASHES.json records the digests of the ZIP files.
 line-length = 100
 target-version = "py312"
 include = ["tools/**/*.py"]
@@ -7,5 +7,5 @@ include = ["tools/**/*.py"]
 [lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "C4", "PL", "S", "BLE", "TRY", "PTH", "N"]
 ignore = [
-  "PLR2004", # chess constants (e.g. halfmove limits) are clearer inline
+  "PLR2004", # chess constants (for example, halfmove limits) are clearer inline
 ]

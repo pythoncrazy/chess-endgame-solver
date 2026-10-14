@@ -1,8 +1,8 @@
 """Selective cell access to authenticated packed frames, without full unpack.
 
 Only v3 index checksums authorize this path. The writer must verify each full
-decoded page against its source values before committing that checksum.
-Legacy v2 frames retain full decoded-value checksum verification at lookup.
+decoded page against its source values before it commits that checksum.
+Legacy v2 frames keep the full checksum verification of decoded values at lookup.
 """
 import hashlib
 import struct

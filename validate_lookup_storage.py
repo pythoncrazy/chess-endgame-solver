@@ -1,4 +1,4 @@
-"""Verify lookup reductions, index paging, cache churn and exact results."""
+"""Verify lookup reductions, index pages, cache churn and exact results."""
 import json
 from pathlib import Path
 import tempfile
@@ -33,12 +33,12 @@ def validate():
         assert new_store.requests-before==1
         compact_cache_bytes=new.data.size
         assert compact_cache_bytes<=page, 'Packed WDL cache should use at most one byte/cell here'
-        # Constant pages need no frame fetch; warm both relevant index pages.
+        # Constant pages do not fetch a frame. Warm both relevant index pages.
         new.records(0,[10,11]);before=new_store.requests
         constant_ids=np.arange(10*page,12*page)
         assert np.array_equal(new.probe_many(constant_ids),values[constant_ids])
         assert new_store.requests==before
-        # Full round trip with tiny caches, multiple index pages, final partial
+        # Full round trip with tiny caches, many index pages, a final partial
         # page and more IDs than pages. Test serial + parallel fetch planners.
         churn=BatchReader(manifest,LocalRangeStore(directory),data_cache_bytes=page,
                           index_cache_bytes=128,directory_cache_bytes=32,max_bytes=4096,max_parallel_reads=4)
@@ -49,7 +49,7 @@ def validate():
             try:new.probe_many(bad)
             except IndexError:pass
             else:raise AssertionError('invalid ID accepted')
-        # Authenticated index-page failure, independently of directory checksum.
+        # Authenticated index-page failure, independent of the directory checksum.
         o=manifest['objects'][0];path=Path(directory)/o['key'];original=path.read_bytes()
         from adaptive_storage import OBJECT_HEADER
         damaged=bytearray(original);damaged[OBJECT_HEADER.size+o['directory_bytes']]^=1;path.write_bytes(damaged)

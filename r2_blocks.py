@@ -1,7 +1,7 @@
 """Immutable two-bit WDL blocks, Zstandard frames, range reads and batch cache.
 
 Local reference implementation. S3RangeStore supports an already-configured
-S3/R2 client for reads only; this script does not create cloud resources or
+S3/R2 client for reads only. This script does not create cloud resources or
 upload data. This is a research format, not a Syzygy-compatible DTZ format.
 """
 from collections import OrderedDict, defaultdict
@@ -52,7 +52,7 @@ class S3RangeStore:
 
 
 class HttpRangeStore:
-    """Read a deployed range_worker.mjs endpoint; no credentials or uploads."""
+    """Read a deployed range_worker.mjs endpoint. No credentials or uploads."""
     def __init__(self,base_url,timeout=30):
         self.base_url=base_url.rstrip('/')+'/';self.timeout=timeout
         self.requests=0;self.bytes_read=0

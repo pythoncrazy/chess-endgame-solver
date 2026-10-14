@@ -1,4 +1,4 @@
-"""Exact shared knight matrix and occluded slider fills vs six-piece legal moves."""
+"""Exact shared knight matrix and occluded slider fills, compared with six-piece legal moves."""
 import argparse,json,sys,time
 from pathlib import Path
 import numpy as np
@@ -45,7 +45,7 @@ def validate(chess_path,cases=320):
         while True:
             squares=rng.choice(64,5,replace=False).tolist()
             if chess.square_distance(squares[0],squares[1])>1:break
-        # Exactly six pieces after inserting the moving piece; mixed blockers.
+        # Exactly six pieces after we add the piece that moves. Mixed blockers.
         board=chess.Board(None)
         fixed=[(squares[0],chess.KING,chess.WHITE),(squares[1],chess.KING,chess.BLACK),
                (squares[2],chess.ROOK,not color),(squares[3],chess.BISHOP,color),(squares[4],chess.KNIGHT,not color)]
