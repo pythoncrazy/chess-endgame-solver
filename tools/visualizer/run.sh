@@ -4,7 +4,7 @@
 # Tailnet (IPv4 and IPv6, so MagicDNS names work):
 #   tools/visualizer/run.sh 8000 $(tailscale ip -4) $(tailscale ip -6)
 set -euo pipefail
-TB_ROOT=${TB_ROOT:-/home/supersketchy/git/chess-solver/tb}
+TB_ROOT=${TB_ROOT:?set TB_ROOT to the data directory}
 PORT=${1:-8642}
 shift || true
 HOSTS=("${@:-127.0.0.1}")
