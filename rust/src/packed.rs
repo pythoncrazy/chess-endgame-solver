@@ -489,7 +489,7 @@ fn black_start(layout: &Layout) -> usize {
     10 * layout.per
 }
 
-/// Decompressed WDL block `b`: 4096 stored words, four positions per byte.
+/// Decompressed WDL block `b`: `BLOCK / 16` stored words, four positions per byte.
 /// With white-only ranks, black-to-move wins of rank 1 take code 3.
 fn wdl_block(layout: &Layout, c: &Canonical, b: usize, sides: RankSides) -> Vec<u8> {
     let words_per_block = BLOCK / 16;

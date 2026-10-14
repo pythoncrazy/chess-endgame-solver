@@ -789,8 +789,8 @@ mod kernel {
 
     /// One round. MODE 0 seeds checkmates. MODE 1 derives wins and losses from
     /// `input` and commits them into `output`. In place, these are the same buffer.
-    /// MODE 1 evaluates only the blocks that `dirty` flags. It records in
-    /// `changed` which blocks changed. Skipped blocks keep both buffers valid,
+    /// MODE 1 evaluates only the words that `dirty` flags. It records in
+    /// `changed` which words changed. Skipped words keep both buffers valid,
     /// because they and their children did not change in the last round.
     // On the H100 NVL, occupancy 12 with 2 worker warps was the fastest.
     // Time per KQBvKR sweep: occupancy 12: 10.2 ms, occupancy 16: 10.45 ms.
@@ -1445,8 +1445,17 @@ impl Gpu {
         let rank =
             DeviceVec::<u16>::filled(&self.stream, 0xff, if ranked { words * 64 } else { 1 })?;
         let mut round_value = DeviceVec::<u16>::zeroed(&self.stream, 1)?;
-        let device_bytes =
-            state[0].bytes() + state[1].bytes() + check.bytes() + lower_dev.bytes() + rank.bytes();
+        // Per-word frontier flags: `dirty` gates the next sweep, and every
+        // sweep writes `changed`.
+        let dirty = DeviceVec::<i32>::filled(&self.stream, 1, words)?;
+        let changed_flags = DeviceVec::<i32>::zeroed(&self.stream, words)?;
+        let device_bytes = state[0].bytes()
+            + state[1].bytes()
+            + check.bytes()
+            + lower_dev.bytes()
+            + rank.bytes()
+            + dirty.bytes()
+            + changed_flags.bytes();
         let grid = launch_grid(words);
         let device = self.stream.device();
         let (event_start, event_mid, event_end) = (
@@ -1476,16 +1485,13 @@ impl Gpu {
             }
         }
         let statics_seconds = t0.elapsed().as_secs_f64();
-        // Per-word frontier flags: `dirty` gates the next sweep, and every
-        // sweep writes `changed`.
-        let dirty = DeviceVec::<i32>::filled(&self.stream, 1, words)?;
-        let changed_flags = DeviceVec::<i32>::zeroed(&self.stream, words)?;
         let frontier_limit = (self.frontier * words as f64) as i64;
         let mut last_changed = i64::MAX;
         let mut rounds = 0u32;
         let mut records_log = Vec::new();
         for round in 0u32.. {
-            if round >= u32::from(UNRESOLVED) {
+            // Round r writes proof rank r. UNRESOLVED is not a rank.
+            if ranked && round >= u32::from(UNRESOLVED) {
                 return Err("proof rank exceeds the 16-bit representation".into());
             }
             let r0 = Instant::now();
@@ -1502,7 +1508,7 @@ impl Gpu {
             let frontier = round >= 2 && last_changed <= frontier_limit;
             event_start.record(&self.stream)?;
             if frontier {
-                // SAFETY: flag buffers hold one i32 per block. Stream ordered.
+                // SAFETY: flag buffers hold one i32 per word. Stream ordered.
                 unsafe {
                     cutile::cuda_core::memset_d8_async(dirty.ptr, 0, dirty.bytes(), &self.stream)?;
                     kernel::mark(dirty.ptr(), changed_flags.ptr(), meta.ptr())
@@ -1510,7 +1516,7 @@ impl Gpu {
                         .sync_on(&self.stream)?;
                 }
             } else if round >= 2 {
-                // SAFETY: as above. Nonzero bytes flag every block.
+                // SAFETY: as above. Nonzero bytes flag every word.
                 unsafe {
                     cutile::cuda_core::memset_d8_async(dirty.ptr, 1, dirty.bytes(), &self.stream)?;
                 }
@@ -1789,17 +1795,41 @@ fn solve_all(
     level: i32,
     threads: usize,
 ) -> Result<serde_json::Value, Error> {
+    if pieces > 5 {
+        // A ranked six-piece solve uses more than 300 GB of device memory.
+        return Err(format!(
+            "--all {pieces}: ranked solves fit in device memory up to 5 pieces. \
+             Solve a six-piece tree with `gpu_solve MATERIAL OUTPUT_DIRECTORY`."
+        )
+        .into());
+    }
     let materials = all_materials(pieces)?;
+    let (send, receive) = std::sync::mpsc::sync_channel::<Job>(2);
+    let writer = std::thread::spawn(move || write_jobs(receive, level, threads));
+    let mut resumed = Vec::new();
+    let solved = solve_all_into(gpu, &materials, output, threads, &send, &mut resumed);
+    drop(send);
+    // Let the writer finish the tables it has before an error stops the process.
+    let tables = writer.join().map_err(|_| "writer thread panicked")?;
+    solved?;
+    Ok(json!({"materials": materials.len(), "resumed_verified_tables": resumed, "tables": tables?}))
+}
+
+fn solve_all_into(
+    gpu: &Gpu,
+    materials: &[Material],
+    output: &std::path::Path,
+    threads: usize,
+    send: &std::sync::mpsc::SyncSender<Job>,
+    resumed: &mut Vec<serde_json::Value>,
+) -> Result<(), Error> {
     let max_skeleton = materials
         .iter()
         .map(Material::skeleton_len)
         .max()
         .unwrap_or(1);
-    let (send, receive) = std::sync::mpsc::sync_channel::<Job>(2);
-    let writer = std::thread::spawn(move || write_jobs(receive, level, threads));
     let mut solved = Solved::new();
-    let mut resumed = Vec::new();
-    for m in &materials {
+    for m in materials {
         let name = m.name();
         let path = output.join(format!("{name}.tbz"));
         let needed_below = m.skeleton_len() < max_skeleton;
@@ -1852,9 +1882,7 @@ fn solve_all(
             break;
         }
     }
-    drop(send);
-    let tables = writer.join().map_err(|_| "writer thread panicked")??;
-    Ok(json!({"materials": materials.len(), "resumed_verified_tables": resumed, "tables": tables}))
+    Ok(())
 }
 
 fn main() -> Result<(), Error> {
@@ -1910,10 +1938,6 @@ fn solve_one_tree(
             .map_err(|e| e.to_string())?;
         let table = solution.table.ok_or("full table missing")?;
         let timing = solution.record;
-        let t = Instant::now();
-        let path = output.join(format!("{}.gpu.tbp", m.name()));
-        let file = File::create(&path).map_err(|e| e.to_string())?;
-        let header = table.write(BufWriter::new(file), GENERATOR)?;
         let counts = table.counts();
         if counts != solution.counts || solution.violations != 0 {
             return Err(format!(
@@ -1923,6 +1947,21 @@ fn solve_one_tree(
                 solution.violations
             ));
         }
+        let t = Instant::now();
+        let path = output.join(format!("{}.gpu.tbp", m.name()));
+        // A resumed run reads each .gpu.tbp. Thus write a full file or none.
+        let partial = path.with_extension("tbp.partial");
+        let file = File::create(&partial).map_err(|e| e.to_string())?;
+        let header = table
+            .write(BufWriter::new(file), GENERATOR)
+            .and_then(|h| {
+                std::fs::rename(&partial, &path)
+                    .map(|()| h)
+                    .map_err(|e| e.to_string())
+            })
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&partial);
+            })?;
         records_out.push(json!({
             "material": m.name(), "rounds": table.rounds, "timing": timing,
             "write_seconds": t.elapsed().as_secs_f64(),
@@ -1934,12 +1973,31 @@ fn solve_one_tree(
     // Restart: reuse completed tables whose payload digest verifies.
     let mut solved = Solved::new();
     let mut resumed = Vec::new();
-    for entry in std::fs::read_dir(output)? {
-        let path = entry?.path();
+    // Reuse only intact tables written by this exact clean build.
+    let entries = if GENERATOR.ends_with("+dirty") {
+        Vec::new()
+    } else {
+        std::fs::read_dir(output)?.collect::<Result<Vec<_>, _>>()?
+    };
+    for entry in entries {
+        let path = entry.path();
         if path.to_string_lossy().ends_with(".gpu.tbp") {
-            let (table, header) = Table::read(std::io::BufReader::new(File::open(&path)?))?;
-            // Reuse only intact tables written by this exact clean build.
-            if GENERATOR.ends_with("+dirty") || header.generator != GENERATOR {
+            let read = File::open(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|f| Table::read(std::io::BufReader::new(f)));
+            let (table, header) = match read {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("not resuming {} ({e})", path.display());
+                    continue;
+                }
+            };
+            if header.generator != GENERATOR
+                || Some(header.material.as_str())
+                    != path
+                        .file_name()
+                        .and_then(|n| n.to_str()?.strip_suffix(".gpu.tbp"))
+            {
                 eprintln!(
                     "not resuming {} (generator {:?})",
                     path.display(),
