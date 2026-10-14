@@ -53,11 +53,9 @@ absent, the archive Reader rejects the frame and does not guess a result.
 GPU development uses the **current NVIDIA/cuda-rust project**. Its Tile crate
 has the name `cutile`. `gpu/Cargo.toml` pins revision
 `bc46b1ffb751885073066b087594045f07f0f81b`. The GPU workspace is independent,
-so the CPU storage tests do not build CUDA dependencies. Its source uses the
-inspected API and has the standard format. But GPU host/JIT compilation is
-**unverified**. A trial build stopped in cuda-bindings, because this
-environment has no CUDA toolkit. The GPU lockfile records the resolved
-dependency graph.
+so the CPU storage tests do not build CUDA dependencies. The GPU workspace
+builds and runs on an H100 NVL with CUDA 13.3. CI does not build it, because CI
+has no CUDA toolkit. The GPU lockfile records the resolved dependency graph.
 
 On the H100 machine, install a compatible driver and a CUDA toolkit with Hopper
 Tile IR support. This pinned upstream must have Tile IR 13.3 or later. Then run:
