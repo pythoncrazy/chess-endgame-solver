@@ -1956,7 +1956,7 @@ fn main() -> Result<(), Error> {
     };
     let device_init_seconds = init.elapsed().as_secs_f64();
     let mut report = if all {
-        let level = args.next().map_or(Ok(19), |v| v.parse())?;
+        let level = args.next().map_or(Ok(15), |v| v.parse())?;
         let threads = args.next().map_or(Ok(20), |v| v.parse())?;
         solve_all(&gpu, target.parse()?, &output, level, threads)?
     } else {
