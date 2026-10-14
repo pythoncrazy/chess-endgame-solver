@@ -1,5 +1,6 @@
 //! Exact CPU reference and range-readable archive core. GPU kernels live separately.
 pub mod archive;
+pub mod cm;
 pub mod codec;
 pub mod dense6;
 pub mod encode;

@@ -4,7 +4,7 @@ use std::{fs::File, io::BufWriter, path::PathBuf, time::Instant};
 use tablebase_core::packed::{self, Canonical, Codec, PackedTable, RankSides, WriteOptions};
 
 fn main() -> Result<(), String> {
-    let usage = "usage: tb_pack [--level L] [--wdl-codec zstd|lzma] [--rank-codec zstd|lzma] \
+    let usage = "usage: tb_pack [--level L] [--wdl-codec zstd|lzma|cm] [--rank-codec zstd|lzma|cm] \
                  [--ranks both|white] [--threads T] [--check] [--probes N] OUTPUT_DIRECTORY TABLE...";
     let mut args = std::env::args().skip(1).peekable();
     let (mut options, mut threads, mut check, mut probes) =
@@ -12,6 +12,7 @@ fn main() -> Result<(), String> {
     let codec = |v: Option<String>| match v.as_deref() {
         Some("zstd") => Ok(Codec::Zstd),
         Some("lzma") => Ok(Codec::Lzma),
+        Some("cm") => Ok(Codec::Cm),
         _ => Err(usage.to_string()),
     };
     while let Some(flag) = args.next_if(|a| a.starts_with("--")) {
