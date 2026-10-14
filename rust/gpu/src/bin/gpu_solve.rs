@@ -1596,9 +1596,10 @@ impl Gpu {
             Some(layout) => {
                 // Stored words form 20 contiguous runs of the full layout.
                 let per = layout.words() / 20;
-                let mut flat = vec![0u64; 2 * layout.words()];
-                for (run, dst) in flat.chunks_mut(2 * per).enumerate() {
-                    state[last].read_into(2 * layout.full_word(run * per), dst)?;
+                let mut records = vec![[0u64; 2]; layout.words()];
+                for (run, dst) in records.chunks_mut(per).enumerate() {
+                    state[last]
+                        .read_into(2 * layout.full_word(run * per), dst.as_flattened_mut())?;
                 }
                 let mut stored_rank = Vec::new();
                 if ranked {
@@ -1610,7 +1611,7 @@ impl Gpu {
                 Some(Canonical {
                     material: material.clone(),
                     rounds,
-                    records: flat.as_chunks::<2>().0.to_vec(),
+                    records,
                     rank: stored_rank,
                     counts: Some(counts),
                 })
