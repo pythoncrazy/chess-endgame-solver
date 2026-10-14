@@ -2023,6 +2023,8 @@ fn main() -> Result<(), Error> {
     jit_cache::enable(Arc::new(FileSystemJitStore::default_location()?));
     let init = Instant::now();
     let device = cutile::cuda_core::Device::new(0)?;
+    // With the default threshold of zero, each table maps its device memory again.
+    device.default_mem_pool()?.set_release_threshold(16 << 30)?;
     warm_kernels(&device);
     let gpu = Gpu {
         stream: device.new_stream()?,
