@@ -912,6 +912,28 @@ impl Symmetry {
         }
         x
     }
+
+    /// Map a bitboard from the image domain back to the source domain:
+    /// bit `bk` of the result equals bit `self.square(bk)` of `y`.
+    pub fn inverse_bitboard(self, mut y: u64) -> u64 {
+        if self.mirror_ranks {
+            y = y.swap_bytes();
+        }
+        if self.mirror_files {
+            y = ((y >> 1) & 0x5555_5555_5555_5555) | ((y & 0x5555_5555_5555_5555) << 1);
+            y = ((y >> 2) & 0x3333_3333_3333_3333) | ((y & 0x3333_3333_3333_3333) << 2);
+            y = ((y >> 4) & 0x0f0f_0f0f_0f0f_0f0f) | ((y & 0x0f0f_0f0f_0f0f_0f0f) << 4);
+        }
+        if self.transpose {
+            let t = 0x0f0f_0f0f_0000_0000 & (y ^ (y << 28));
+            y ^= t ^ (t >> 28);
+            let t = 0x3333_0000_3333_0000 & (y ^ (y << 14));
+            y ^= t ^ (t >> 14);
+            let t = 0x5500_5500_5500_5500 & (y ^ (y << 7));
+            y ^= t ^ (t >> 7);
+        }
+        y
+    }
 }
 
 /// White-king squares of the a1-d1-d4 triangle; every position has a

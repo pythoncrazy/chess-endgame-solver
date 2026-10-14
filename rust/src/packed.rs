@@ -52,8 +52,54 @@ const BLOCK_CACHE: usize = 256;
 /// Decompressed blocks keyed by (rank section, block number).
 type BlockCache = LruCache<(bool, usize), Arc<Vec<u8>>>;
 
+const TRIANGLE_LOOKUP: [Option<usize>; 64] = {
+    let mut table = [None; 64];
+    let mut i = 0;
+    while i < TRIANGLE.len() {
+        table[TRIANGLE[i] as usize] = Some(i);
+        i += 1;
+    }
+    table
+};
+
+const TO_TRIANGLE: [Symmetry; 64] = {
+    let mut table = [Symmetry {
+        transpose: false,
+        mirror_files: false,
+        mirror_ranks: false,
+    }; 64];
+    let mut sq = 0usize;
+    while sq < 64 {
+        let mut b = 0u8;
+        while b < 8 {
+            let g = Symmetry {
+                transpose: b & 1 != 0,
+                mirror_files: b & 2 != 0,
+                mirror_ranks: b & 4 != 0,
+            };
+            let mut s = sq as u8;
+            if g.transpose {
+                s = ((s & 7) << 3) | (s >> 3);
+            }
+            if g.mirror_files {
+                s ^= 7;
+            }
+            if g.mirror_ranks {
+                s ^= 56;
+            }
+            if TRIANGLE_LOOKUP[s as usize].is_some() {
+                table[sq] = g;
+                break;
+            }
+            b += 1;
+        }
+        sq += 1;
+    }
+    table
+};
+
 fn triangle_index(square: u8) -> Option<usize> {
-    TRIANGLE.iter().position(|&t| t == square)
+    TRIANGLE_LOOKUP[usize::from(square)]
 }
 
 fn on_diagonal(square: u8) -> bool {
@@ -63,9 +109,7 @@ fn on_diagonal(square: u8) -> bool {
 /// The symmetry that moves `square` into the triangle (the identity or the
 /// transpose both qualify on the diagonal; the identity form is returned).
 fn to_triangle(square: u8) -> Symmetry {
-    Symmetry::all()
-        .find(|g| triangle_index(g.square(square)).is_some())
-        .expect("every square has an image in the triangle")
+    TO_TRIANGLE[usize::from(square)]
 }
 
 /// Where a full-layout word's values live in the stored stream.
@@ -90,6 +134,18 @@ impl Image {
             t = TRANSPOSE.square(t);
         }
         t
+    }
+
+    /// Map a bitboard from the stored word (`self.word`) back to the full word.
+    fn bitboard(&self, mut y: u64) -> u64 {
+        if self.per_square {
+            let lower = y & LOWER_RIGHT;
+            y = lower | TRANSPOSE.bitboard(lower);
+        }
+        if self.transpose {
+            y = TRANSPOSE.bitboard(y);
+        }
+        self.g.inverse_bitboard(y)
     }
 }
 
@@ -341,8 +397,12 @@ fn parallel<T: Send>(
 /// Stored, legal positions of stored word `cw`.
 fn stored_bits(layout: &Layout, c: &Canonical, cw: usize) -> u64 {
     let [win, loss] = c.records[cw];
+    let valid = !(win & loss);
+    if valid == 0 {
+        return 0;
+    }
     let (_, squares) = layout.material.decode(layout.full_word(cw));
-    layout.stored_mask(&squares) & !(win & loss)
+    layout.stored_mask(&squares) & valid
 }
 
 /// Decompressed WDL block `b`: 4096 stored words, four positions per byte.
@@ -352,17 +412,15 @@ fn wdl_block(layout: &Layout, c: &Canonical, b: usize) -> Vec<u8> {
     let mut out = vec![0u8; range.len() * 16];
     let mut prev = 0u8;
     for (i, cw) in range.enumerate() {
-        let stored = stored_bits(layout, c, cw);
         let [win, loss] = c.records[cw];
+        let stored = stored_bits(layout, c, cw);
+        if stored == 0 {
+            out[i * 16..(i + 1) * 16].fill(prev * 0x55);
+            continue;
+        }
         for bk in 0..64 {
             if stored >> bk & 1 != 0 {
-                prev = if win >> bk & 1 != 0 {
-                    1
-                } else if loss >> bk & 1 != 0 {
-                    2
-                } else {
-                    0
-                };
+                prev = ((win >> bk & 1) as u8) | (((loss >> bk & 1) as u8) << 1);
             }
             let p = i * 64 + bk;
             out[p / 4] |= prev << (2 * (p % 4));
@@ -380,6 +438,17 @@ fn rank_block(layout: &Layout, c: &Canonical, b: usize, width: usize) -> Vec<u8>
     for (i, cw) in range.enumerate() {
         let [win, loss] = c.records[cw];
         let decisive = stored_bits(layout, c, cw) & (win | loss);
+        if decisive == 0 {
+            if width == 1 {
+                out[i * 64..(i + 1) * 64].fill(prev as u8);
+            } else {
+                let bytes = prev.to_le_bytes();
+                for dst in out[i * 128..(i + 1) * 128].as_chunks_mut::<2>().0 {
+                    dst.copy_from_slice(&bytes);
+                }
+            }
+            continue;
+        }
         for bk in 0..64 {
             if decisive >> bk & 1 != 0 {
                 prev = c.rank[cw * 64 + bk];
@@ -427,7 +496,25 @@ pub fn write(
                 rank_block(&layout, c, b, width)
             };
             let digest: [u8; 32] = Sha256::digest(&raw).into();
-            let frame = zstd::bulk::compress(&raw, level).map_err(|e| e.to_string())?;
+            thread_local! {
+                static COMPRESSOR: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            let frame = COMPRESSOR.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                if borrow.as_ref().is_none_or(|(l, _)| *l != level) {
+                    *borrow = Some((
+                        level,
+                        zstd::bulk::Compressor::new(level).map_err(|e| e.to_string())?,
+                    ));
+                }
+                borrow
+                    .as_mut()
+                    .unwrap()
+                    .1
+                    .compress(&raw)
+                    .map_err(|e| e.to_string())
+            })?;
             Ok((digest, frame))
         })?;
         let offset = payload.len() as u64;
@@ -678,33 +765,31 @@ impl PackedTable {
             Some(s) => self.section_bytes(s, threads)?,
             None => Vec::new(),
         };
-        let words = material.words();
         let ranked = width > 0;
-        let chunk = 1usize << 12;
-        let parts = parallel(words.div_ceil(chunk), threads, |part| {
-            let range = part * chunk..((part + 1) * chunk).min(words);
+        let stored_words = layout.words();
+        let sc = 1usize << 12;
+        let stored_parts = parallel(stored_words.div_ceil(sc), threads, |part| {
+            let range = part * sc..((part + 1) * sc).min(stored_words);
             let mut planes = Vec::with_capacity(range.len());
             let mut ranks = Vec::with_capacity(if ranked { range.len() * 64 } else { 0 });
-            for w in range {
+            for cw in range {
+                let w = layout.full_word(cw);
                 let valid = statics(&self.geometry, &material, w).valid;
-                let (black, squares) = material.decode(w);
-                let image = layout.image(black, &squares[..layout.m]);
                 let (mut win, mut loss) = (0u64, 0u64);
                 let mut word_rank = [UNRESOLVED; 64];
-                let mut bits = valid;
-                while bits != 0 {
-                    let bk = bits.trailing_zeros() as u8;
-                    bits &= bits - 1;
-                    let p = image.word * 64 + usize::from(image.square(bk));
+                for (bk, slot) in word_rank.iter_mut().enumerate() {
+                    let p = cw * 64 + bk;
                     let code = wdl[p / 4] >> (2 * (p % 4)) & 3;
-                    win |= u64::from(code == 1) << bk;
-                    loss |= u64::from(code == 2) << bk;
-                    if ranked && code != 0 {
-                        word_rank[usize::from(bk)] = if width == 1 {
-                            u16::from(rank_raw[p])
-                        } else {
-                            u16::from_le_bytes([rank_raw[2 * p], rank_raw[2 * p + 1]])
-                        };
+                    if valid >> bk & 1 != 0 {
+                        win |= u64::from(code == 1) << bk;
+                        loss |= u64::from(code == 2) << bk;
+                        if ranked && code != 0 {
+                            *slot = if width == 1 {
+                                u16::from(rank_raw[p])
+                            } else {
+                                u16::from_le_bytes([rank_raw[2 * p], rank_raw[2 * p + 1]])
+                            };
+                        }
                     }
                 }
                 planes.push([valid, win, loss]);
@@ -714,22 +799,67 @@ impl PackedTable {
             }
             Ok((planes, ranks))
         })?;
+        let mut s_planes = Vec::with_capacity(stored_words);
+        let mut s_ranks = Vec::with_capacity(if ranked { stored_words * 64 } else { 0 });
+        for (p, r) in stored_parts {
+            s_planes.extend_from_slice(&p);
+            s_ranks.extend_from_slice(&r);
+        }
+
+        let words = material.words();
         let mut table = Table {
-            material,
-            valid: Vec::with_capacity(words),
-            win: Vec::with_capacity(words),
-            loss: Vec::with_capacity(words),
-            rank: Vec::with_capacity(if ranked { words * 64 } else { 0 }),
+            material: material.clone(),
+            valid: vec![0u64; words],
+            win: vec![0u64; words],
+            loss: vec![0u64; words],
+            rank: vec![0u16; if ranked { words * 64 } else { 0 }],
             rounds: self.header.rounds,
         };
-        for (planes, ranks) in parts {
-            for [v, w, l] in planes {
-                table.valid.push(v);
-                table.win.push(w);
-                table.loss.push(l);
+        // Every other word is a symmetric image of a stored word: map its
+        // planes with O(1) bitboard symmetries instead of re-deriving them.
+        let chunk = 1usize << 16;
+        let mut rank_chunks = table.rank.chunks_mut(chunk * 64);
+        let work: Vec<_> = table
+            .valid
+            .chunks_mut(chunk)
+            .zip(table.win.chunks_mut(chunk))
+            .zip(table.loss.chunks_mut(chunk))
+            .enumerate()
+            .map(|(part, ((v, w), l))| (part * chunk, v, w, l, rank_chunks.next()))
+            .collect();
+        let workers = threads.clamp(1, work.len().max(1));
+        let work = Mutex::new(work.into_iter());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let next = work.lock().expect("work").next();
+                        let Some((w0, vs, ws, ls, mut rs)) = next else {
+                            break;
+                        };
+                        for i in 0..vs.len() {
+                            let (black, squares) = material.decode(w0 + i);
+                            let image = layout.image(black, &squares[..layout.m]);
+                            let [sv, sw, sl] = s_planes[image.word];
+                            vs[i] = image.bitboard(sv);
+                            ws[i] = image.bitboard(sw);
+                            ls[i] = image.bitboard(sl);
+                            if let Some(r) = rs.as_deref_mut() {
+                                let dst = &mut r[i * 64..(i + 1) * 64];
+                                dst.fill(UNRESOLVED);
+                                let mut bits = ws[i] | ls[i];
+                                while bits != 0 {
+                                    let bk = bits.trailing_zeros() as u8;
+                                    bits &= bits - 1;
+                                    dst[usize::from(bk)] =
+                                        s_ranks[image.word * 64 + usize::from(image.square(bk))];
+                                }
+                            }
+                        }
+                    }
+                });
             }
-            table.rank.extend_from_slice(&ranks);
-        }
+        });
         Ok(table)
     }
 }

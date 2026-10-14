@@ -244,9 +244,13 @@ fn check_position(
     let smaller = |r: Option<u16>| r.is_none_or(|r| r < rank);
     // Over all children: a losing child of smaller rank, a losing child, a
     // nonwinning child, and whether every child is a win of smaller rank.
+    // The loop stops once the obligation's outcome is settled; a skipped
+    // child's legality is covered by its own stored image and the symmetry
+    // check. Checkmates (rank 0) need no child at all.
     let (mut proving_loss, mut any_loss, mut any_nonwin, mut all_smaller_wins) =
         (false, false, false, true);
-    for m in &moves {
+    let probe_children = !(value == -2 && rank == 0);
+    for m in moves.iter().filter(|_| probe_children) {
         let mut child = pos.clone();
         child.play_unchecked(*m);
         let (v, r) = child_value(ctx, &child, m.capture())?;
@@ -254,6 +258,14 @@ fn check_position(
         any_loss |= v == -2;
         any_nonwin |= v != 2;
         all_smaller_wins &= v == 2 && smaller(r);
+        let settled = match value {
+            2 => proving_loss,
+            -2 => !all_smaller_wins,
+            _ => any_loss,
+        };
+        if settled {
+            break;
+        }
     }
     let ok = match value {
         2 => proving_loss,
@@ -399,8 +411,12 @@ fn verify_table(
     let start = Instant::now();
     let tally = Tally::default();
     let first_failure = std::sync::Mutex::new(None::<String>);
-    let words = table.valid.len();
     let layout = Layout::new(&table.material);
+    // Stored scope walks only the stored words (white king in the triangle).
+    let words = match scope {
+        Scope::Stored => layout.words(),
+        _ => table.valid.len(),
+    };
     let ctx = Context::new(tables, table);
     // Dynamic chunks: canonical words sit in contiguous index ranges, so a
     // static split would leave most threads idle.
@@ -417,7 +433,11 @@ fn verify_table(
                         break;
                     }
                     let mut counts = Counts::default();
-                    for word in start..(start + CHUNK).min(words) {
+                    for index in start..(start + CHUNK).min(words) {
+                        let word = match scope {
+                            Scope::Stored => layout.full_word(index),
+                            _ => index,
+                        };
                         let mut squares = match scope {
                             Scope::All => u64::MAX,
                             Scope::Canonical => {
