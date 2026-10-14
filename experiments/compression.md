@@ -116,3 +116,82 @@ Decision: Make a real coder from the mixer.
 - The coder must have a fast decoder for single probes.
 - Smaller blocks decrease the probe time but increase the size.
 - A GPU can code thousands of blocks in parallel for the packer.
+
+## E3: run contexts for WDL
+
+Question: Do run lengths help the WDL models?
+
+Method: The walk counts three runs inside the block.
+
+- The run of values that are equal to the previous coded value.
+- The run of values that are equal to the value at word distance 1.
+- The run of values that are equal to the value of the left square.
+
+Three new models use these runs in buckets 0, 1, 2-3, 4-7 and up to 64.
+
+Results for the adaptive mixer with the v4 block sizes:
+
+| Table | WDL before | WDL after | Change |
+|---|---|---|---|
+| KQvKR | 13,245 | 12,106 | -8.6% |
+| KRvKB | 38,939 | 36,635 | -5.9% |
+| KQBvKR | 899,545 | 807,568 | -10.2% |
+| KRNvKQ | 7,471,247 | 7,030,928 | -5.9% |
+| KBNvKN | 3,470,769 | 3,311,138 | -4.6% |
+
+The adaptive total for all sections is now 30,597,262 bytes.
+This is 39% smaller than zstd.
+
+Decision: Keep the run contexts.
+
+## E4: semi-static mixer for small blocks
+
+Question: Can a fixed model replace the adaptive model?
+
+An adaptive model has two problems.
+
+- A decoder must decode the block from the start. A probe is thus slow.
+- Each block is a sequence. The GPU can only use one thread for each block.
+
+A fixed model gives each decision a probability from its contexts only.
+Thus all decisions of a block are independent.
+A GPU can find all probabilities in parallel. An interleaved rANS coder can then code them.
+Small blocks do not lose model data, because the model is in the header.
+
+Method:
+
+1. Count the bits of each context and decision over the full table.
+2. Keep a 12-bit probability for each context with TB_PRUNE bits or more. Other contexts give the mixer a zero input.
+3. Train the mixer weights for two epochs on each eighth block.
+4. Find the code length with the fixed model and fixed weights.
+5. Find the header size: zstd level 19 on a presence bitmap and the 12-bit values.
+
+A WDL block has 256 words (16384 positions). A rank block has 64 words (4096 positions).
+These blocks are 64 times smaller than the v4 blocks.
+
+Results with TB_PRUNE 64:
+
+| Table | WDL data | WDL header | Rank data | Rank header |
+|---|---|---|---|---|
+| KQvKR | 25,451 | 20,270 | 316,183 | 38,150 |
+| KRvKB | 63,004 | 9,685 | 26,009 | 4,374 |
+| KQBvKR | 1,714,464 | 50,266 | 11,832,153 | 86,040 |
+| KRNvKQ | 9,278,925 | 241,102 | 5,964,389 | 113,561 |
+| KBNvKN | 4,343,456 | 18,049 | 3,130,388 | 54,769 |
+
+| TB_PRUNE | Data | Header | Total |
+|---|---|---|---|
+| 1 | 36,574,818 | 1,118,612 | 37,693,430 |
+| 16 | 36,610,929 | 860,828 | 37,471,757 |
+| 64 | 36,694,422 | 636,266 | 37,330,688 |
+
+The total is 26% smaller than zstd. The adaptive mixer is 39% smaller.
+The fixed model is almost equal to the adaptive model on rank.
+It is worse on WDL, because the WDL data changes inside a table.
+
+A test with v4 block sizes shows the cause of the WDL loss.
+With these blocks, the fixed WDL model of KQBvKR is 1,578,638 bytes. The adaptive model is 807,568 bytes.
+Thus the block size is not the cause. The cause is the fixed model.
+
+Decision: Use the fixed model for the rank section.
+Find a better fixed model for WDL, or use the adaptive model for WDL.
