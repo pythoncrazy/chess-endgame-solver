@@ -1885,6 +1885,56 @@ fn solve_all_into(
     Ok(())
 }
 
+type Compile = Box<dyn FnOnce(&Arc<cutile::cuda_core::Stream>) + Send>;
+
+/// Compile the kernels on background threads, one specialization per thread.
+/// The cuTile frontend runs at the first launch of each specialization. It
+/// runs also on a disk-cache hit, and takes about 1.3 s for each sweep. A launch
+/// waits for a compile that is in progress. A failed compile fails again at its launch.
+fn warm_kernels(device: &Arc<cutile::cuda_core::Device>) {
+    fn null<T>() -> cutile::tile_kernel::DevicePointer<T> {
+        // SAFETY: a compile-only launcher never dereferences its pointers.
+        unsafe { cutile::tile_kernel::DevicePointer::from_cu_deviceptr(0) }
+    }
+    let mut jobs: Vec<Compile> = vec![
+        Box::new(move |s| {
+            let _ = unsafe { kernel::statics(null(), null(), null()) }.compile_on(s);
+        }),
+        Box::new(move |s| {
+            let _ = unsafe { kernel::mark(null(), null(), null()) }.compile_on(s);
+        }),
+        Box::new(move |s| {
+            let _ = unsafe { kernel::finish(null(), null(), null()) }.compile_on(s);
+        }),
+    ];
+    for mode in ["0", "1"] {
+        jobs.push(Box::new(move |s| {
+            let sweep = unsafe {
+                kernel::sweep(
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                    null(),
+                )
+            };
+            let _ = sweep.generics(vec![mode.into(), "1".into()]).compile_on(s);
+        }));
+    }
+    for job in jobs {
+        if let Ok(stream) = device.new_stream() {
+            std::thread::spawn(move || job(&stream));
+        }
+    }
+}
+
 fn main() -> Result<(), Error> {
     let wall = Instant::now();
     let mut args = std::env::args().skip(1).peekable();
@@ -1898,6 +1948,7 @@ fn main() -> Result<(), Error> {
     jit_cache::enable(Arc::new(FileSystemJitStore::default_location()?));
     let init = Instant::now();
     let device = cutile::cuda_core::Device::new(0)?;
+    warm_kernels(&device);
     let gpu = Gpu {
         stream: device.new_stream()?,
         frontier: std::env::var("TB_FRONTIER").map_or(Ok(0.03), |v| v.parse())?,
