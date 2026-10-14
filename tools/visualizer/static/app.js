@@ -139,7 +139,10 @@ function probe(fen) {
   if (!cache.has(fen)) {
     cache.set(fen, fetch(`/api/probe?fen=${encodeURIComponent(fen)}`)
       .then((r) => r.json())
-      .catch(() => ({ s: "offline" })));
+      .catch(() => {
+        cache.delete(fen);
+        return { s: "offline" };
+      }));
     if (cache.size > 5000) cache.delete(cache.keys().next().value);
   }
   return cache.get(fen);
@@ -445,8 +448,11 @@ function renderExplorer(moves, exact) {
   const box = $("explorer");
   box.replaceChildren();
   if (!moves.length) { box.innerHTML = '<p class="empty">No legal moves.</p>'; return; }
+  // A proof rank counts a capture as 0. The rank of a lower table is a
+  // comparable distance only if the ranks are distances to mate.
+  const key = (m) => (m.capture && !exact ? 0 : m.rank ?? 1e9);
   const order = (a, b) => {
-    const ra = a.rank ?? 1e9, rb = b.rank ?? 1e9;
+    const ra = key(a), rb = key(b);
     if (a.w === 2) return (b.mate - a.mate) || ra - rb;
     if (a.w === -2) return rb - ra;
     return 0;
@@ -810,9 +816,22 @@ function drawCharts(solve) {
 $("evidence-material").addEventListener("change", renderEvidence);
 
 // ------------------------------------------------------------ boot
+function hashFen() {
+  try {
+    return decodeURIComponent(location.hash.slice(1));
+  } catch {
+    return "";
+  }
+}
+
+window.addEventListener("hashchange", () => {
+  const fen = hashFen();
+  if (parseFen(fen)) show(fen, { reset: true });
+});
+
 async function boot() {
   renderTray();
-  const fromHash = decodeURIComponent(location.hash.slice(1));
+  const fromHash = hashFen();
   const first = show(parseFen(fromHash) ? fromHash : START, { reset: true });
   const list = await fetch("/api/materials").then((r) => r.json());
   materials = Object.fromEntries(list.rows.map((row) => {

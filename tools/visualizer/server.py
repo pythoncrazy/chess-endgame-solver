@@ -376,6 +376,34 @@ def chess_legal(board: chess.Board) -> bool:
     return board.status() & ~ignored == chess.STATUS_VALID
 
 
+def parse_board(fen: str) -> chess.Board:
+    """Parse a FEN. Without pawns, promoted-piece marks and the en passant square
+    do not have an effect. Thus the parser clears them. It also clears castling
+    rights that the position cannot have."""
+    board = chess.Board(fen)
+    board.promoted = chess.BB_EMPTY
+    board.ep_square = None
+    board.castling_rights = board.clean_castling_rights()
+    return board
+
+
+def accepts(header: str, token: str) -> bool:
+    """True if a comma-separated header (for example `Accept-Encoding`) accepts `token`."""
+    for part in header.split(","):
+        name, _, params = part.partition(";")
+        if name.strip().lower() != token:
+            continue
+        for param in params.split(";"):
+            key, _, value = param.strip().partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    return float(value) > 0
+                except ValueError:
+                    return False
+        return True
+    return False
+
+
 def sign(x: int) -> int:
     return (x > 0) - (x < 0)
 
@@ -459,7 +487,11 @@ class Store:
             }
 
     def verification_state(self, table: Table) -> tuple[str, int]:
-        runs = self.verifications.get(table.header["payload_sha256"], [])
+        runs = [
+            r
+            for r in self.verifications.get(table.header["payload_sha256"], [])
+            if r.get("material") == table.name
+        ]
         if not runs:
             return "pending", 0
         return ("pass" if all(r["status"] == "pass" for r in runs) else "fail"), len(runs)
@@ -594,7 +626,7 @@ class Store:
         """
         start = time.perf_counter()
         try:
-            board = chess.Board(fen)
+            board = parse_board(fen)
         except ValueError:
             return {"s": "fen"}
         reason = self.unsupported(board)
@@ -641,9 +673,14 @@ class Store:
     def best_line(self, fen: str, limit: int = 120) -> dict:
         """Best play from a decided position: fastest win, longest defence."""
         try:
-            board = chess.Board(fen)
+            board = parse_board(fen)
         except ValueError:
             return {"s": "fen"}
+        reason = self.unsupported(board)
+        if reason:
+            return {"s": "unsupported", "why": reason}
+        if not chess_legal(board):
+            return {"s": "illegal"}
         line = []
         for _ in range(limit):
             if board.is_game_over() or self.unsupported(board):
@@ -652,14 +689,19 @@ class Store:
             if wdl in (None, 0):
                 break
             best, best_key = None, None
+            found = self.locate(board)
+            exact = found is not None and self.exact_dtm(found[0].name)
             for move in board.legal_moves:
+                capture = board.is_capture(move)
                 board.push(move)
                 child, rank = self.value(board)
                 mate = board.is_checkmate()
                 board.pop()
                 if child is None:
                     continue
-                r = rank if rank is not None else 1 << 20
+                # A proof rank counts a capture as 0. Ranks of a lower table
+                # are comparable only if the ranks are distances to mate.
+                r = 0 if capture and not exact else (1 << 20 if rank is None else rank)
                 key = (0 if mate else 1, r) if -child == 2 else (2, -r)
                 if -child == wdl and (best_key is None or key < best_key):
                     best, best_key = move, key
@@ -675,6 +717,11 @@ class Store:
             return {"s": "missing", "m": material}
         rng = random.SystemRandom()
         goal = {"win": 2, "draw": 0, "loss": -2}.get(want)
+        counts = table.header.get("counts")
+        if goal is not None and counts:
+            sides = {"w": [0], "b": [1]}.get(turn, [0, 1])
+            if not any(counts[i][{2: "win", 0: "draw", -2: "loss"}[goal]] for i in sides):
+                return {"s": "none"}
         for _ in range(200_000):
             word = rng.randrange(table.words // 2)
             if turn == "b" or (turn == "any" and rng.random() < 0.5):
@@ -755,6 +802,7 @@ class V6Server(http.server.ThreadingHTTPServer):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive: no reconnect per request
+    timeout = 30  # seconds of silence before the server closes a connection
     store: Store
     page: bytes
     page_gz: bytes
@@ -772,14 +820,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         etag: str | None = None,
         compressed: bytes | None = None,
     ) -> None:
-        if etag and self.headers.get("If-None-Match") == etag:
+        tags = {
+            t.strip().removeprefix("W/") for t in self.headers.get("If-None-Match", "").split(",")
+        }
+        if etag and (etag in tags or "*" in tags):
             self.send_response(304)
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", cache)
+            self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        gz = "gzip" in self.headers.get("Accept-Encoding", "")
+        gz = accepts(self.headers.get("Accept-Encoding", ""), "gzip")
         if gz and compressed is None and len(body) >= GZIP_MIN and not kind.startswith("font/"):
             compressed = gzip.compress(body, compresslevel=6, mtime=0)
         payload = compressed if gz and compressed is not None else body
@@ -795,11 +847,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def error(self, status: int, text: str) -> None:
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def api(self, data: dict) -> None:
         body = json.dumps(data, separators=(",", ":")).encode()
         self.reply(body, "application/json", "no-store")
 
     def do_GET(self) -> None:
+        if self.headers.get("Content-Length", "0") != "0" or "Transfer-Encoding" in self.headers:
+            self.close_connection = True
+            self.error(400, "a GET request has no body")
+            return
         url = urllib.parse.urlsplit(self.path)
         q = dict(urllib.parse.parse_qsl(url.query))
         s = self.store
@@ -826,7 +891,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.fonts[url.path[7:]], "font/woff2", "public, max-age=31536000, immutable"
             )
         else:
-            self.reply(b"not found", "text/plain", "no-store")
+            self.error(404, "not found")
 
 
 def main() -> None:

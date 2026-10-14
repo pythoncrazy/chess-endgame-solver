@@ -64,7 +64,8 @@ def main() -> int:
     picks = rng.sample(legal, samples)
     # Include the longest proof rank, so the comparison covers the DTM extreme.
     deepest = max(legal, key=lambda p: int(rank[p[0] * 64 + p[1]]) % UNRESOLVED)
-    picks.append(deepest)
+    if deepest not in picks:
+        picks.append(deepest)
     client = Client(output / "lichess_responses.jsonl")
     rows, agree = [], 0
     for word, bk in picks:
