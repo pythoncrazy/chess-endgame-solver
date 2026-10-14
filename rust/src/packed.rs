@@ -18,6 +18,7 @@
 //! exactly from the white-to-move children. A probe decompresses at most one
 //! block per section, plus the children's blocks for a black-to-move rank.
 use crate::Result;
+use crate::cm;
 use crate::pawnless::{
     Counts, DIGEST_TREE, Geometry, MAX_SKELETON, Material, Symmetry, Table, UNRESOLVED,
     payload_digest, statics,
@@ -33,7 +34,7 @@ use std::{
     os::unix::fs::FileExt,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -340,7 +341,14 @@ pub enum Codec {
     /// One LZMA1 `.lzma` ("alone") stream per block (preset 9e, lc 4): about
     /// 10% smaller rank sections than zstd 19, about 6x slower cold probes.
     Lzma,
+    /// Context mixer with a fixed model and small blocks (`cm` module).
+    Cm,
 }
+
+/// Stored words in each block of a `cm` WDL section.
+pub const CM_WDL_WORDS: usize = 256;
+/// Stored words in each block of a `cm` rank section.
+pub const CM_RANK_WORDS: usize = 64;
 
 /// Sides to move whose proof ranks are stored.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -383,6 +391,12 @@ pub struct Section {
     pub compressed_bytes: u64,
     #[serde(default)]
     pub codec: Codec,
+    /// `cm` only: stored words in each block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_words: Option<u64>,
+    /// `cm` only: bytes of the model blob at `offset`, before the block index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -410,7 +424,7 @@ pub struct PackedHeader {
 }
 
 /// Run `f` on indices `0..n` with dynamic scheduling over `threads` workers.
-fn parallel<T: Send>(
+pub(crate) fn parallel<T: Send>(
     n: usize,
     threads: usize,
     f: impl Fn(usize) -> Result<T> + Sync,
@@ -557,6 +571,7 @@ fn compress_block(codec: Codec, level: i32, raw: &[u8]) -> Result<Vec<u8>> {
             encoder.write_all(raw).map_err(|e| e.to_string())?;
             encoder.finish().map_err(|e| e.to_string())
         }
+        Codec::Cm => Err("cm blocks are not byte blocks".into()),
     }
 }
 
@@ -573,7 +588,146 @@ fn decompress_block(codec: Codec, frame: &[u8], expect: usize) -> Result<Vec<u8>
                 .map_err(|e| e.to_string())?;
             Ok(out)
         }
+        Codec::Cm => Err("cm blocks are not byte blocks".into()),
     }
+}
+
+/// Words `range` of the stored domain, with their stored legal positions.
+fn cm_words(layout: &Layout, geometry: &Geometry, range: Range<usize>) -> Vec<cm::Word> {
+    let material = &layout.material;
+    range
+        .map(|cw| {
+            let full = layout.full_word(cw);
+            let (black, squares) = material.decode(full);
+            let mut word = cm::Word {
+                stored: layout.stored_in_word(full) & statics(geometry, material, full).valid,
+                black,
+                squares: [0; 5],
+            };
+            word.squares[..layout.m].copy_from_slice(&squares[..layout.m]);
+            word
+        })
+        .collect()
+}
+
+/// The WDL section of a table, as `cm` blocks.
+struct CmWdl<'a> {
+    layout: &'a Layout,
+    geometry: &'a Geometry,
+    c: &'a Canonical,
+    mark_rank1: bool,
+}
+
+impl cm::Blocks for CmWdl<'_> {
+    fn sizes(&self) -> Vec<usize> {
+        cm::wdl_sizes()
+    }
+    fn sets(&self) -> usize {
+        cm::WDL_SETS
+    }
+    fn blocks(&self) -> usize {
+        self.c.records.len().div_ceil(CM_WDL_WORDS)
+    }
+    fn walk<D: cm::Decide>(&self, b: usize, d: &mut D) {
+        let range = b * CM_WDL_WORDS..((b + 1) * CM_WDL_WORDS).min(self.c.records.len());
+        let words = cm_words(self.layout, self.geometry, range.clone());
+        let mut values = vec![cm::UNKNOWN; words.len() * 64];
+        let black = black_start(self.layout);
+        for (i, (cw, word)) in range.zip(&words).enumerate() {
+            let [win, loss] = self.c.records[cw];
+            for bk in 0..64 {
+                if word.stored >> bk & 1 == 0 {
+                    continue;
+                }
+                let mut v = (win >> bk & 1) as u8 | (((loss >> bk & 1) as u8) << 1);
+                if v == 1 && cw >= black && self.mark_rank1 && self.c.rank[cw * 64 + bk] == 1 {
+                    v = 3;
+                }
+                values[i * 64 + bk] = v;
+            }
+        }
+        cm::walk_wdl(
+            self.geometry,
+            &self.layout.material.skeleton,
+            &words,
+            &mut values,
+            d,
+        );
+    }
+}
+
+/// The rank section of a table with white-only ranks, as `cm` blocks.
+struct CmRank<'a> {
+    layout: &'a Layout,
+    geometry: &'a Geometry,
+    c: &'a Canonical,
+    width: usize,
+    words: usize,
+}
+
+impl cm::Blocks for CmRank<'_> {
+    fn sizes(&self) -> Vec<usize> {
+        cm::rank_sizes(self.width)
+    }
+    fn sets(&self) -> usize {
+        cm::rank_sets(self.width)
+    }
+    fn blocks(&self) -> usize {
+        self.words.div_ceil(CM_RANK_WORDS)
+    }
+    fn walk<D: cm::Decide>(&self, b: usize, d: &mut D) {
+        let range = b * CM_RANK_WORDS..((b + 1) * CM_RANK_WORDS).min(self.words);
+        let words = cm_words(self.layout, self.geometry, range.clone());
+        let mut codes = vec![0u8; words.len() * 64];
+        let mut ranks = vec![cm::NO_RANK; words.len() * 64];
+        for (i, (cw, word)) in range.zip(&words).enumerate() {
+            let [win, loss] = self.c.records[cw];
+            for bk in 0..64 {
+                if word.stored >> bk & 1 != 0 && (win | loss) >> bk & 1 != 0 {
+                    codes[i * 64 + bk] = if win >> bk & 1 != 0 { 1 } else { 2 };
+                    ranks[i * 64 + bk] = self.c.rank[cw * 64 + bk];
+                }
+            }
+        }
+        cm::walk_rank(
+            self.geometry,
+            &self.layout.material.skeleton,
+            &words,
+            &codes,
+            &mut ranks,
+            self.width,
+            d,
+        );
+    }
+}
+
+/// Make sure that the solver and `statics` agree on the legal stored positions.
+fn check_cm_words(
+    layout: &Layout,
+    geometry: &Geometry,
+    c: &Canonical,
+    threads: usize,
+) -> Result<()> {
+    let parts = c.records.len().div_ceil(1 << 14);
+    parallel(parts, threads, |part| {
+        let range = part << 14..((part + 1) << 14).min(c.records.len());
+        for (cw, word) in range.clone().zip(cm_words(layout, geometry, range)) {
+            if word.stored != stored_bits(layout, c, cw) {
+                return Err(format!(
+                    "stored word {cw}: legality disagrees with the solver"
+                ));
+            }
+            let [win, loss] = c.records[cw];
+            let decisive = word.stored & (win | loss);
+            if !c.rank.is_empty()
+                && (0..64).any(|bk| decisive >> bk & 1 != 0 && c.rank[cw * 64 + bk] == UNRESOLVED)
+            {
+                return Err(format!("stored word {cw}: a decisive position has no rank"));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Compress a stored table into a v4 file image.
@@ -608,35 +762,86 @@ pub fn write(
     let mut payload = Vec::new();
     let mut infos = Vec::new();
     let mut content = Sha256::new();
+    let geometry = Geometry::new();
+    if sections.iter().any(|s| s.2 == Codec::Cm) {
+        check_cm_words(&layout, &geometry, c, threads)?;
+    }
     for (name, raw_bytes, codec) in sections {
-        let blocks = raw_bytes.div_ceil(BLOCK);
-        let frames = parallel(blocks, threads, |b| {
-            let raw = if name == "wdl" {
+        let raw_block = |b| {
+            if name == "wdl" {
                 wdl_block(&layout, c, b, sides)
             } else {
                 rank_block(&layout, c, b, width, rank_words)
+            }
+        };
+        let (model, block_words, frames) = if codec == Codec::Cm {
+            let settings = cm::Settings::default();
+            let (model, frames, block_words) = if name == "wdl" {
+                let blocks = CmWdl {
+                    layout: &layout,
+                    geometry: &geometry,
+                    c,
+                    mark_rank1: sides == RankSides::White && width > 0,
+                };
+                let (m, f) = cm::encode(&blocks, settings, threads)?;
+                (m, f, CM_WDL_WORDS)
+            } else {
+                if sides != RankSides::White {
+                    return Err("a cm rank section needs white-only ranks".into());
+                }
+                let blocks = CmRank {
+                    layout: &layout,
+                    geometry: &geometry,
+                    c,
+                    width,
+                    words: rank_words,
+                };
+                let (m, f) = cm::encode(&blocks, settings, threads)?;
+                (m, f, CM_RANK_WORDS)
             };
-            let digest: [u8; 32] = Sha256::digest(&raw).into();
-            Ok((digest, compress_block(codec, options.level, &raw)?))
-        })?;
+            let digests = parallel(raw_bytes.div_ceil(BLOCK), threads, |b| {
+                Ok(<[u8; 32]>::from(Sha256::digest(raw_block(b))))
+            })?;
+            for d in &digests {
+                content.update(d);
+            }
+            (Some(model), Some(block_words as u64), frames)
+        } else {
+            let frames = parallel(raw_bytes.div_ceil(BLOCK), threads, |b| {
+                let raw = raw_block(b);
+                Ok((
+                    <[u8; 32]>::from(Sha256::digest(&raw)),
+                    compress_block(codec, options.level, &raw)?,
+                ))
+            })?;
+            for (d, _) in &frames {
+                content.update(d);
+            }
+            (None, None, frames.into_iter().map(|(_, f)| f).collect())
+        };
         let offset = payload.len() as u64;
+        let model_bytes = model.as_ref().map(|m| m.len() as u64);
+        if let Some(m) = &model {
+            payload.extend_from_slice(m);
+        }
         let mut at = 0u64;
-        for (_, frame) in &frames {
+        for frame in &frames {
             payload.extend_from_slice(&at.to_le_bytes());
             at += frame.len() as u64;
         }
         payload.extend_from_slice(&at.to_le_bytes());
-        for (digest, frame) in &frames {
-            content.update(digest);
+        for frame in &frames {
             payload.extend_from_slice(frame);
         }
         infos.push(Section {
             name: name.into(),
             offset,
-            blocks: blocks as u64,
+            blocks: frames.len() as u64,
             raw_bytes: raw_bytes as u64,
-            compressed_bytes: at,
+            compressed_bytes: at + model_bytes.unwrap_or(0),
             codec,
+            block_words,
+            model_bytes,
         });
     }
     let header = PackedHeader {
@@ -865,6 +1070,18 @@ struct SectionIndex {
     offsets: Vec<u64>,
     raw_bytes: usize,
     codec: Codec,
+    /// Decompressed bytes of each block (the last block may be shorter).
+    block: usize,
+    /// `cm` only: the stored words of each block and the model blob.
+    cm: Option<CmIndex>,
+}
+
+struct CmIndex {
+    block_words: usize,
+    /// Absolute file offset and length of the model blob.
+    model_at: u64,
+    model_len: usize,
+    model: OnceLock<std::result::Result<Arc<cm::Model>, String>>,
 }
 
 /// A v3 or v4 table opened for probing; blocks are read on demand and cached.
@@ -931,8 +1148,13 @@ impl PackedTable {
             }
         }
         let index = |s: &Section| -> Result<SectionIndex> {
+            let model_len = if s.codec == Codec::Cm {
+                s.model_bytes.ok_or("cm section lacks model_bytes")?
+            } else {
+                0
+            };
             let mut raw = vec![0u8; 8 * (s.blocks as usize + 1)];
-            file.read_exact_at(&mut raw, start + s.offset)
+            file.read_exact_at(&mut raw, start + s.offset + model_len)
                 .map_err(err)?;
             let offsets: Vec<u64> = raw
                 .as_chunks::<8>()
@@ -940,16 +1162,42 @@ impl PackedTable {
                 .iter()
                 .map(|b| u64::from_le_bytes(*b))
                 .collect();
-            let frames = start + s.offset + raw.len() as u64;
+            let frames = start + s.offset + model_len + raw.len() as u64;
             if offsets.windows(2).any(|w| w[0] > w[1]) || frames + offsets[offsets.len() - 1] > size
             {
                 return Err("v3 block index out of range".into());
             }
+            let unit = if s.name == "wdl" {
+                16
+            } else {
+                64 * header.rank_width
+            };
+            let cm = if s.codec == Codec::Cm {
+                let block_words = s.block_words.ok_or("cm section lacks block_words")? as usize;
+                if !(1..=1 << 16).contains(&block_words)
+                    || offsets.len() as u64 - 1
+                        != (s.raw_bytes / unit as u64).div_ceil(block_words as u64)
+                {
+                    return Err("cm block size out of range".into());
+                }
+                Some(CmIndex {
+                    block_words,
+                    model_at: start + s.offset,
+                    model_len: model_len as usize,
+                    model: OnceLock::new(),
+                })
+            } else {
+                None
+            };
             Ok(SectionIndex {
                 frames,
                 offsets,
                 raw_bytes: s.raw_bytes as usize,
                 codec: s.codec,
+                block: cm
+                    .as_ref()
+                    .map_or(header.block_bytes, |c| c.block_words * unit),
+                cm,
             })
         };
         let find = |name: &str| header.sections.iter().find(|s| s.name == name);
@@ -979,13 +1227,94 @@ impl PackedTable {
         self.file
             .read_exact_at(&mut frame, section.frames + from)
             .map_err(|e| e.to_string())?;
-        let block = self.header.block_bytes;
+        let block = section.block;
         let expect = block.min(section.raw_bytes - b * block);
+        if let Some(index) = &section.cm {
+            return self.read_cm_block(section, index, b, &frame, expect);
+        }
         let raw = decompress_block(section.codec, &frame, expect)?;
         if raw.len() != expect {
             return Err("v3 block has the wrong length".into());
         }
         Ok(raw)
+    }
+
+    fn cm_model(&self, section: &SectionIndex, index: &CmIndex) -> Result<Arc<cm::Model>> {
+        index
+            .model
+            .get_or_init(|| {
+                let mut blob = vec![0u8; index.model_len];
+                self.file
+                    .read_exact_at(&mut blob, index.model_at)
+                    .map_err(|e| e.to_string())?;
+                let (sizes, sets) = if std::ptr::eq(section, &self.wdl) {
+                    (cm::wdl_sizes(), cm::WDL_SETS)
+                } else {
+                    let width = self.header.rank_width;
+                    (cm::rank_sizes(width), cm::rank_sets(width))
+                };
+                cm::Model::parse(&blob, &sizes, sets).map(Arc::new)
+            })
+            .clone()
+    }
+
+    /// Decode `cm` block `b` into the byte layout of the other codecs.
+    /// Positions without a value repeat the previous value of the block.
+    fn read_cm_block(
+        &self,
+        section: &SectionIndex,
+        index: &CmIndex,
+        b: usize,
+        frame: &[u8],
+        expect: usize,
+    ) -> Result<Vec<u8>> {
+        let model = self.cm_model(section, index)?;
+        let pieces = &self.layout.material.skeleton;
+        let first = b * index.block_words;
+        if std::ptr::eq(section, &self.wdl) {
+            let range = first..first + expect / 16;
+            let words = cm_words(&self.layout, &self.geometry, range);
+            let values = cm::decode_wdl(&model, &self.geometry, pieces, &words, frame);
+            let mut out = vec![0u8; expect];
+            let mut prev = 0u8;
+            for (p, &v) in values.iter().enumerate() {
+                if v != cm::UNKNOWN {
+                    prev = v;
+                }
+                out[p / 4] |= prev << (2 * (p % 4));
+            }
+            return Ok(out);
+        }
+        let width = self.header.rank_width;
+        let range = first..first + expect / (64 * width);
+        let words = cm_words(&self.layout, &self.geometry, range.clone());
+        let mut codes = vec![0u8; words.len() * 64];
+        let per_block = self.wdl.block * 4;
+        let (low, high) = (range.start * 64, range.end * 64);
+        let mut p = low;
+        while p < high {
+            let data = self.block(false, p / per_block)?;
+            let end = high.min((p / per_block + 1) * per_block);
+            for q in p..end {
+                let i = q % per_block;
+                codes[q - low] = data[i / 4] >> (2 * (i % 4)) & 3;
+            }
+            p = end;
+        }
+        let ranks = cm::decode_rank(&model, &self.geometry, pieces, &words, &codes, width, frame);
+        let mut out = vec![0u8; expect];
+        let mut prev = 0u16;
+        for (p, &r) in ranks.iter().enumerate() {
+            if r != cm::NO_RANK {
+                prev = r;
+            }
+            if width == 1 {
+                out[p] = prev as u8;
+            } else {
+                out[2 * p..2 * p + 2].copy_from_slice(&prev.to_le_bytes());
+            }
+        }
+        Ok(out)
     }
 
     fn block(&self, rank: bool, b: usize) -> Result<Arc<Vec<u8>>> {
@@ -1042,14 +1371,14 @@ impl PackedTable {
 
     /// WDL code of stored position `p`.
     fn code(&self, p: usize) -> Result<u8> {
-        let block = self.header.block_bytes;
+        let block = self.wdl.block;
         Ok(self.block(false, p / 4 / block)?[p / 4 % block] >> (2 * (p % 4)) & 3)
     }
 
     /// Stored proof rank of stored position `p` (a stored side to move).
     fn stored_rank(&self, p: usize) -> Result<u16> {
         let width = self.header.rank_width;
-        let block = self.header.block_bytes;
+        let block = self.rank.as_ref().ok_or("no rank section")?.block;
         let at = p * width;
         let data = self.block(true, at / block)?;
         let i = at % block;

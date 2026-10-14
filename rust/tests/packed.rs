@@ -59,12 +59,21 @@ fn packed_roundtrip_probe_and_identical_pieces() {
         level: 3,
         ..Default::default()
     };
+    let cm = WriteOptions {
+        wdl_codec: Codec::Cm,
+        rank_codec: Codec::Cm,
+        ..Default::default()
+    };
     for (name, options) in [
         ("KQvK", both),
         ("KQvK", white),
         ("KvKR", white),
         ("KNNvK", white),
         ("KRvKB", white),
+        ("KQvK", cm),
+        ("KvKR", cm),
+        ("KNNvK", cm),
+        ("KRvKB", cm),
     ] {
         let table = solved(name);
         let path = dir.join(format!("{name}.tbz"));
