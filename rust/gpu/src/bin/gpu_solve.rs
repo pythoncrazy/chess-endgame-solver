@@ -105,10 +105,18 @@ mod kernel {
         select(condition, ones, zero)
     }
 
+    /// Word handled by each lane. The grid is 2-D (block = y * grid.x + x)
+    /// because block ids above 2^24 on grid X are not delivered correctly.
     fn word_index() -> Tile<i64, { [64] }> {
         let pid = get_tile_block_id();
-        let block: Tile<i32, { [64] }> = broadcast_scalar(pid.0, shape![64]);
-        let block: Tile<i64, { [64] }> = exti(block);
+        let grid = get_num_tile_blocks();
+        let x: Tile<i32, { [64] }> = broadcast_scalar(pid.0, shape![64]);
+        let y: Tile<i32, { [64] }> = broadcast_scalar(pid.1, shape![64]);
+        let gx: Tile<i32, { [64] }> = broadcast_scalar(grid.0, shape![64]);
+        let x: Tile<i64, { [64] }> = exti(x);
+        let y: Tile<i64, { [64] }> = exti(y);
+        let gx: Tile<i64, { [64] }> = exti(gx);
+        let block: Tile<i64, { [64] }> = y * gx + x;
         let width: Tile<i64, { [64] }> = constant(64i64, shape![64]);
         let lane: Tile<i64, { [64] }> = iota(shape![64]);
         block * width + lane
@@ -516,6 +524,19 @@ fn role_code(role: pawnless::Role) -> i64 {
 
 type Error = Box<dyn std::error::Error>;
 
+/// Largest grid X used; ids above 2^24 on one axis are unreliable in the pinned
+/// cuTile, so larger launches add a Y dimension. Word counts are powers of two.
+const GRID_X: usize = 1 << 20;
+
+fn launch_grid(words: usize) -> (u32, u32, u32) {
+    let blocks = words / BLOCK;
+    if blocks <= GRID_X {
+        (blocks as u32, 1, 1)
+    } else {
+        (GRID_X as u32, (blocks / GRID_X) as u32, 1)
+    }
+}
+
 /// Stream-ordered device allocation. cuTile tensors are limited to fewer than
 /// 2^31 elements, while six-piece planes hold 2^31 words, so solver buffers use
 /// raw driver allocations; the kernels take raw pointers.
@@ -664,10 +685,14 @@ impl Gpu {
             .sum::<usize>()
             + check.as_ref().map_or(0, |c| c.bytes())
             + rank.as_ref().map_or(0, |r| r.bytes());
-        let grid = ((words / BLOCK) as u32, 1, 1);
+        let grid = launch_grid(words);
         let device = self.stream.device();
         let (event_start, event_end) = (device.new_event()?, device.new_event()?);
         let prepare_seconds = start.elapsed().as_secs_f64();
+        eprintln!(
+            "{}: {words} words, {device_bytes} device bytes, statics",
+            material.name()
+        );
         let t0 = Instant::now();
         // SAFETY: every pointer addresses a live device tensor sized for this
         // material; kernels touch words < `words` and lower offsets in range.
@@ -690,6 +715,7 @@ impl Gpu {
                 (0, 0)
             };
             let counter = self.zeros::<i64>(1)?;
+            eprintln!("{}: round {round}", material.name());
             let mode = if round == 0 { "0" } else { "1" };
             event_start.record(&self.stream)?;
             // SAFETY: as above. Ranked mode reads [src] and writes [dst]; in
@@ -795,10 +821,25 @@ fn main() -> Result<(), Error> {
         }));
         Ok(table)
     };
-    solve_tree(&material, &mut Solved::new(), &mut solve_one)?;
+    // Restart: reuse completed tables whose payload digest verifies.
+    let mut solved = Solved::new();
+    let mut resumed = Vec::new();
+    for entry in std::fs::read_dir(&output)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "tbp")
+            && path.to_string_lossy().ends_with(".gpu.tbp")
+        {
+            let (table, header) = Table::read(std::io::BufReader::new(File::open(&path)?))?;
+            resumed.push(
+                json!({"material": header.material, "payload_sha256": header.payload_sha256}),
+            );
+            solved.insert(header.material, Arc::new(table));
+        }
+    }
+    solve_tree(&material, &mut solved, &mut solve_one)?;
     println!(
         "{}",
-        json!({"solver": "gpu-cutile", "device": std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default(), "tables": records})
+        json!({"solver": "gpu-cutile", "device": std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default(), "resumed_verified_tables": resumed, "tables": records})
     );
     Ok(())
 }
