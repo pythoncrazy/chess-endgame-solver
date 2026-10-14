@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tablebase · GPU solver</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="/piece/wN.svg">
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="/" aria-label="Tablebase home"><img src="/piece/wN.svg" alt="" width="26" height="26"><span>Tablebase</span></a>
+  <nav class="site-nav" aria-label="Sections">
+    <button class="nav-tab is-active" data-view="analysis" aria-pressed="true">Analysis</button>
+    <button class="nav-tab" data-view="materials" aria-pressed="false">Materials</button>
+    <button class="nav-tab" data-view="evidence" aria-pressed="false">Evidence</button>
+  </nav>
+</header>
+
+<main class="analysis" id="view-analysis">
+  <section class="board-col" aria-label="Board">
+    <div class="board-wrap">
+      <div class="board" id="board" role="grid" aria-label="Chessboard"></div>
+      <svg class="arrows" id="arrows" viewBox="0 0 8 8" aria-hidden="true">
+        <defs>
+          <marker id="head-win" markerWidth="4" markerHeight="4" refX="2" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#629924"/></marker>
+          <marker id="head-draw" markerWidth="4" markerHeight="4" refX="2" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#9a9a9a"/></marker>
+          <marker id="head-loss" markerWidth="4" markerHeight="4" refX="2" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#cc3333"/></marker>
+        </defs>
+      </svg>
+    </div>
+
+    <div class="tray" id="tray" aria-label="Board editor">
+      <div class="tray-row" data-color="w"></div>
+      <div class="tray-row" data-color="b"></div>
+    </div>
+
+    <div class="board-tools">
+      <div class="seg" role="group" aria-label="Side to move">
+        <button id="turn-w" class="seg-btn is-on" aria-pressed="true">White to play</button>
+        <button id="turn-b" class="seg-btn" aria-pressed="false">Black to play</button>
+      </div>
+      <button class="icon-btn" id="flip" title="Flip board (f)" aria-label="Flip board">
+        <svg viewBox="0 0 24 24"><path d="M7 4v14m0 0-3-3m3 3 3-3M17 20V6m0 0-3 3m3-3 3 3"/></svg>
+      </button>
+      <button class="icon-btn" id="clear" title="Clear board" aria-label="Clear board">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13"/></svg>
+      </button>
+    </div>
+
+    <form class="fen-row" id="fen-form">
+      <label for="fen">FEN</label>
+      <input id="fen" spellcheck="false" autocomplete="off">
+      <button type="button" class="icon-btn" id="copy-fen" title="Copy FEN" aria-label="Copy FEN">
+        <svg viewBox="0 0 24 24"><path d="M9 9h10v11H9zM5 15V4h10"/></svg>
+      </button>
+    </form>
+
+    <form class="random-row" id="random-form">
+      <label for="material">Random</label>
+      <select id="material" aria-label="Material"></select>
+      <select id="random-result" aria-label="Result for the side to move">
+        <option value="any">any result</option>
+        <option value="win">side to move wins</option>
+        <option value="draw">draw</option>
+        <option value="loss">side to move loses</option>
+      </select>
+      <button class="btn" type="submit">Load position</button>
+    </form>
+  </section>
+
+  <section class="tools" aria-label="Tablebase">
+    <div class="tools-head">
+      <h1 id="verdict" class="verdict">Set up a position</h1>
+      <p id="verdict-sub" class="verdict-sub">Place pieces from the tray, paste a FEN, or load a random position.</p>
+      <dl class="facts" id="facts"></dl>
+    </div>
+    <div class="moves" id="moves" aria-live="polite"></div>
+    <div class="history">
+      <div class="history-bar">
+        <button class="icon-btn" id="back" title="Back (←)" aria-label="Back"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg></button>
+        <button class="icon-btn" id="forward" title="Forward (→)" aria-label="Forward"><svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg></button>
+        <span class="history-label">Line</span>
+        <button class="link-btn" id="best-line" title="Play the best move for both sides (b)">Play best line</button>
+      </div>
+      <ol class="line" id="line"></ol>
+    </div>
+  </section>
+</main>
+
+<main class="page" id="view-materials" hidden>
+  <h1>Materials</h1>
+  <p class="lede">Every table the server memory-maps. Counts come from the solver; verification from the independent shakmaty + Syzygy verifier, matched by payload SHA-256.</p>
+  <div class="table-scroll"><table class="data" id="materials-table"></table></div>
+</main>
+
+<main class="page" id="view-evidence" hidden>
+  <h1>Evidence</h1>
+  <div class="evidence-head">
+    <label for="evidence-material">Material</label>
+    <select id="evidence-material"></select>
+  </div>
+  <section class="chart-block">
+    <h2>Convergence: words changed per sweep</h2>
+    <p class="chart-note">Log scale. A sweep that changes no word ends the solve; that zero round is the termination proof.</p>
+    <div class="chart" id="chart-changed"></div>
+    <h2>Sweep time</h2>
+    <div class="chart chart-small" id="chart-time"></div>
+  </section>
+  <section class="evidence-grid">
+    <div><h2>Solve</h2><dl class="kv" id="solve-facts"></dl></div>
+    <div><h2>Verification</h2><div id="verify-list"></div></div>
+    <div><h2>Online comparisons</h2><div id="online-list"></div></div>
+  </section>
+</main>
+
+<div class="tooltip" id="tooltip" role="status" hidden></div>
+<script src="/app.js" type="module"></script>
+</body>
+</html>

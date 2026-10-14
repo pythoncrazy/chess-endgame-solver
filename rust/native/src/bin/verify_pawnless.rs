@@ -199,6 +199,24 @@ fn check_position(
     Ok(())
 }
 
+fn record_failure(
+    table: &Table,
+    word: usize,
+    bk: u8,
+    error: &str,
+    tally: &Tally,
+    first_failure: &std::sync::Mutex<Option<String>>,
+) {
+    tally.failures.fetch_add(1, Ordering::Relaxed);
+    let mut slot = first_failure.lock().expect("mutex");
+    if slot.is_none() {
+        let fen = position(&table.material, word, bk).map(|p| {
+            shakmaty::fen::Fen::from_position(&p, shakmaty::EnPassantMode::Legal).to_string()
+        });
+        *slot = Some(format!("word {word} bk {bk} fen {fen:?}: {error}"));
+    }
+}
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: verify_pawnless SYZYGY_DIRECTORY THREADS [--canonical] TABLE_FILE...";
@@ -233,30 +251,31 @@ fn main() -> Result<(), String> {
         let tally = Tally::default();
         let first_failure = std::sync::Mutex::new(None::<String>);
         let words = table.valid.len();
-        let chunk = words.div_ceil(threads.max(1));
+        // Dynamic chunks: canonical words sit in contiguous index ranges, so a
+        // static split would leave most threads idle.
+        const CHUNK: usize = 4096;
+        let next = AtomicU64::new(0);
         std::thread::scope(|scope| {
-            for part in 0..threads.max(1) {
-                let (tables, syzygy, tally, first_failure) =
-                    (&tables, &syzygy, &tally, &first_failure);
+            for _ in 0..threads.max(1) {
+                let (tables, syzygy, tally, first_failure, next) =
+                    (&tables, &syzygy, &tally, &first_failure, &next);
                 scope.spawn(move || {
-                    for word in part * chunk..((part + 1) * chunk).min(words) {
-                        if canonical && !canonical_white_king(white_king(&table.material, word)) {
-                            continue;
+                    loop {
+                        let start = next.fetch_add(CHUNK as u64, Ordering::Relaxed) as usize;
+                        if start >= words {
+                            break;
                         }
-                        for bk in 0..64u8 {
-                            tally.positions.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = check_position(tables, syzygy, table, word, bk, tally) {
-                                tally.failures.fetch_add(1, Ordering::Relaxed);
-                                let mut slot = first_failure.lock().expect("mutex");
-                                if slot.is_none() {
-                                    let fen = position(&table.material, word, bk).map(|p| {
-                                        shakmaty::fen::Fen::from_position(
-                                            &p,
-                                            shakmaty::EnPassantMode::Legal,
-                                        )
-                                        .to_string()
-                                    });
-                                    *slot = Some(format!("word {word} bk {bk} fen {fen:?}: {e}"));
+                        for word in start..(start + CHUNK).min(words) {
+                            if canonical && !canonical_white_king(white_king(&table.material, word))
+                            {
+                                continue;
+                            }
+                            for bk in 0..64u8 {
+                                tally.positions.fetch_add(1, Ordering::Relaxed);
+                                if let Err(e) =
+                                    check_position(tables, syzygy, table, word, bk, tally)
+                                {
+                                    record_failure(table, word, bk, &e, tally, first_failure);
                                 }
                             }
                         }
