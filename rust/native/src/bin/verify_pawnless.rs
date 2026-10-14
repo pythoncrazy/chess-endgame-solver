@@ -5,6 +5,7 @@
 //! - legality agrees with shakmaty. The check accepts impossible-check positions.
 //! - the unclocked WDL equals the sign of Syzygy WDL after zeroing.
 //! - proof ranks hold:
+//!   - a win or a loss has a proof rank.
 //!   - a win has a child loss of smaller rank, or a capture into a lower-material loss.
 //!   - every child of a loss is a win of smaller rank, or a lower-material win.
 //!   - a rank-0 loss is checkmate.
@@ -241,6 +242,9 @@ fn check_position(
         return Ok(());
     }
     let rank = table.rank[word * 64 + usize::from(bk)];
+    if value != 0 && rank == pawnless::UNRESOLVED {
+        return Err(format!("value {value} has no proof rank"));
+    }
     let moves = pos.legal_moves();
     let smaller = |r: Option<u16>| r.is_none_or(|r| r < rank);
     // Over all children, look for a loss of smaller rank, any loss and any child
@@ -355,7 +359,10 @@ fn main() -> Result<(), String> {
     };
     let mut paths = BTreeMap::new();
     for path in args {
-        paths.insert(material_of(&path)?.name(), path);
+        let name = material_of(&path)?.name();
+        if let Some(other) = paths.insert(name.clone(), path) {
+            return Err(format!("{other}: a second file has the material {name}"));
+        }
     }
     if paths.is_empty() {
         return Err(usage.into());
@@ -379,6 +386,12 @@ fn main() -> Result<(), String> {
         for name in needs(material) {
             if let (false, Some(path)) = (tables.contains_key(&name), paths.get(&name)) {
                 let (table, digest) = load_table(path.as_ref(), threads)?;
+                if table.material.name() != name {
+                    return Err(format!(
+                        "{path}: the file has the material {}",
+                        table.material.name()
+                    ));
+                }
                 digests.insert(name.clone(), digest);
                 tables.insert(name, table);
             }
