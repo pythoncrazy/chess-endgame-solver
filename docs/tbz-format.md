@@ -42,7 +42,7 @@ last block can be shorter. A reader rejects a section if `raw_bytes` or `blocks`
 do not agree with the material and `block_bytes`. It also rejects a section
 that goes past the end of the file. Codecs:
 
-- `zstd`: one zstd frame per block (level 19).
+- `zstd`: one zstd frame per block. `tb_pack` uses level 19, and `gpu_solve --all` uses level 15.
 - `lzma`: one LZMA1 "alone" (`.lzma`) stream per block, preset 9e with
   `lc=4`, dictionary = block size. Python: `lzma.FORMAT_ALONE`.
 - `cm`: a context model with a binary arithmetic coder. A `cm` section has a

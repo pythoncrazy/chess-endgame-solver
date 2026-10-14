@@ -78,6 +78,9 @@ cargo run --release --manifest-path rust/gpu/Cargo.toml --bin gpu_solve -- --all
 ```
 
 The GPU solver writes `.tbz` files with `--all`. For one material, it writes `.gpu.tbp` files.
+With `--all`, you can give the zstd level (default 15) and the number of pack
+threads (default 20). Level 19 makes files approximately 2% smaller,
+but the compression takes approximately three times longer.
 
 ### Pack tables
 
