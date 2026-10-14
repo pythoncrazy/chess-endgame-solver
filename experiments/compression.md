@@ -256,3 +256,53 @@ The capture geometry gives KQBvKR the largest gain: its adaptive WDL size decrea
 
 Decision: Keep the capture geometry.
 The fixed model is now a good choice for a parallel GPU coder with fast probes.
+
+## E7: the cm codec
+
+Question: Does a real coder keep the E6 gain, with good speed?
+
+Method: `src/cm.rs` and `TBZ_CM.md` give the codec. It uses the E6 fixed model.
+
+- A model blob in each section keeps the 12-bit probabilities and the mixer weights.
+- A 32-bit binary arithmetic coder codes each block. The coder is the lpaq coder.
+- All arithmetic of the decoder uses integers. Thus all decoders get the same bits.
+- A WDL block has 256 words. A rank block has 64 words.
+
+The test uses `tb_pack --wdl-codec cm --rank-codec cm --check --probes 2000` with 24 threads.
+The probe times are for one open table, with the model in memory.
+
+Results (file sizes include the header):
+
+| Table | v4 zstd | cm | Change |
+|---|---|---|---|
+| KQvKR | 516,551 | 398,765 | -23% |
+| KRvKB | 114,445 | 94,005 | -18% |
+| KQBvKR | 15,693,949 | 12,627,871 | -20% |
+| KRNvKQ | 22,934,552 | 13,203,463 | -42% |
+| KBNvKN | 11,291,452 | 6,630,038 | -41% |
+| Total | 50,550,949 | 32,954,142 | -35% |
+
+The E6 estimate was 31,937,546 bytes. The real coder is 3% larger.
+
+Each table decodes to the same table as the source. The `content_sha256` of each file is the same as for zstd.
+
+Speed for KQBvKR:
+
+| Step | v4 zstd | cm, first version | cm, faster geometry |
+|---|---|---|---|
+| Pack | 2.66 s | 9.05 s | 3.49 s |
+| Full decode | 1.09 s | 33.16 s | 2.76 s |
+| Probe p50 | 217 us | 2,337 us | 847 us |
+| Probe p99 | 509 us | 4,936 us | 1,754 us |
+
+The first version had two problems.
+
+- The rank decoder read each WDL code through the block cache lock.
+- The geometry found the attacks again for each black-king square.
+
+The faster version finds the attacks once for each word. It reads each WDL block once for each rank block.
+
+One WDL block takes approximately 0.5 ms to decode. One rank block takes approximately 0.2 ms.
+The first probe of a table also reads the model: approximately 5 ms for WDL and 11 ms for rank.
+
+Decision: Add `cm` as a codec. Keep zstd as the default until the viewer can read `cm`.
