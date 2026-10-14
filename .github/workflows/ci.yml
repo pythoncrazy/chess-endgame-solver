@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust
+            rust/native
+      - name: Format
+        run: |
+          for m in rust/Cargo.toml rust/native/Cargo.toml rust/gpu/Cargo.toml; do
+            cargo fmt --manifest-path "$m" --check
+          done
+      - name: Clippy
+        run: |
+          cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path rust/native/Cargo.toml --all-targets --features http -- -D warnings
+      - name: Test
+        run: |
+          cargo test --locked --release --manifest-path rust/Cargo.toml
+          cargo test --locked --release --manifest-path rust/native/Cargo.toml --features http
+
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.17.0
+      - run: ruff check
+      - run: ruff format --check
