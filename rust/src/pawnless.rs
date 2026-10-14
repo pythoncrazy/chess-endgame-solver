@@ -576,6 +576,11 @@ pub struct FileHeader {
     pub rounds: u32,
     pub planes: Vec<String>,
     pub payload_sha256: String,
+    /// Program and source revision that produced the table. Integrity (the
+    /// digest) does not prove correctness, so restarts reuse only tables from
+    /// the same generator.
+    #[serde(default)]
+    pub generator: String,
 }
 
 impl Table {
@@ -592,7 +597,7 @@ impl Table {
         bytes
     }
 
-    pub fn header(&self, payload: &[u8]) -> FileHeader {
+    pub fn header(&self, payload: &[u8], generator: &str) -> FileHeader {
         FileHeader {
             format: "tablebase-pawnless-v1".into(),
             material: self.material.name(),
@@ -605,12 +610,13 @@ impl Table {
                 .map(|p| p.to_string())
                 .collect(),
             payload_sha256: format!("{:x}", Sha256::digest(payload)),
+            generator: generator.to_string(),
         }
     }
 
-    pub fn write(&self, mut out: impl Write) -> Result<FileHeader> {
+    pub fn write(&self, mut out: impl Write, generator: &str) -> Result<FileHeader> {
         let payload = self.payload();
-        let header = self.header(&payload);
+        let header = self.header(&payload, generator);
         let json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
         out.write_all(FILE_MAGIC).map_err(|e| e.to_string())?;
         out.write_all(&(json.len() as u64).to_le_bytes())

@@ -11,6 +11,8 @@ use serde_json::json;
 use std::{fs::File, io::BufWriter, path::PathBuf, sync::Arc, time::Instant};
 use tablebase_core::pawnless::{self, Material, Solved, Table, UNRESOLVED, solve_tree};
 
+/// Program and git revision recorded in table headers (see build.rs).
+const GENERATOR: &str = concat!("gpu_solve git:", env!("TB_SOURCE_REVISION"));
 /// Lanes (words) per tile block.
 const BLOCK: usize = 64;
 /// Device metadata layout (i64 entries).
@@ -813,7 +815,7 @@ fn main() -> Result<(), Error> {
         let (table, timing) = gpu.solve(m, lower, ranked).map_err(|e| e.to_string())?;
         let path = output.join(format!("{}.gpu.tbp", m.name()));
         let file = File::create(&path).map_err(|e| e.to_string())?;
-        let header = table.write(BufWriter::new(file))?;
+        let header = table.write(BufWriter::new(file), GENERATOR)?;
         records.push(json!({
             "material": m.name(), "rounds": table.rounds, "timing": timing,
             "counts_white_to_move": table.counts()[0], "counts_black_to_move": table.counts()[1],
@@ -830,6 +832,15 @@ fn main() -> Result<(), Error> {
             && path.to_string_lossy().ends_with(".gpu.tbp")
         {
             let (table, header) = Table::read(std::io::BufReader::new(File::open(&path)?))?;
+            // Reuse only intact tables written by this exact clean build.
+            if GENERATOR.ends_with("+dirty") || header.generator != GENERATOR {
+                eprintln!(
+                    "not resuming {} (generator {:?})",
+                    path.display(),
+                    header.generator
+                );
+                continue;
+            }
             resumed.push(
                 json!({"material": header.material, "payload_sha256": header.payload_sha256}),
             );
@@ -839,7 +850,7 @@ fn main() -> Result<(), Error> {
     solve_tree(&material, &mut solved, &mut solve_one)?;
     println!(
         "{}",
-        json!({"solver": "gpu-cutile", "device": std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default(), "resumed_verified_tables": resumed, "tables": records})
+        json!({"solver": "gpu-cutile", "generator": GENERATOR, "device": std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default(), "resumed_verified_tables": resumed, "tables": records})
     );
     Ok(())
 }

@@ -78,10 +78,11 @@ fn kqvk_counts_and_known_positions() {
 fn table_file_roundtrip_and_rejections() {
     let t = solved_kqvk();
     let mut bytes = Vec::new();
-    let header = t.write(&mut bytes).unwrap();
+    let header = t.write(&mut bytes, "test").unwrap();
     let (back, read_header) = Table::read(bytes.as_slice()).unwrap();
     assert_eq!(back, t);
     assert_eq!(read_header, header);
+    assert_eq!(read_header.generator, "test");
     let mut corrupt = bytes.clone();
     *corrupt.last_mut().unwrap() ^= 1;
     assert!(

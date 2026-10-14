@@ -19,7 +19,10 @@ fn main() -> Result<(), String> {
         let seconds = start.elapsed().as_secs_f64();
         let path = output.join(format!("{}.cpu.tbp", m.name()));
         let file = File::create(&path).map_err(|e| e.to_string())?;
-        let header = table.write(BufWriter::new(file))?;
+        let header = table.write(
+            BufWriter::new(file),
+            concat!("tb_solve ", env!("CARGO_PKG_VERSION")),
+        )?;
         records.push(serde_json::json!({
             "material": m.name(), "seconds": seconds, "rounds": table.rounds,
             "counts_white_to_move": table.counts()[0], "counts_black_to_move": table.counts()[1],
