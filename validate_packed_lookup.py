@@ -1,4 +1,4 @@
-"""All-cell checks of selective decoding and authenticated-frame mutations."""
+"""All-cell checks of selective decode and authenticated-frame mutations."""
 import hashlib
 import json
 from pathlib import Path

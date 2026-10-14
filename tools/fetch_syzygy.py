@@ -1,8 +1,8 @@
 """Fetch the published Syzygy WDL tables of every pawnless material up to five pieces.
 
-Files come from tablebase.lichess.ovh; each must match the MD5 published by an
-independent mirror (tablebase.sesse.net). The catalog records size, MD5 and SHA-256.
-Only reference data is downloaded; no chess result is generated here.
+Files come from tablebase.lichess.ovh. Each file must match the MD5 that an
+independent mirror (tablebase.sesse.net) publishes. The catalog records size, MD5
+and SHA-256. This script downloads only reference data. It generates no chess result.
 
 Usage: python -I tools/fetch_syzygy.py DIRECTORY [MAX_PIECES]
 """

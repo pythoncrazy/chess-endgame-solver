@@ -2,10 +2,11 @@
 
 Usage: python -I tools/online_dtm_compare.py TABLE_FILE OUTPUT_DIR [SAMPLES]
 
-In KQvK no capture leads to a win or loss (Black capturing the queen gives a
-draw), so the synchronous proof rank of a decided position is its exact
-distance to mate in plies. lichess reports DTM in plies with the sign of the
-side to move, so |dtm| must equal the rank and the category must match WDL.
+In KQvK no capture leads to a win or loss. If Black captures the queen, the
+result is a draw. Thus the synchronous proof rank of a decided position is its
+exact distance to mate in plies. The lichess service reports DTM in plies, with
+the sign of the side to move. Thus |dtm| must equal the rank, and the category must
+match WDL.
 """
 
 from __future__ import annotations
@@ -58,10 +59,10 @@ def main() -> int:
     table, output = Path(sys.argv[1]), Path(sys.argv[2])
     samples = int(sys.argv[3]) if len(sys.argv) > 3 else 40
     header, valid, win, loss, rank = load(table)
-    rng = random.Random(20261014)  # noqa: S311 - reproducible sampling
+    rng = random.Random(20261014)  # noqa: S311 - reproducible samples
     legal = [(w, b) for w in range(len(valid)) for b in range(64) if valid[w] >> b & 1]
     picks = rng.sample(legal, samples)
-    # Include the longest proof rank so the DTM extreme is compared.
+    # Include the longest proof rank, so the comparison covers the DTM extreme.
     deepest = max(legal, key=lambda p: int(rank[p[0] * 64 + p[1]]) % UNRESOLVED)
     picks.append(deepest)
     client = Client(output / "lichess_responses.jsonl")
@@ -75,7 +76,7 @@ def main() -> int:
         data = json.loads(record["body"]) if record["status"] == 200 else {}
         category, dtm = data.get("category"), data.get("dtm")
         wdl_ok = CATEGORY.get(category) is not None and CATEGORY[category] == value
-        # lichess reports dtm 0 (or null) for draws; decided positions need |dtm| == rank.
+        # lichess reports dtm 0 (or null) for draws. Decided positions must have |dtm| == rank.
         if r == UNRESOLVED:
             dtm_ok = category == "draw" and dtm in (None, 0)
         else:

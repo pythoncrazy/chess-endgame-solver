@@ -3,13 +3,13 @@
 The tool finds prose in Markdown, text, HTML and code comments. It checks the
 rules that a program can check:
 
-- A sentence has a maximum of 20 words (rules 5.1 and 6.1 permit 20 and 25).
+- A sentence has a maximum of 20 words (rules 5.1 and 6.1 let you use 20 and 25).
 - Prose has no semicolons and no contractions.
 - Prose does not use Latin abbreviations.
 - Words that end in "ing" are technical names from TERMS.
 - Words from UNAPPROVED do not occur. The tool shows the approved word.
 
-Approved meanings, parts of speech and noun clusters need a human review.
+Approved meanings, parts of speech and noun clusters must have a human review.
 This tool does not certify compliance.
 
 Usage: python tools/ste_check.py [PATH...]

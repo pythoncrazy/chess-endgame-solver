@@ -1,7 +1,7 @@
 """Browser smoke test of the visualizer: load, click-move, drag, editor, buttons.
 
 Usage: python -I tools/visualizer/ui_smoke.py URL
-Prints every console error and failed request; exits non-zero on any failure.
+Prints every console error and failed request. Exits non-zero on any failure.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def main() -> int:  # noqa: PLR0915 - one linear browser script
         check(
             "turn flipped to black", page.locator("#turn-b").get_attribute("aria-pressed") == "true"
         )
-        # Explorer row click plays the move.
+        # A click on an explorer row plays the move.
         before = page.locator("#tview button").count()
         page.locator(".tb-move").first.click()
         page.wait_for_timeout(800)

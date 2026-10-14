@@ -1,4 +1,4 @@
-"""Measured page eviction and origin reads; no assumed production hit rates."""
+"""Measured page eviction and origin reads. No assumed production hit rates."""
 import json
 from pathlib import Path
 import sys

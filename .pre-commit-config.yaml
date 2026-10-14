@@ -1,6 +1,7 @@
-# prek (https://github.com/j178/prek) hooks. Install: prek install; run all: prek run --all-files
-# The supplied Python oracle scripts stay byte-identical to the ZIP (see FILE_HASHES.json),
-# so Python lint/format applies to tools/ only. All Rust workspaces are checked.
+# prek (https://github.com/j178/prek) hooks.
+# To install the hooks, run `prek install`. To run all hooks, run `prek run --all-files`.
+# The code of the supplied Python oracle scripts stays as in the ZIP.
+# Thus Python lint and format apply to tools/ only. The hooks check all Rust workspaces.
 default_install_hook_types: [pre-commit]
 repos:
   - repo: builtin

@@ -1,9 +1,10 @@
-"""Complete KQvKR re-encoding and batched FEN probes via python-chess.
+"""Encode all of KQvKR again and do batched FEN probes through python-chess.
 
-Uses python-chess's existing canonical ranking and capture-resolution rules,
-with raw symbols supplied from our archive. Private python-chess interfaces
-are deliberately isolated here: this is a version-sensitive research bridge.
-Other material dependencies still use supplied local Syzygy files.
+Uses the canonical rank rules and capture rules that python-chess already has.
+Our archive supplies the raw symbols. This module isolates the private
+python-chess interfaces on purpose, because this research bridge is sensitive
+to the python-chess version. Other material dependencies still use supplied
+local Syzygy files.
 """
 import argparse
 import hashlib
@@ -265,7 +266,7 @@ def experiment(chess_path,table_path,cache_path,output_path=None,page_positions=
             b.set_piece_at(int(square),chess.Piece(piece,color))
         b.turn=bool(rng.integers(2))
         if b.is_valid():boards.append(b)
-    # Include color mirroring and fresh-clock values; no repetition-history claim.
+    # Include color mirrors and values with a fresh clock. No claim about repetition history.
     boards.extend([b.mirror() for b in boards[:500]])
     expected=[oracle.probe_wdl(b) for b in boards]
     got,rounds=probe_batch(actual,encoded,reader,boards)

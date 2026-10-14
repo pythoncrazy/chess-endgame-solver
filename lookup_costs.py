@@ -1,8 +1,8 @@
 """R2/Workers read-only rate model, checked against official example math.
 
 Rates verified 2026-10-13. Hit rates, traffic and CPU times are assumptions,
-not demonstrated deployment measurements. No inference about cache hit rate
-from dataset compression or chess knowledge is justified.
+not demonstrated deployment measurements. Dataset compression and chess
+knowledge do not justify an inference about the cache hit rate.
 """
 import json
 import math

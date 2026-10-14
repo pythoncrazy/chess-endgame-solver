@@ -1,4 +1,4 @@
-"""Run independent correctness checks; CPU-only and no H100 timings claimed."""
+"""Run independent correctness checks. CPU only, with no claims about H100 times."""
 import argparse
 import json
 import sys
@@ -28,7 +28,7 @@ def random_graphs(cases=120):
             stats['duplicate_notifications'] += metrics['duplicates']
         stats['nodes'] += n
         stats['max_rounds'] = max(stats['max_rounds'], rounds)
-    # A long forced chain tests proof depth and parity; a closed cycle is drawn.
+    # A long forced chain tests proof depth and parity. A closed cycle is a draw.
     n = 257
     a = np.zeros((n, n), bool)
     for i in range(n - 1): a[i, i + 1] = True
@@ -37,7 +37,7 @@ def random_graphs(cases=120):
     assert rounds == 256 and rank[0] == 256
     assert np.array_equal(got, counter_oracle(a, seeds))
     assert verify_certificate(a, seeds, got, rank)
-    # A radix carry across blocks would incorrectly hide losing children.
+    # A radix carry across blocks would incorrectly hide children that are a loss.
     a = np.ones((130, 130), bool); state = np.full(130, -1, np.int8)
     w, l = encoded_float_predicates(a, state)
     assert w.all() and not l.any()
@@ -53,7 +53,8 @@ def chess_fibers(chess_path, cases=160):
     checked_rows = checked_edges = safe_segment_rows = 0
     for case in range(cases):
         piece = [chess.ROOK, chess.BISHOP, chess.QUEEN, chess.KNIGHT][case % 4]
-        # Skeleton: kings and 2 or 3 other pieces fixed; one white piece varies.
+        # Skeleton: the kings and 2 or 3 other pieces are fixed.
+        # The square of one white piece is variable.
         while True:
             squares = rng.choice(64, 5, replace=False).tolist()
             if chess.square_distance(squares[0], squares[1]) > 1: break
@@ -79,8 +80,9 @@ def chess_fibers(chess_path, cases=160):
         assert np.array_equal(w, (a & (state == -1)[None, :]).any(1))
         assert np.array_equal(l, a.any(1) & ~(a & (state != 1)[None, :]).any(1))
         checked_rows += int(valid.sum()); checked_edges += int(a.sum())
-        # Factorized nonking quiet relation: geometry from fixed blockers,
-        # times a destination-only own-king-safety mask, times source validity.
+        # Factorized quiet relation for a non-king piece. It is the geometry from
+        # fixed blockers, times a mask of own-king safety for each destination,
+        # times source validity.
         safe_destination = np.zeros(64, bool)
         for y in range(64):
             if board.piece_at(y): continue
@@ -96,8 +98,8 @@ def chess_fibers(chess_path, cases=160):
             board.remove_piece_at(x)
         factored = valid[:, None] & geometric & safe_destination[None, :]
         assert np.array_equal(factored, a), f"fiber legality factorization mismatch {case}"
-        # For sliders, every unblocked pair on the same line segment is
-        # connected. This checks the segment relation against legal moves.
+        # For sliders, an edge connects every unblocked pair on the same line
+        # segment. This checks the segment relation against legal moves.
         if piece != chess.KNIGHT:
             kinds = ([0, 1] if piece == chess.ROOK else [2, 3] if piece == chess.BISHOP else [0, 1, 2, 3])
             segment_relation = np.zeros_like(a)
@@ -131,9 +133,9 @@ def chess_fibers(chess_path, cases=160):
 def clocked_dag_checks():
     """Check topological clock DP against an independently expanded game graph.
 
-    Toy model has quiet same-tier edges and zeroing lower-tier edges. Models
-    either an automatic deadline, or a draw-claim action followed by a later
-    automatic deadline. This is not a complete FIDE repetition-history model.
+    The toy model has quiet edges in the same tier and zeroing edges to a lower
+    tier. It models an automatic deadline, or a draw claim and then a later
+    automatic deadline. This is not a complete FIDE model of repetition history.
     """
     rng = np.random.default_rng(831)
     results = []
@@ -169,8 +171,8 @@ def clocked_dag_checks():
                         for y in np.flatnonzero(zero[t, x]):
                             expanded[pos, ix(t - 1, 0, y)] = True
                             options.append(-int(values[t - 1, 0, y]))
-                    # Claim before an intended quiet move reaches the threshold,
-                    # or claim immediately once the threshold is reached.
+                    # Claim before an intended quiet move reaches the threshold.
+                    # Or claim immediately when the clock reaches the threshold.
                     claimable = claim is not None and (h >= claim or (h == claim - 1 and quiet[t, x].any()))
                     if options and claimable:
                         expanded[pos, draw_node] = True

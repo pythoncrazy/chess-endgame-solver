@@ -1,4 +1,4 @@
-"""Fetch the pinned published comparison tables; never generate chess results."""
+"""Fetch the pinned published comparison tables. Never generate chess results."""
 import argparse
 import hashlib
 import json

@@ -4,14 +4,14 @@ Usage:
   python -I tools/visualizer/server.py --tables DIR [--tables DIR ...]
       [--syzygy DIR ...] [--logs DIR] [--host 127.0.0.1] [--port 8642]
 
-Network budget: the page is one self-contained document (CSS, JS and the piece
-sprite inline) revalidated by ETag; fonts are content-addressed and immutable.
-API replies are compact JSON, gzip-compressed, over keep-alive connections. The
-client generates pawnless moves itself, so a probe returns only the value of
-each move, in UCI order. Tables are memory-mapped. A packed position costs one
-cached block per section (WDL, rank); a v4 black-to-move rank is derived from
-its white-to-move children; a v2 position costs one record. Values are never
-guessed.
+Network budget: the page is one self-contained document. It has the CSS, the JS
+and the piece sprite inline, and the client revalidates it by ETag. Fonts are
+content-addressed and immutable. API replies are compact JSON, gzip-compressed,
+over keep-alive connections. The client generates pawnless moves itself. Thus a
+probe returns only the value of each move, in UCI order. Tables are
+memory-mapped. A packed position costs one cached block per section (WDL,
+rank). The server derives a v4 black-to-move rank from its white-to-move
+children. A v2 position costs one record. The server never guesses values.
 """
 
 from __future__ import annotations
@@ -96,8 +96,10 @@ class Layout:
 
 @dataclass
 class Table(Layout):
-    """A memory-mapped table. Version 2 keeps one record per word, so a probe
-    is one contiguous read; version 1 (three planes) is still accepted."""
+    """A memory-mapped table. Version 2 keeps one record per word.
+
+    Thus a probe is one contiguous read. The server also accepts version 1
+    (three planes)."""
 
     path: Path
     header: dict
@@ -225,7 +227,7 @@ BLOCKS = BlockCache(2048)
 
 
 class PackedTable(Layout):
-    """A v3 or v4 table. Legality is not stored; callers judge it with python-chess."""
+    """A v3 or v4 table. It does not store legality. Callers judge it with python-chess."""
 
     knows_legality = False
 
@@ -301,9 +303,10 @@ class PackedTable(Layout):
         return data[0] if self.rank_width == 1 else int.from_bytes(data[:2], "little")
 
     def _derive_black(self, squares: list[int], bk: int, win: bool) -> int:
-        """Rank of a decisive black-to-move position from its white-to-move
-        children: a win is one more than its fastest losing child, a loss one
-        more than its slowest child; captures (lower material) count as 0."""
+        """Rank of a decisive black-to-move position from its white-to-move children.
+
+        A win is one more than its fastest child that is a loss. A loss is one
+        more than its slowest child. Captures (lower material) count as 0."""
         board = chess.Board(None)
         board.turn = chess.BLACK
         for (white, role), square in zip(self.pieces, squares, strict=True):
@@ -366,8 +369,9 @@ def material_name(board: chess.Board, white: bool) -> str:
 
 
 def chess_legal(board: chess.Board) -> bool:
-    """python-chess legality, accepting check patterns that cannot arise in play
-    (the tables and the shakmaty verifier accept them too)."""
+    """python-chess legality, but accept check patterns that cannot occur in play.
+
+    The tables and the shakmaty verifier also accept them."""
     ignored = chess.STATUS_IMPOSSIBLE_CHECK | chess.STATUS_TOO_MANY_CHECKERS
     return board.status() & ~ignored == chess.STATUS_VALID
 
@@ -461,8 +465,10 @@ class Store:
         return ("pass" if all(r["status"] == "pass" for r in runs) else "fail"), len(runs)
 
     def exact_dtm(self, name: str) -> bool:
-        """Proof ranks equal distance to mate when every capture leads to a material
-        without decisive positions (those children then correctly count as rank 0)."""
+        """True if proof ranks equal distance to mate.
+
+        That is the case if each capture leads to a material without decisive
+        positions. Those children then correctly count as rank 0."""
         pieces = skeleton(name)
         for k in range(1, len(pieces)):
             rest = pieces[:k] + pieces[k + 1 :]
@@ -528,10 +534,11 @@ class Store:
             "dtm": self.dtm_checks.get(digest),
         }
 
-    # Probing ----------------------------------------------------------------------
+    # Probes -----------------------------------------------------------------------
     def locate(self, board: chess.Board) -> tuple[Layout, bool, list[int], int] | None:
-        """Table, turn, skeleton squares and black king of a pawnless board (colours
-        swapped if needed)."""
+        """Table, turn, skeleton squares and black king of a pawnless board.
+
+        If necessary, this swaps the colours."""
         for flipped in (False, True):
             table = self.tables.get(material_name(board, white=not flipped))
             if table is None:
@@ -577,9 +584,14 @@ class Store:
             return None
 
     def probe(self, fen: str) -> dict:
-        """Compact probe. Keys: s status, m material, w WDL, r rank, z Syzygy WDL,
-        v [[wdl, rank], ...] per legal move in sorted UCI order, n move count,
-        d indices whose child disagrees with Syzygy, x legality disagreement."""
+        """Compact probe. The reply has these keys:
+
+        - s status, m material, w WDL, r rank, z Syzygy WDL.
+        - v [[wdl, rank], ...] for each legal move, in sorted UCI order.
+        - n move count.
+        - d indices of children that do not agree with Syzygy.
+        - x legality disagreement.
+        """
         start = time.perf_counter()
         try:
             board = chess.Board(fen)
@@ -702,7 +714,7 @@ ESBUILD = ["npx", "--no-install", "esbuild@0.25.10", "--minify"]
 
 
 def minify(source: str, loader: str) -> tuple[str, bool]:
-    """Minify with esbuild when it is installed locally; otherwise ship the source."""
+    """Minify with esbuild if it is installed locally. If not, ship the source."""
     try:
         done = subprocess.run(  # noqa: S603 - fixed argument list, no shell
             [*ESBUILD, f"--loader={loader}"],
@@ -826,7 +838,7 @@ def main() -> None:
     parser.add_argument(
         "--host",
         action="append",
-        help="bind address; repeat for several (IPv4 and IPv6); default loopback",
+        help="bind address. Repeat for several (IPv4 and IPv6). The default is loopback.",
     )
     args = parser.parse_args()
     Handler.store = Store(args.tables, args.syzygy, args.logs)
@@ -838,7 +850,7 @@ def main() -> None:
         server_class = V6Server if ":" in host else http.server.ThreadingHTTPServer
         servers.append(server_class((host, args.port), Handler))
         shown = f"[{host}]" if ":" in host else host
-        print(f"{len(Handler.store.tables)} tables; http://{shown}:{args.port}/", flush=True)
+        print(f"{len(Handler.store.tables)} tables at http://{shown}:{args.port}/", flush=True)
     for server in servers[1:]:
         threading.Thread(target=server.serve_forever, daemon=True).start()
     servers[0].serve_forever()

@@ -1,4 +1,4 @@
-"""Full KQvKR native stream page-size/decode-cost tradeoffs from cached data."""
+"""Page-size and decode-cost tradeoffs of the full native KQvKR stream, from cached data."""
 import argparse
 from collections import Counter
 import json

@@ -1,4 +1,4 @@
-"""Persistent multi-material cache/session contracts using published references."""
+"""Persistent multi-material cache/session contracts, checked with published references."""
 import argparse,json,sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor

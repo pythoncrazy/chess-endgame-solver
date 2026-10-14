@@ -1,4 +1,4 @@
-"""Six-piece H100 end-to-end bounds, with explicit traffic and timing assumptions."""
+"""Six-piece H100 end-to-end bounds, with explicit traffic and time assumptions."""
 import json,math,re,hashlib
 from pathlib import Path
 
@@ -23,10 +23,10 @@ def model():
                             peak_compute_rows_s=compute,peak_bandwidth_rows_s=bandwidth,
                             conditional_rate_ceiling_rows_s=rate,full_dense_source_pass_lower_bound_ms=1000*dense/rate,
                             caveat='Resident operator only; mask generation, layout changes, rank/gathers, packing instructions, spill traffic, global convergence and other pieces are excluded. Static shared matrix assumed hot in cache. FP8 peak is optimistic; full-precision accumulation can reduce attainable arithmetic throughput.'))
-    # An illustrative INT32 instruction-issue cap. Hopper has half as many
-    # INT32 lanes as FP32 lanes; advertised FP32 FLOPS count two ops per FMA.
-    # Actual compiled instruction counts, dual issue and 64-bit lowering must
-    # be measured, so these are sensitivity cases, not kernel predictions.
+    # An illustrative cap on INT32 instruction issue. Hopper has half as many
+    # INT32 lanes as FP32 lanes. Advertised FP32 FLOPS count two ops per FMA.
+    # Measure the actual compiled instruction counts, dual issue and 64-bit
+    # lowered code. Until then, these are sensitivity cases, not kernel predictions.
     scalar32_issue=67e12/4
     scalar_sensitivity=[dict(assumed_int32_lane_instructions_per_source_row=n,
                              conditional_scalar_rows_s=scalar32_issue/n,

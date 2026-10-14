@@ -1,8 +1,9 @@
 """Measured exact codecs on native Syzygy symbol streams and chess DTM.
 
-Native streams include illegal-slot fillers and capture-reconstructable values;
-they are NOT necessarily final legal-board WDL answers. Samples are explicitly
-labelled. No whole-eight size extrapolation is made.
+Native streams contain fillers for illegal slots and values that captures can
+reconstruct. Thus they are NOT necessarily final WDL answers for legal boards.
+Each sample has an explicit label. This script does not extrapolate the size of
+all eight-piece tables.
 """
 import argparse
 from collections import Counter
@@ -80,7 +81,7 @@ def reconstruction(chess_path,table_path):
     from validate_quotient import chess_check
     measured={}
     def experiment(nodes,graph,wdl,dtm):
-        # Win proof depths are odd; loss proof depths are even, including mate 0.
+        # Win proof depths are odd. Loss proof depths are even, with mate 0.
         win=np.flatnonzero(wdl==1);loss=np.flatnonzero(wdl==-1)
         assert np.all(dtm[win]%2==1) and np.all(dtm[loss]%2==0)
         stored={int(i):int(dtm[i]) for i in loss}

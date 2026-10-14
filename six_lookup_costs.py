@@ -1,4 +1,4 @@
-"""Origin-only cost sensitivity from measured native probing traces."""
+"""Origin-only cost sensitivity from measured traces of native probes."""
 import json
 from pathlib import Path
 

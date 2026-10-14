@@ -24,7 +24,7 @@ export default {
         offset < 0 || length <= 0 || length > MAX_RANGE || !Number.isSafeInteger(offset+length)) {
       return reply('Range out of bounds', 416);
     }
-    // Normalize numeric spelling, giving one stable cache key for each range.
+    // Write the numbers in one normal form, so each range has one stable cache key.
     const token = `${key}/${offset}/${length}`;
     const cacheKey = new Request(`${url.origin}/range/${token}`, {method:'GET'});
     const cache = caches.default;

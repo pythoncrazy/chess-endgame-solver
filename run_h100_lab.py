@@ -1,4 +1,4 @@
-"""H100 preflight and exact operator comparison. Never invents generation timings."""
+"""H100 preflight and exact operator comparison. Never invents generation times."""
 import argparse,json,os,shutil,subprocess,time
 from pathlib import Path
 

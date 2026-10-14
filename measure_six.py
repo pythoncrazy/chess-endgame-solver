@@ -1,7 +1,8 @@
 """Published six-piece metadata, sampled codec costs and native Rust probe oracle.
 
-This does NOT generate a six-piece material. Native symbols are stored-stream
-codes, including fillers; they are not final legal-position WDL answers.
+This does NOT generate a six-piece material. Native symbols are the codes of
+the stored stream, with fillers. They are not final WDL answers for legal
+positions.
 """
 import argparse,hashlib,json,sys,time,tempfile,re
 from pathlib import Path

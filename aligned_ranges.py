@@ -34,10 +34,10 @@ class RangeLRU:
 
 
 class AlignedRangeStore:
-    """Use stable physical byte-tile URLs, allowing reuse across query batches.
+    """Use stable physical byte-tile URLs, so query batches can use tiles again.
 
-    object_sizes comes from the verified catalog. Tiles increase fetched bytes;
-    enable only where locality/cache savings justify that amplification.
+    object_sizes comes from the verified catalog. Tiles increase fetched bytes.
+    Use tiles only where locality and cache savings justify that amplification.
     """
     def __init__(self,store,object_sizes,tile_bytes=65536):
         self.store=store;self.object_sizes=object_sizes
