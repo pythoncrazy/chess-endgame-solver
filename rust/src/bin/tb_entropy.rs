@@ -220,6 +220,243 @@ fn rank_bits(wdl: &[u8], rank: &[u16], words: usize) -> Vec<(&'static str, f64)>
     out
 }
 
+/// Binary context mixer, as in PAQ coders.
+/// Each model keeps an adaptive bit probability per context.
+/// A mixer adds the model outputs in the logistic domain with online weights.
+struct Mixer {
+    tables: Vec<Vec<(f32, u16)>>,
+    weights: Vec<f32>,
+    stretched: Vec<f32>,
+    limit: u16,
+    rate: f32,
+    bits: f64,
+}
+
+fn stretch(p: f32) -> f32 {
+    (p / (1.0 - p)).ln()
+}
+
+impl Mixer {
+    fn new(sizes: &[usize], sets: usize, limit: u16, rate: f32) -> Mixer {
+        Mixer {
+            tables: sizes.iter().map(|&n| vec![(0.5, 0); n]).collect(),
+            weights: vec![0.0; sets * sizes.len()],
+            stretched: vec![0.0; sizes.len()],
+            limit,
+            rate,
+            bits: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        for t in &mut self.tables {
+            t.fill((0.5, 0));
+        }
+        let start = 1.0 / self.tables.len() as f32;
+        self.weights.fill(start);
+    }
+
+    fn code(&mut self, contexts: &[usize], set: usize, bit: bool) {
+        let n = self.tables.len();
+        let w = &mut self.weights[set * n..(set + 1) * n];
+        let mut dot = 0.0;
+        for (i, &c) in contexts.iter().enumerate() {
+            let s = stretch(self.tables[i][c].0);
+            self.stretched[i] = s;
+            dot += w[i] * s;
+        }
+        let p = (1.0 / (1.0 + (-dot).exp())).clamp(1.0 / 65536.0, 1.0 - 1.0 / 65536.0);
+        let y = f32::from(u8::from(bit));
+        self.bits -= f64::from(if bit { p } else { 1.0 - p }).log2();
+        let err = (y - p) * self.rate;
+        for (wi, s) in w.iter_mut().zip(&self.stretched) {
+            *wi += err * s;
+        }
+        for (i, &c) in contexts.iter().enumerate() {
+            let (q, k) = &mut self.tables[i][c];
+            *q = (*q + (y - *q) / (f32::from(*k) + 1.5)).clamp(1.0 / 4096.0, 1.0 - 1.0 / 4096.0);
+            *k = (*k + 1).min(self.limit);
+        }
+    }
+}
+
+/// Code each block in parallel with a fresh mixer and add the code lengths.
+fn per_block<M, F>(words: usize, per_block: usize, make: M, block: F) -> f64
+where
+    M: Fn() -> Mixer + Sync,
+    F: Fn(usize, usize, &mut Mixer) + Sync,
+{
+    let threads = 24;
+    let blocks = words.div_ceil(per_block);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (make, block) = (&make, &block);
+                s.spawn(move || {
+                    let mut m = make();
+                    for b in (t..blocks).step_by(threads) {
+                        m.reset();
+                        let start = b * per_block;
+                        block(start, (start + per_block).min(words), &mut m);
+                    }
+                    m.bits
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("block")).sum()
+    })
+}
+
+/// Value at (file + df, rank + dr) of word cw - dw, if the block has it.
+fn near<T: Copy>(
+    v: &[T],
+    none: T,
+    start: usize,
+    (cw, bk): (usize, usize),
+    (dw, df, dr): (usize, i32, i32),
+) -> T {
+    let (f, r) = ((bk % 8) as i32 + df, (bk / 8) as i32 + dr);
+    if cw < start + dw || !(0..8).contains(&f) || !(0..8).contains(&r) {
+        return none;
+    }
+    v[(cw - dw) * 64 + (r * 8 + f) as usize]
+}
+
+const WDL_NODES: usize = 6;
+
+fn wdl_mixing(wdl: &[u8], words: usize, limit: u16, rate: f32) -> f64 {
+    let black_start = words / 2;
+    let sizes = [1, 25, 625, 15625, 15625, 78125, 3125, 3125].map(|n| n * WDL_NODES);
+    per_block(
+        words,
+        BLOCK / 16,
+        || Mixer::new(&sizes, WDL_NODES * 5, limit, rate),
+        |start, end, m| {
+            let mut c = [0usize; 8];
+            for cw in start..end {
+                let turn = usize::from(cw >= black_start) * 3;
+                for bk in 0..64 {
+                    let v = wdl[cw * 64 + bk];
+                    if v == UNKNOWN {
+                        continue;
+                    }
+                    let at =
+                        |dw, df, dr| usize::from(near(wdl, UNKNOWN, start, (cw, bk), (dw, df, dr)));
+                    let (left, up, ul, ur) =
+                        (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
+                    let (w1, w8, w64, w512, w4096) = (
+                        at(1, 0, 0),
+                        at(8, 0, 0),
+                        at(64, 0, 0),
+                        at(512, 0, 0),
+                        at(4096, 0, 0),
+                    );
+                    let (w1l, w1u) = (at(1, -1, 0), at(1, 0, -1));
+                    let board = left * 5 + up;
+                    let word = board * 25 + w1 * 5 + w8;
+                    let base = [
+                        0,
+                        board,
+                        word,
+                        word * 25 + ul * 5 + ur,
+                        word * 25 + w64 * 5 + w512,
+                        (word * 25 + ul * 5 + ur) * 5 + w64,
+                        (((w1 * 5 + w8) * 5 + w64) * 5 + w512) * 5 + w4096,
+                        (((board * 5 + w1) * 5 + w1l) * 5) + w1u,
+                    ];
+                    let mut node = |n: usize, bit: bool| {
+                        for (ci, b) in c.iter_mut().zip(base) {
+                            *ci = b * WDL_NODES + n + turn;
+                        }
+                        m.code(&c, (n + turn) * 5 + left, bit);
+                    };
+                    node(0, v == 0);
+                    if v != 0 {
+                        node(1, v == 2);
+                        if v != 2 && turn != 0 {
+                            node(2, v == 3);
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+const RANK_NODES: usize = 160;
+
+/// Context value of a neighbour rank relative to the predicted rank.
+fn rel(x: u16, pred: u16) -> usize {
+    if x == NO_RANK {
+        17
+    } else {
+        (i32::from(x) - i32::from(pred)).clamp(-8, 8) as usize + 8
+    }
+}
+
+fn rank_mixing(wdl: &[u8], rank: &[u16], words: usize, limit: u16, rate: f32) -> f64 {
+    let sizes = [8, 2056, 648, 11664, 11664, 9252, 11664].map(|n| n * RANK_NODES);
+    per_block(
+        words,
+        BLOCK / 64,
+        || Mixer::new(&sizes, RANK_NODES * 2, limit, rate),
+        |start, end, m| {
+            let mut c = [0usize; 7];
+            for cw in start..end {
+                for bk in 0..64 {
+                    let r = rank[cw * 64 + bk];
+                    if r == NO_RANK {
+                        continue;
+                    }
+                    let win = usize::from(wdl[cw * 64 + bk] == 1);
+                    let at = |dw, df, dr| near(rank, NO_RANK, start, (cw, bk), (dw, df, dr));
+                    let (left, up, ul, ur) =
+                        (at(0, -1, 0), at(0, 0, -1), at(0, -1, -1), at(0, 1, -1));
+                    let (w1, w8, w64) = (at(1, 0, 0), at(8, 0, 0), at(64, 0, 0));
+                    let (kind, pred) = [left, up, w1]
+                        .iter()
+                        .position(|&x| x != NO_RANK)
+                        .map_or((3, 0), |i| (i, [left, up, w1][i]));
+                    let p = usize::from(pred);
+                    let base = [
+                        win * 4 + kind,
+                        (win * 4 + kind) * 257 + p,
+                        (win * 18 + rel(up, pred)) * 18 + rel(w1, pred),
+                        ((win * 18 + rel(up, pred)) * 18 + rel(ul, pred)) * 18 + rel(ur, pred),
+                        ((win * 18 + rel(w1, pred)) * 18 + rel(w8, pred)) * 18 + rel(w64, pred),
+                        (win * 257 + p) * 18 + rel(up, pred),
+                        ((win * 18 + rel(left, pred)) * 18 + rel(w1, pred)) * 18 + rel(w8, pred),
+                    ];
+                    let mut node = |n: usize, bit: bool| {
+                        for (ci, b) in c.iter_mut().zip(base) {
+                            *ci = b * RANK_NODES + n;
+                        }
+                        m.code(&c, n * 2 + win, bit);
+                    };
+                    let d = i32::from(r) - i32::from(pred);
+                    node(0, d == 0);
+                    if d == 0 {
+                        continue;
+                    }
+                    let neg = usize::from(d < 0) * 80;
+                    node(1, d < 0);
+                    let mag = d.unsigned_abs();
+                    let k = mag.ilog2() as usize;
+                    for j in 0..k {
+                        node(2 + j + neg, true);
+                    }
+                    if k < 7 {
+                        node(2 + k + neg, false);
+                    }
+                    for i in (0..k).rev() {
+                        node(10 + k * 8 + i + neg, mag >> i & 1 == 1);
+                    }
+                }
+            }
+        },
+    )
+}
+
 fn main() -> Result<(), String> {
     let mut report = Vec::new();
     for input in std::env::args().skip(1).map(PathBuf::from) {
@@ -232,6 +469,12 @@ fn main() -> Result<(), String> {
         let words = stored.records.len();
         let known = wdl.iter().filter(|&&v| v != UNKNOWN).count();
         let ranked = rank.iter().filter(|&&r| r != NO_RANK).count();
+        let t_mix = Instant::now();
+        let wdl_mix = wdl_mixing(&wdl, words, 255, 0.02);
+        let wdl_mix_s = t_mix.elapsed().as_secs_f64();
+        let t_mix = Instant::now();
+        let rank_mix = rank_mixing(&wdl, &rank, words, 255, 0.02);
+        let rank_mix_s = t_mix.elapsed().as_secs_f64();
         let (w, r) = std::thread::scope(|s| {
             let w = s.spawn(|| wdl_bits(&wdl, words));
             let r = s.spawn(|| rank_bits(&wdl, &rank, words));
@@ -249,6 +492,8 @@ fn main() -> Result<(), String> {
             "file_sections": header.sections.iter()
                 .map(|s| (s.name.clone(), s.compressed_bytes)).collect::<Vec<_>>(),
             "wdl_bytes": bytes(w), "rank_bytes": bytes(r),
+            "wdl_mixing_bytes": (wdl_mix / 8.0).round(), "rank_mixing_bytes": (rank_mix / 8.0).round(),
+            "wdl_mixing_seconds": wdl_mix_s, "rank_mixing_seconds": rank_mix_s,
             "seconds": t.elapsed().as_secs_f64(),
         });
         eprintln!("{row}");
