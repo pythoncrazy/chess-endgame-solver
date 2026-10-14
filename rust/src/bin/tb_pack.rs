@@ -72,14 +72,19 @@ fn main() -> Result<(), String> {
         let t1 = Instant::now();
         let stored = Canonical::from_table(&table);
         let path = output.join(format!("{}.tbz", table.material.name()));
-        let file = File::create(&path).map_err(|e| e.to_string())?;
+        let partial = path.with_extension("tbz.partial");
+        let file = File::create(&partial).map_err(|e| e.to_string())?;
         let header = packed::write(
             &stored,
             BufWriter::new(file),
             concat!("tb_pack ", env!("CARGO_PKG_VERSION")),
             options,
             threads,
-        )?;
+        )
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&partial);
+        })?;
+        std::fs::rename(&partial, &path).map_err(|e| e.to_string())?;
         let pack_seconds = t1.elapsed().as_secs_f64();
         let mut row = serde_json::json!({
             "material": header.material, "source": input, "source_sha256": source_digest,
