@@ -25,6 +25,8 @@ The `verify_pawnless` program makes these checks on each position:
 - The legality of the position agrees with shakmaty.
 - The win, draw or loss agrees with the Syzygy WDL value.
 - The proof rank is exact. The program calculates it again from the ranks of the next positions.
+- With `--dtz`, the proof rank agrees with the Syzygy DTZ value. This is a second check of
+  the ranks. It does not use the solver data of the next positions.
 
 Thus a table cannot pass with a wrong result or with a wrong rank.
 
@@ -56,11 +58,12 @@ export TB_ROOT=/path/to/data
 
 ### Get the reference tables
 
-Download the Syzygy WDL tables for all pawnless materials with five pieces or fewer:
+Download the Syzygy WDL tables for all pawnless materials with five pieces or fewer.
+Add `--dtz` to download the DTZ tables also (290 MB):
 
 ```sh
 uv sync
-uv run tools/fetch_syzygy.py "$TB_ROOT/references-345" 5
+uv run tools/fetch_syzygy.py "$TB_ROOT/references-345" 5 --dtz
 ```
 
 ### Solve tables
@@ -104,7 +107,7 @@ cargo run --release --manifest-path rust/verify/Cargo.toml --bin verify_pawnless
 
 The second argument is the number of threads. Add `--stored` to check one position
 of each symmetry class and the symmetry of the table. This is faster than a check
-of all positions.
+of all positions. Add `--dtz` to compare the proof ranks with the Syzygy DTZ tables.
 
 ### Open the viewer
 

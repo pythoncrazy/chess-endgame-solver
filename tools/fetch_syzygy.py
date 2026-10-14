@@ -1,10 +1,11 @@
-"""Fetch the published Syzygy WDL tables of every pawnless material up to five pieces.
+"""Fetch the published Syzygy tables of every pawnless material up to five pieces.
 
+The script fetches the WDL tables. With --dtz, it also fetches the DTZ tables.
 Files come from tablebase.lichess.ovh. Each file must match the MD5 that an
 independent mirror (tablebase.sesse.net) publishes. The catalog records size, MD5
 and SHA-256. This script downloads only reference data. It generates no chess result.
 
-Usage: uv run tools/fetch_syzygy.py DIRECTORY [MAX_PIECES]
+Usage: uv run tools/fetch_syzygy.py DIRECTORY [MAX_PIECES] [--dtz]
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-SOURCE = "https://tablebase.lichess.ovh/tables/standard/3-4-5-wdl/"
+SOURCE = "https://tablebase.lichess.ovh/tables/standard/3-4-5-{kind}/"
 CHECKSUMS = "http://tablebase.sesse.net/syzygy/3-4-5/checksum.md5"
 VALUE = {"Q": 9, "R": 5, "B": 3, "N": 3}
 
@@ -52,16 +53,18 @@ def fetch(url: str) -> bytes:
 
 
 def main() -> int:
-    root = Path(sys.argv[1])
-    max_pieces = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    args = [a for a in sys.argv[1:] if a != "--dtz"]
+    kinds = {"rtbw": "wdl"} | ({"rtbz": "dtz"} if "--dtz" in sys.argv[1:] else {})
+    root = Path(args[0])
+    max_pieces = int(args[1]) if len(args) > 1 else 5
     root.mkdir(parents=True, exist_ok=True)
     md5 = {}
     for line in fetch(CHECKSUMS).decode().splitlines():
         digest, _, name = line.partition("  ")
         md5[name.strip()] = digest
     catalog = []
-    for name in materials(max_pieces):
-        file = f"{name}.rtbw"
+    for name, (suffix, kind) in itertools.product(materials(max_pieces), kinds.items()):
+        file = f"{name}.{suffix}"
         expected = md5.get(file)
         if expected is None:
             print(f"{file}: not in the independent checksum list", file=sys.stderr)
@@ -69,7 +72,7 @@ def main() -> int:
         path = root / file
         data = path.read_bytes() if path.exists() else b""
         if hashlib.md5(data).hexdigest() != expected:  # noqa: S324 - published checksum format
-            data = fetch(SOURCE + file)
+            data = fetch(SOURCE.format(kind=kind) + file)
             if hashlib.md5(data).hexdigest() != expected:  # noqa: S324
                 print(f"{file}: MD5 mismatch against {CHECKSUMS}", file=sys.stderr)
                 return 1
@@ -86,8 +89,9 @@ def main() -> int:
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
         )
+    sources = [SOURCE.format(kind=kind) for kind in kinds.values()]
     (root / "catalog.json").write_text(
-        json.dumps({"source": SOURCE, "md5_list": CHECKSUMS, "files": catalog}, indent=1) + "\n"
+        json.dumps({"sources": sources, "md5_list": CHECKSUMS, "files": catalog}, indent=1) + "\n"
     )
     print(f"{len(catalog)} files, {sum(c['bytes'] for c in catalog)} bytes in {root}")
     return 0
