@@ -1508,6 +1508,9 @@ impl PackedTable {
                         win |= u64::from(code & 1 == 1) << bk;
                         loss |= u64::from(code == 2) << bk;
                         if code == 3 {
+                            if !derived || cw < rank_words {
+                                return Err("invalid WDL code".into());
+                            }
                             *slot = 1;
                         } else if ranked && code != 0 && cw < rank_words {
                             *slot = if width == 1 {
@@ -1588,6 +1591,38 @@ impl PackedTable {
         });
         if ranked && derived {
             self.derive_black_ranks(&mut table, threads)?;
+        }
+        // A cm block fills positions without a value from its own block only.
+        // Thus the digest of a cm section uses the blocks of the writer.
+        let cm = self.wdl.cm.is_some() || self.rank.as_ref().is_some_and(|s| s.cm.is_some());
+        let canonical = cm.then(|| Canonical::from_table(&table));
+        let mut content = Sha256::new();
+        for (is_rank, raw, section) in [
+            (false, &wdl, Some(&self.wdl)),
+            (true, &rank_raw, self.rank.as_ref()),
+        ] {
+            let Some(section) = section else { continue };
+            let digests = parallel(raw.len().div_ceil(BLOCK), threads, |b| {
+                let digest = match (&canonical, section.cm.is_some(), is_rank) {
+                    (Some(c), true, true) => {
+                        Sha256::digest(rank_block(layout, c, b, width, rank_words))
+                    }
+                    (Some(c), true, false) => {
+                        Sha256::digest(wdl_block(layout, c, b, self.header.rank_sides))
+                    }
+                    _ => Sha256::digest(&raw[b * BLOCK..raw.len().min((b + 1) * BLOCK)]),
+                };
+                Ok(<[u8; 32]>::from(digest))
+            })?;
+            for d in &digests {
+                content.update(d);
+            }
+        }
+        if format!("{:x}", content.finalize()) != self.header.content_sha256 {
+            return Err("v3 content digest mismatch".into());
+        }
+        if self.header.counts.is_some_and(|c| c != table.counts()) {
+            return Err("v3 header counts disagree with the table".into());
         }
         Ok(table)
     }
