@@ -2,9 +2,9 @@
 
 Usage: python -I tools/online_compare.py PACKAGE_ROOT REFERENCE_DIR OUTPUT_DIR
 
-The local oracle is python-chess probing the verified native Syzygy files. For the
-1,005-FEN set, the Rust-verified expected values must also agree. Unknown or
-unmapped online categories are recorded as unresolved, never as draws.
+The local oracle is python-chess, which probes the verified native Syzygy files. For
+the 1,005-FEN set, the Rust-verified expected values must also agree. The script
+records unknown or unmapped online categories as unresolved, never as draws.
 """
 
 from __future__ import annotations
@@ -134,8 +134,8 @@ class Client:
 
 
 def select_positions(rust_values: dict[str, int]) -> list[tuple[str, str]]:
-    """Stratify by material, value and turn; then fill randomly to SAMPLE_SIZE."""
-    rng = random.Random(SEED)  # noqa: S311 - reproducible sampling, not cryptography
+    """Stratify by material, value and turn. Then fill randomly to SAMPLE_SIZE."""
+    rng = random.Random(SEED)  # noqa: S311 - reproducible samples, not cryptography
     groups: dict[tuple[str, int, str], list[str]] = collections.defaultdict(list)
     for fen, value in rust_values.items():
         groups[material(chess.Board(fen)), value, fen.split()[1]].append(fen)
@@ -151,8 +151,8 @@ def select_positions(rust_values: dict[str, int]) -> list[tuple[str, str]]:
 def compare_children(tablebase, board: chess.Board, moves: list[dict]) -> dict:
     """Compare each online child entry with the local child value at clock zero.
 
-    Online child categories include the child's own clock. A quiet child with a
-    nonzero clock whose class magnitude differs is recorded as skipped.
+    Online child categories include the own clock of the child. If a quiet child
+    has a nonzero clock and a different class magnitude, record it as skipped.
     """
     differ, checked, skipped = [], 0, 0
     for move in moves:

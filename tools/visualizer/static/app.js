@@ -1,6 +1,6 @@
 // Tablebase analysis board. The client generates pawnless chess moves itself
-// (no pawns, castling or en passant), so the server sends only the value of each
-// legal move, in sorted UCI order. Responses are cached per FEN.
+// (no pawns, castling or en passant). Thus the server sends only the value of
+// each legal move, in sorted UCI order. The client caches responses per FEN.
 
 const $ = (id) => document.getElementById(id);
 const FILES = "abcdefgh";
@@ -126,9 +126,9 @@ const state = {
   flipped: false,
   tool: "move",
   selected: null,
-  moves: [], // legal moves of the current position (client-generated)
-  result: null, // server reply for the current position
-  nodes: [], // [{ fen, uci, san }], index 0 is the setup
+  moves: [], // Legal moves of the position on the board (client-generated).
+  result: null, // Server reply for the position on the board.
+  nodes: [], // [{ fen, uci, san }]. Index 0 is the setup.
   index: 0,
   request: 0,
 };
@@ -294,7 +294,7 @@ $("board").addEventListener("pointerup", (e) => {
   if (to === d.from) { renderBoard(); return; }
   const m = to === null ? null : moveFor(d.from, to);
   if (m) { playMove(m); return; }
-  // Not a legal move: the drop edits the position; off the board removes the piece.
+  // Not a legal move: the drop edits the position. A drop off the board removes the piece.
   state.board[d.from] = null;
   if (to !== null) state.board[to] = d.piece;
   edit();
@@ -372,8 +372,8 @@ const OK = '<svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><path d="m3
 const BAD = '<svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8"/></svg>';
 const WHY = {
   pawns: "Pawns are outside the pawnless tables.",
-  castling: "Castling rights are not represented.",
-  kings: "Each side needs exactly one king.",
+  castling: "The tables do not include castling rights.",
+  kings: "Each side must have exactly one king.",
   pieces: "The tables cover at most six pieces.",
 };
 const TITLES = {
@@ -434,7 +434,7 @@ function renderTools() {
   const rankText = r.r == null ? "no proof rank" : exact ? `mate in ${r.r} plies` : `proof rank ${r.r}`;
   sub.textContent = mate ? `Checkmate · ${z}` : terminal ? `Stalemate · ${z}` : `${r.m} · ${rankText} · ${z} · ${r.ms} ms`;
   if (!moves) {
-    $("explorer").innerHTML = '<div class="status-box"><strong>Move list mismatch</strong>The server and the client disagree on the legal moves; no values are shown.</div>';
+    $("explorer").innerHTML = '<div class="status-box"><strong>Move list mismatch</strong>The server and the client do not agree on the legal moves. No values are shown.</div>';
     return;
   }
   renderExplorer(moves, exact);
@@ -451,7 +451,7 @@ function renderExplorer(moves, exact) {
     if (a.w === -2) return rb - ra;
     return 0;
   };
-  for (const [title, w] of [["Winning", 2], ["Drawing", 0], ["Losing", -2], ["Unknown", null]]) {
+  for (const [title, w] of [["Wins", 2], ["Draws", 0], ["Losses", -2], ["Unknown", null]]) {
     const list = moves.filter((m) => (m.w ?? null) === w).sort(order);
     if (!list.length) continue;
     const h = document.createElement("h3");
@@ -475,7 +475,7 @@ function moveRow(m, exact) {
   b.className = "tb-move";
   const name = san(state.board, state.turn, m, state.moves);
   const label = m.mate ? "Checkmate" : m.stale ? "Stalemate" : RES[m.w] ?? "Unknown";
-  // The child may live in a lower material: label its rank by that table.
+  // The child can be in a lower material. Label its rank by that table.
   const childExact = materials?.[materialOf(m.next)]?.exactDtm ?? exact;
   const dist = m.rank != null && m.w !== 0 && !m.mate ? `${childExact ? "DTM" : "rank"} ${m.rank + 1}` : "";
   const warn = m.disagree ? '<span class="warn" title="Syzygy disagrees for this child">≠ Syzygy</span>' : "";
@@ -712,16 +712,16 @@ async function renderEvidence() {
   $("verify-list").innerHTML = ev.verify?.length ? ev.verify.map((c) => `
     <div class="box report">
       <header><strong class="${c.status === "pass" ? "ok" : "bad"}">${c.status === "pass" ? OK : BAD}${c.status}</strong><span>${c.scope?.startsWith("canonical") ? "canonical positions + 8 symmetries" : "all positions"}</span></header>
-      <p>${fmtInt(c.legal_positions)} legal positions; ${fmtInt(c.syzygy_wdl_compared)} compared with Syzygy</p>
-      <p>${c.proof_ranks_present === false ? "No proof ranks (in-place table)" : `${fmtInt(c.proof_obligations_checked)} proof obligations checked`}${c.symmetry_violating_words != null ? `; ${fmtInt(c.symmetry_violating_words)} symmetry violations` : ""}</p>
+      <p>${fmtInt(c.legal_positions)} legal positions · ${fmtInt(c.syzygy_wdl_compared)} compared with Syzygy</p>
+      <p>${c.proof_ranks_present === false ? "No proof ranks (in-place table)" : `${fmtInt(c.proof_obligations_checked)} proof obligations checked`}${c.symmetry_violating_words != null ? ` · ${fmtInt(c.symmetry_violating_words)} symmetry violations` : ""}</p>
       ${c.first_failure ? `<p class="bad">First failure: ${c.first_failure}</p>` : ""}
       <p class="src">${c.log} · ${c.seconds?.toFixed(1)} s</p>
     </div>`).join("") : '<div class="box report"><span class="pending">Pending.</span> No verifier report matches this payload digest yet.</div>';
   const cards = [];
-  if (ev.dtm) cards.push(`<div class="box report"><header><strong>This table vs lichess DTM</strong><span>${ev.dtm.a} / ${ev.dtm.n} agree</span></header><p>WDL and |DTM| plies vs the synchronous proof rank; matched by payload digest.</p></div>`);
+  if (ev.dtm) cards.push(`<div class="box report"><header><strong>This table and lichess DTM</strong><span>${ev.dtm.a} / ${ev.dtm.n} agree</span></header><p>WDL and |DTM| plies, compared with the synchronous proof rank. Matched to this table by payload digest.</p></div>`);
   if (ev.ref) {
-    const extra = [ev.ref.u ? `${ev.ref.u} unresolved (no local reference value), excluded` : "", ev.ref.s ? `${ev.ref.s} with a nonzero halfmove clock, recorded separately` : ""].filter(Boolean).join("; ");
-    cards.push(`<div class="box report"><header><strong>Syzygy reference vs lichess</strong><span class="${ev.ref.d ? "bad" : ""}">${ev.ref.a} / ${ev.ref.a + ev.ref.d} compared agree</span></header><p>Checks the reference files this table is verified against, not the table itself.</p>${extra ? `<p>${extra}</p>` : ""}</div>`);
+    const extra = [ev.ref.u ? `${ev.ref.u} unresolved (no local reference value), excluded` : "", ev.ref.s ? `${ev.ref.s} with a nonzero halfmove clock, recorded separately` : ""].filter(Boolean).join(" · ");
+    cards.push(`<div class="box report"><header><strong>Syzygy reference and lichess</strong><span class="${ev.ref.d ? "bad" : ""}">${ev.ref.a} / ${ev.ref.a + ev.ref.d} compared agree</span></header><p>Checks the reference files this table is verified against, not the table itself.</p>${extra ? `<p>${extra}</p>` : ""}</div>`);
   }
   $("online-list").innerHTML = cards.join("") || `<div class="box report">No online comparison covers ${name}.</div>`;
 }

@@ -1,4 +1,4 @@
-"""Independent padded index/quiet move-closure fixtures, using python-chess."""
+"""Independent fixtures for the padded index and quiet move closure, with python-chess."""
 import argparse
 import json
 import random
@@ -41,7 +41,7 @@ def validate(chess_path):
         value,s=rank(squares,board.turn==chess.BLACK)
         canonical=[transform(square,s) for square in squares]
         assert rank(canonical,board.turn==chess.BLACK)[0]==value
-        # Independent board transformation preserves actual legal quiet moves.
+        # An independent board transformation keeps the actual legal quiet moves.
         transformed=board.transform(lambda bb:sum(1<<transform(sq,s) for sq in chess.scan_forward(bb)))
         children=[]
         for move in board.legal_moves:
@@ -53,9 +53,10 @@ def validate(chess_path):
             child=squares.copy();child[axis]=move.to_square
             child_value,_=rank(child,board.turn!=chess.BLACK)
             canonical_child=canonical.copy();canonical_child[axis]=target
-            # Residual king stabilizers allow different orientations to represent
-            # the same board. Compare the chosen working child from canonical
-            # coordinates, not an arbitrary original orientation's child ID.
+            # Residual king stabilizers let different orientations represent the
+            # same board. Compare the chosen working child from canonical
+            # coordinates. Do not compare the child ID of an original orientation,
+            # because the orientation that occurs can be any of them.
             child_value,_=rank(canonical_child,board.turn!=chess.BLACK)
             children.append([axis,target,str(child_value)])
             quiet+=1;king+=axis<2

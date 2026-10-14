@@ -45,7 +45,7 @@ def validate():
             else:raise AssertionError(('undetected bit mutation',offset,len(frame)))
     for frame in selected[:10]:
         for end in (0,1,15,31,len(frame)-1):rejects(lambda f=frame,e=end:decode(f[:e]))
-    # Zstd trailing data was previously ignored by the decompressor.
+    # Before, the decompressor ignored data after the end of a Zstd frame.
     frame=next(f for f,i in candidates(np.arange(65),allow_lzma=False) if i['compression']=='zstd')
     fields=list(HEADER.unpack_from(frame));fields[6]+=1
     rejects(lambda:decode(HEADER.pack(*fields)+frame[32:]+b'x'))

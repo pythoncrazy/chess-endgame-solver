@@ -53,14 +53,14 @@ def validate():
         const_store=LocalRangeStore(directory);const_reader=ArchiveReader(manifest,const_store)
         assert np.array_equal(const_reader.probe_many(np.arange(page*3)),values[:page*3])
         assert const_store.requests==1
-        # Object-index integrity is checked before trusting offsets/constants.
+        # Check the integrity of the object index before you trust offsets/constants.
         first=manifest['objects'][0];path=Path(directory)/first['key'];original=path.read_bytes()
         damaged=bytearray(original);damaged[0]^=1;path.write_bytes(damaged)
         try:ArchiveReader(manifest,LocalRangeStore(directory)).probe_many([0])
         except ValueError:pass
         else:raise AssertionError('corrupt index accepted')
         path.write_bytes(original)
-        # Frame corruption detection using a new reader/cache.
+        # Find frame corruption with a new reader/cache.
         target=next((j,p,record) for j in range(len(manifest['objects']))
                     for p,record in enumerate(reader.object_index(j)) if record[1])
         j,p,entry=target;offset,length=entry[:2];obj=manifest['objects'][j];path=Path(directory)/obj['key']

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start (or restart) the tablebase visualizer in the background.
-# Usage: tools/visualizer/run.sh [PORT] [HOST...]   (defaults: 8642, 127.0.0.1)
+# Usage: tools/visualizer/run.sh [PORT] [HOST...]
+# The default port is 8642. The default host is 127.0.0.1.
 # Tailnet (IPv4 and IPv6, so MagicDNS names work):
 #   tools/visualizer/run.sh 8000 $(tailscale ip -4) $(tailscale ip -6)
 set -euo pipefail

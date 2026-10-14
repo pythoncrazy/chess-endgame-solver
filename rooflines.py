@@ -1,4 +1,4 @@
-"""Explicit, reproducible capacity/roofline models; no empirical timings."""
+"""Explicit, reproducible capacity/roofline models. No empirical time measurements."""
 import json
 import math
 from pathlib import Path
@@ -15,7 +15,7 @@ def model():
     fp = []
     for reuse in [1, 4, 16, 64]:
         # FP16 adjacency 64x64, one FP16 query vector, FP32 temporary counts.
-        # This favorable model omits narrow-N padding and relation creation.
+        # This favorable model omits the padding for narrow N and relation creation.
         bytes_per_row = 128/reuse + 2 + 4
         fp.append(dict(relation_reuse=reuse, bytes_per_row=bytes_per_row,
                        hbm_rows_per_s=3.35e12/bytes_per_row,

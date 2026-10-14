@@ -1,7 +1,8 @@
 """Independent checks of the tables through the visualizer's Python decoder.
 
-This path shares no code with the Rust solver or the shakmaty-based verifier:
-numpy/zstandard read the .tbp/.tbz files, python-chess judges legality and probes Syzygy.
+This path shares no code with the Rust solver or the shakmaty-based verifier.
+The numpy and zstandard packages read the .tbp/.tbz files. The python-chess package
+judges legality and probes Syzygy.
 
 Usage: python -I tools/visualizer/test_store.py TABLE_DIR SYZYGY_DIR [SAMPLES]
 """
@@ -50,7 +51,7 @@ class KnownPositions(unittest.TestCase):
         self.assertEqual(self.probe("not a fen")["s"], "fen")
 
     def test_colour_swapped_material(self) -> None:
-        # Black rook vs bare king: KvKR, or KRvK with colours swapped.
+        # Black rook against bare king: KvKR, or KRvK with colours swapped.
         r = self.probe("8/8/3k4/8/8/8/8/r3K3 w - - 0 1")
         self.assertEqual((r["s"], r["w"]), ("ok", -2))
         self.assertIn(r["m"], ("KvKR", "KRvK"))
@@ -85,10 +86,10 @@ class KnownPositions(unittest.TestCase):
 
 
 class SampledAgreement(unittest.TestCase):
-    """Random positions from every table: legality vs python-chess, WDL vs Syzygy."""
+    """Random positions from every table: legality against python-chess, WDL against Syzygy."""
 
     def test_every_table(self) -> None:
-        rng = random.Random(20261014)  # noqa: S311 - reproducible sampling
+        rng = random.Random(20261014)  # noqa: S311 - reproducible samples
         s = store()
         for name, table in sorted(s.tables.items()):
             start = time.perf_counter()

@@ -16,7 +16,7 @@ def validate(chess_path,table_path,pawn_archives):
     from lookup_storage import BatchReader,ByteLRU
     from r2_blocks import LocalRangeStore
     rng=np.random.default_rng(6701);states=0
-    # Full standard board and selected Chess960 initial arrangements.
+    # Full standard board and selected Chess960 start arrangements.
     boards=[chess.Board()]
     for number in (0,17,518,959):
         b=chess.Board.from_chess960_pos(number);boards.append(b)
@@ -43,7 +43,7 @@ def validate(chess_path,table_path,pawn_archives):
     try:cache_identity(same_fen,'fide-value','optional50-auto75')
     except ValueError:pass
     else:raise AssertionError('unknown history accepted as complete')
-    # Fullmove ordinal should not create needless value-cache misses.
+    # The fullmove ordinal should not cause unnecessary misses in the value cache.
     different_ordinal=same_fen.copy();different_ordinal.fullmove_number+=100
     assert cache_identity(same_fen,'wdl','v1',history_aware=False)==cache_identity(different_ordinal,'wdl','v1',history_aware=False)
     assert cache_identity(same_fen,'wdl','v1',history_aware=False)!=cache_identity(same_fen,'dtz','v1',history_aware=False)
@@ -75,8 +75,8 @@ def validate(chess_path,table_path,pawn_archives):
         for key,table in list(actual.wdl.items()):
             if table.key in (encoded.key,encoded.mirrored_key):table.close();actual.wdl[key]=encoded
         adapters.append((encoded,reader))
-    # First compare scalar probes, then test correctly routed multi-archive
-    # deferred batches, including EP dependencies into a different material.
+    # First compare scalar probes. Then test correctly routed deferred batches
+    # across many archives, with EP dependencies into a different material.
     original_decompress={e:e.decompress_pairs for e,r in adapters}
     def direct(encoded,reader):
         def lookup(token,index):
@@ -123,7 +123,7 @@ def validate(chess_path,table_path,pawn_archives):
         no_ep=b.copy();no_ep.ep_square=None
         ep_changes+=oracle.probe_wdl(b)!=oracle.probe_wdl(no_ep)
     assert ep_changes>0, 'EP test must include value-changing cases'
-    # Verify deferred batch reconstruction of symmetric pawn indexing itself.
+    # Verify the deferred batch reconstruction of the symmetric pawn index itself.
     for encoded,reader in adapters:encoded.decompress_pairs=original_decompress[encoded]
     mapping=dict(adapters);encoded,reader=adapters[1];batch=samples
     got,waves=probe_batch(actual,encoded,reader,batch,material_readers=mapping)
@@ -135,7 +135,7 @@ def validate(chess_path,table_path,pawn_archives):
         values,_=probe_batch(actual,encoded,reader,copies,material_readers=mapping)
         assert values==expected_batch
     with ThreadPoolExecutor(max_workers=8) as pool:list(pool.map(threaded,range(16)))
-    # An omitted material reader cannot be replaced with a different archive.
+    # A different archive cannot replace an omitted material reader.
     for e,r in adapters:r.data=ByteLRU(0);e.symbols={}
     try:probe_batch(actual,encoded,reader,[ep_cases[0]],material_readers={encoded:reader})
     except ValueError:pass

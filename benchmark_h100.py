@@ -1,10 +1,11 @@
 """Run exact operator microbenchmarks on an available CUDA GPU.
 
-Requires numpy, torch, triton. Compares packed Boolean rows with FP16/FP32
-tensor-core reductions. Input legal relations are synthetic and resident.
-Reported rates exclude chess indexing, relation construction, graph scheduling,
-packing, disk I/O and distance computation. They are not generator throughput.
-FP queries=16 is only applicable if 16 useful state vectors share one relation.
+Necessary packages: numpy, torch, triton. Compares packed Boolean rows with
+FP16/FP32 tensor-core reductions. Input legal relations are synthetic and
+resident. The reported rates do not include: chess index, relation
+construction, graph schedule, bit pack, disk I/O and distance computation.
+They are not generator throughput. FP queries=16 applies only if 16 useful
+state vectors share one relation.
 """
 import argparse
 import json
@@ -52,7 +53,7 @@ def main():
     rng = np.random.default_rng(1292)
     groups = args.groups
     a = rng.random((groups, 64, 64)) < .18
-    # For some rows only a winning child is available; include degree-zero rows.
+    # In some rows, the only available child is a win. Include rows of degree zero too.
     a[:, 0] = False
     a[:, 1] = False; a[:, 1, 0] = True
     bits = np.packbits(a, axis=-1, bitorder='little').copy().view('<u8').reshape(groups, 64)
