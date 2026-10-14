@@ -32,6 +32,11 @@ repos:
         entry: uv run --frozen ruff format --check --force-exclude
         types: [python]
         files: ^tools/
+      - id: ste-check
+        name: ASD-STE100 prose check
+        language: system
+        entry: uv run --frozen tools/ste_check.py
+        types: [text]
       - id: cargo-fmt
         name: cargo fmt (core, verify, gpu)
         language: system
