@@ -54,6 +54,7 @@ fn packed_roundtrip_probe_and_identical_pieces() {
         wdl_codec: Codec::Zstd,
         rank_codec: Codec::Zstd,
         rank_sides: RankSides::Both,
+        ..Default::default()
     };
     let white = WriteOptions {
         level: 3,
@@ -63,6 +64,11 @@ fn packed_roundtrip_probe_and_identical_pieces() {
         wdl_codec: Codec::Cm,
         rank_codec: Codec::Cm,
         ..Default::default()
+    };
+    let cm_small = WriteOptions {
+        cm_wdl_words: 7,
+        cm_rank_words: 3,
+        ..cm
     };
     for (name, options) in [
         ("KQvK", both),
@@ -74,6 +80,7 @@ fn packed_roundtrip_probe_and_identical_pieces() {
         ("KvKR", cm),
         ("KNNvK", cm),
         ("KRvKB", cm),
+        ("KRvKB", cm_small),
     ] {
         let table = solved(name);
         let path = dir.join(format!("{name}.tbz"));
