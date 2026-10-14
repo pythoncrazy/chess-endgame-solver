@@ -1052,7 +1052,10 @@ fn derive_black<C: Children + ?Sized>(
                 r => r + 1,
             }
         } else if moved >> bk & 1 != 0 {
-            loss_max[bk] + 1
+            match loss_max[bk] {
+                UNRESOLVED => return Err("black-to-move loss with an unresolved child".into()),
+                r => r + 1,
+            }
         } else {
             0
         };
@@ -1173,6 +1176,9 @@ impl PackedTable {
         {
             return Err("v3 block size out of range".into());
         }
+        if header.rank_width > 2 {
+            return Err("v3 rank width out of range".into());
+        }
         let start = 16 + len;
         let size = file.metadata().map_err(err)?.len();
         if authenticate {
@@ -1182,16 +1188,43 @@ impl PackedTable {
                 return Err(format!("{}: payload digest mismatch", path.display()));
             }
         }
+        let rank_words = match header.rank_sides {
+            RankSides::Both => layout.words(),
+            RankSides::White => black_start(&layout),
+        };
         let index = |s: &Section| -> Result<SectionIndex> {
+            let (unit, words) = if s.name == "wdl" {
+                (16, layout.words())
+            } else {
+                (64 * header.rank_width, rank_words)
+            };
+            if unit == 0 {
+                return Err("v3 rank section disagrees with the rank width".into());
+            }
+            if s.raw_bytes != (words * unit) as u64 {
+                return Err("v3 section size disagrees with the material".into());
+            }
+            let within = |at: Option<u64>| at.filter(|&at| at <= size);
+            let at = within(start.checked_add(s.offset)).ok_or("v3 section out of range")?;
             let (model_len, offsets, frames) = if s.codec == Codec::Cm {
                 let model_len = s.model_bytes.ok_or("cm section lacks model_bytes")?;
                 let index_len = s.index_bytes.ok_or("cm section lacks index_bytes")?;
-                if index_len > 1 << 30 || s.blocks > 1 << 30 {
-                    return Err("cm index too large".into());
+                let block_words = s.block_words.ok_or("cm section lacks block_words")?;
+                if !(1..=CM_MAX_WORDS as u64).contains(&block_words)
+                    || s.blocks != (s.raw_bytes / unit as u64).div_ceil(block_words)
+                {
+                    return Err("cm block size out of range".into());
                 }
+                if s.name == "rank" && header.rank_sides != RankSides::White {
+                    return Err("a cm rank section needs white-only ranks".into());
+                }
+                let frames = within(
+                    at.checked_add(model_len)
+                        .and_then(|a| a.checked_add(index_len)),
+                )
+                .ok_or("cm section out of range")?;
                 let mut blob = vec![0u8; index_len as usize];
-                file.read_exact_at(&mut blob, start + s.offset + model_len)
-                    .map_err(err)?;
+                file.read_exact_at(&mut blob, at + model_len).map_err(err)?;
                 let lengths = zstd::bulk::decompress(&blob, 4 * s.blocks as usize)
                     .map_err(|e| e.to_string())?;
                 if lengths.len() != 4 * s.blocks as usize {
@@ -1201,39 +1234,32 @@ impl PackedTable {
                 for l in lengths.as_chunks::<4>().0 {
                     offsets.push(offsets[offsets.len() - 1] + u64::from(u32::from_le_bytes(*l)));
                 }
-                (model_len, offsets, start + s.offset + model_len + index_len)
+                (model_len, offsets, frames)
             } else {
+                if s.blocks != s.raw_bytes.div_ceil(header.block_bytes as u64) {
+                    return Err("v3 block count disagrees with the section size".into());
+                }
+                let frames = within(at.checked_add(8 * (s.blocks + 1)))
+                    .ok_or("v3 block index out of range")?;
                 let mut raw = vec![0u8; 8 * (s.blocks as usize + 1)];
-                file.read_exact_at(&mut raw, start + s.offset)
-                    .map_err(err)?;
+                file.read_exact_at(&mut raw, at).map_err(err)?;
                 let offsets: Vec<u64> = raw
                     .as_chunks::<8>()
                     .0
                     .iter()
                     .map(|b| u64::from_le_bytes(*b))
                     .collect();
-                (0, offsets, start + s.offset + raw.len() as u64)
+                (0, offsets, frames)
             };
-            if offsets.windows(2).any(|w| w[0] > w[1]) || frames + offsets[offsets.len() - 1] > size
+            if offsets.windows(2).any(|w| w[0] > w[1])
+                || within(frames.checked_add(offsets[offsets.len() - 1])).is_none()
             {
                 return Err("v3 block index out of range".into());
             }
-            let unit = if s.name == "wdl" {
-                16
-            } else {
-                64 * header.rank_width
-            };
             let cm = if s.codec == Codec::Cm {
-                let block_words = s.block_words.ok_or("cm section lacks block_words")? as usize;
-                if !(1..=CM_MAX_WORDS).contains(&block_words)
-                    || offsets.len() as u64 - 1
-                        != (s.raw_bytes / unit as u64).div_ceil(block_words as u64)
-                {
-                    return Err("cm block size out of range".into());
-                }
                 Some(CmIndex {
-                    block_words,
-                    model_at: start + s.offset,
+                    block_words: s.block_words.expect("checked above") as usize,
+                    model_at: at,
                     model_len: model_len as usize,
                     model: OnceLock::new(),
                 })
