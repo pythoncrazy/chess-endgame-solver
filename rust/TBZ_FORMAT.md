@@ -43,6 +43,8 @@ last block can be shorter. Codecs:
 - `zstd`: one zstd frame per block (level 19).
 - `lzma`: one LZMA1 "alone" (`.lzma`) stream per block, preset 9e with
   `lc=4`, dictionary = block size. Python: `lzma.FORMAT_ALONE`.
+- `cm`: a context model with a binary arithmetic coder. A `cm` section has a
+  different layout. [TBZ_CM.md](TBZ_CM.md) gives it.
 
 ## Stored domain and index
 
