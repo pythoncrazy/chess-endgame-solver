@@ -25,8 +25,9 @@ The `verify_pawnless` program makes these checks on each position:
 - The legality of the position agrees with shakmaty.
 - The win, draw or loss agrees with the Syzygy WDL value.
 - The proof rank is exact. The program calculates it again from the ranks of the next positions.
-- With `--dtz`, the proof rank agrees with the Syzygy DTZ value. This is a second check of
-  the ranks. It does not use the solver data of the next positions.
+- With `--dtz`, the proof rank is equal to the Syzygy DTZ value, or one more. A Syzygy DTZ
+  can be one ply short. This is a second check of the ranks. It does not use the solver
+  data of the next positions.
 
 Thus a table cannot pass with a wrong result or with a wrong rank.
 
