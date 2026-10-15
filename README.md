@@ -37,7 +37,7 @@ Thus a table cannot pass with a wrong result or with a wrong rank.
 | `rust/gpu/` | `gpu_solve`, the GPU solver. It uses cuTile Rust. |
 | `rust/verify/` | `verify_pawnless`, the independent check with shakmaty and Syzygy. |
 | `tools/visualizer/` | The web viewer. |
-| `tools/` | Python tools: Syzygy download, online comparison, table digests, the prose check and the commit-message check. `logrun.sh` records the output of long jobs. |
+| `tools/` | Python tools: Syzygy download, online comparison, table digests, the solver checks, the prose check and the commit-message check. `logrun.sh` records the output of long jobs. |
 | `docs/` | The `.tbz` format, the `cm` codec and the compression experiments. |
 
 ## Requirements
@@ -129,6 +129,19 @@ The hooks and the CI make these checks:
 - `ruff check` and `ruff format` for the Python tools.
 - `tools/ste_check.py` for the prose. All prose obeys ASD-STE100 Simplified Technical English.
 - `tools/strip_trailers.py` for the commit messages. They must not have co-author or tool lines.
+
+After a change to the GPU solver, do the solver checks. Each check solves a target
+and compares the digests of the tables with `tools/expected_digests.json`:
+
+```sh
+cargo build --release --manifest-path rust/gpu/Cargo.toml --bin gpu_solve
+uv run tools/check_solver.py KQvKR tmp/check-KQvKR
+uv run tools/check_solver.py KQBvKR tmp/check-KQBvKR
+uv run tools/check_solver.py all5 tmp/check-all5 28
+```
+
+Each output directory must be empty. The last argument is the number of pack threads.
+On an H100 NVL, the `all5` check takes approximately 50 s.
 
 Use short commit messages in the Conventional Commits form, for example
 `fix(packed): reject a bad header`. Make each change in a pull request. Merge with a rebase.
