@@ -11,8 +11,9 @@
 //!     largest rank of its children.
 //!   - a rank-0 loss is checkmate.
 //!   - a draw has no child that is a loss. It is a stalemate or has a child that is not a win.
-//! - with `--dtz`, each proof rank of a win or a loss that is not checkmate
-//!   equals the Syzygy DTZ. The Syzygy directories must hold the DTZ files.
+//! - with `--dtz`, the proof rank of a win or a loss (not checkmate) is the
+//!   Syzygy DTZ `n` or `n + 1`. A Syzygy DTZ can be one ply short.
+//!   The Syzygy directories must hold the DTZ files.
 use shakmaty::{
     Board, CastlingMode, Chess, Color, FromSetup, Piece, Position, PositionError, Role, Setup,
     Square,
@@ -102,6 +103,8 @@ struct Counts {
     legal: u64,
     syzygy_compared: u64,
     dtz_compared: u64,
+    dtz_plus_one: u64,
+    dtz_plus_one_precise: u64,
     proof_checked: u64,
 }
 
@@ -181,6 +184,8 @@ struct Tally {
     legal: AtomicU64,
     syzygy_compared: AtomicU64,
     dtz_compared: AtomicU64,
+    dtz_plus_one: AtomicU64,
+    dtz_plus_one_precise: AtomicU64,
     proof_checked: AtomicU64,
     failures: AtomicU64,
 }
@@ -255,7 +260,9 @@ fn check_position(
         return Err(format!("value {value} has no proof rank"));
     }
     if dtz && value != 0 && rank != 0 {
-        check_dtz(syzygy, &pos, rank)?;
+        let (plus_one, precise) = check_dtz(syzygy, &pos, rank)?;
+        tally.dtz_plus_one += u64::from(plus_one);
+        tally.dtz_plus_one_precise += u64::from(precise);
         tally.dtz_compared += 1;
     }
     let moves = pos.legal_moves();
@@ -314,18 +321,20 @@ fn check_position(
 /// Syzygy DTZ counts the plies to a capture or to mate, as the proof rank does.
 /// The 50-move rule can change the DTZ only after a capture into a cursed win
 /// or a blessed loss. Pawnless tables with four pieces or fewer have no such
-/// positions. A rounded DTZ `n` can also mean `n + 1`.
-fn check_dtz(syzygy: &Tablebase<Chess>, pos: &Chess, rank: u16) -> Result<(), String> {
-    let (dtz, rounded) = match syzygy.probe_dtz(pos).map_err(|e| format!("syzygy: {e}"))? {
-        MaybeRounded::Precise(Dtz(n)) => (n, false),
-        MaybeRounded::Rounded(Dtz(n)) => (n, true),
+/// positions. A DTZ `n` can also mean `n + 1` plies, also when shakmaty gives
+/// it as precise. For example, the DTZ of a win can include a forced capture
+/// by the loser in the move before it. Returns true if the rank is `n + 1`,
+/// and true if shakmaty also gives that DTZ as precise.
+fn check_dtz(syzygy: &Tablebase<Chess>, pos: &Chess, rank: u16) -> Result<(bool, bool), String> {
+    let (dtz, precise) = match syzygy.probe_dtz(pos).map_err(|e| format!("syzygy: {e}"))? {
+        MaybeRounded::Precise(Dtz(n)) => (n, true),
+        MaybeRounded::Rounded(Dtz(n)) => (n, false),
     };
     let (n, r) = (dtz.unsigned_abs(), u32::from(rank));
-    if r == n || (rounded && r == n + 1) {
-        Ok(())
+    if r == n || r == n + 1 {
+        Ok((r != n, r != n && precise))
     } else {
-        let kind = if rounded { "rounded" } else { "precise" };
-        Err(format!("syzygy DTZ {dtz} ({kind}) vs proof rank {rank}"))
+        Err(format!("syzygy DTZ {dtz} vs proof rank {rank}"))
     }
 }
 
@@ -526,6 +535,12 @@ fn verify_table(
                     tally
                         .dtz_compared
                         .fetch_add(counts.dtz_compared, Ordering::Relaxed);
+                    tally
+                        .dtz_plus_one
+                        .fetch_add(counts.dtz_plus_one, Ordering::Relaxed);
+                    tally
+                        .dtz_plus_one_precise
+                        .fetch_add(counts.dtz_plus_one_precise, Ordering::Relaxed);
                     let checked = counts.proof_checked;
                     tally.proof_checked.fetch_add(checked, Ordering::Relaxed);
                 }
@@ -542,6 +557,8 @@ fn verify_table(
         "legal_positions": tally.legal.load(Ordering::Relaxed),
         "syzygy_wdl_compared": tally.syzygy_compared.load(Ordering::Relaxed),
         "syzygy_dtz_compared": tally.dtz_compared.load(Ordering::Relaxed),
+        "syzygy_dtz_plus_one": tally.dtz_plus_one.load(Ordering::Relaxed),
+        "syzygy_dtz_plus_one_precise": tally.dtz_plus_one_precise.load(Ordering::Relaxed),
         "proof_obligations_checked": tally.proof_checked.load(Ordering::Relaxed),
         "scope": match scope {
             Scope::All => "all",
