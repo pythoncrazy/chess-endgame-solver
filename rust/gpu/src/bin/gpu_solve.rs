@@ -1814,23 +1814,49 @@ struct Job {
     record: serde_json::Value,
 }
 
-/// Background writer of the v3 file. It writes to a temporary name and renames
-/// the file when it is complete. The device already checked symmetry.
-fn write_jobs(
+/// A downloaded table on its way to the compressed file.
+struct Download {
+    stored: Canonical,
+    path: PathBuf,
+    record: serde_json::Value,
+}
+
+/// Background download of the stored tables on `stream`, while the writer packs the last table.
+fn download_jobs(
     jobs: std::sync::mpsc::Receiver<Job>,
     stream: &Arc<cutile::cuda_core::Stream>,
-    level: i32,
-    threads: usize,
-) -> tablebase_core::Result<Vec<serde_json::Value>> {
+    out: &std::sync::mpsc::SyncSender<Download>,
+) -> tablebase_core::Result<()> {
     stream
         .device()
         .bind_to_thread()
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
     for mut job in jobs {
         let t = Instant::now();
         let stored = job.stored.download(stream).map_err(|e| e.to_string())?;
         job.record["stored_download_seconds"] = t.elapsed().as_secs_f64().into();
+        let next = Download {
+            stored,
+            path: job.path,
+            record: job.record,
+        };
+        if out.send(next).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Background writer of the v3 file. It writes to a temporary name and renames
+/// the file when it is complete. The device already checked symmetry.
+fn write_jobs(
+    jobs: std::sync::mpsc::Receiver<Download>,
+    level: i32,
+    threads: usize,
+) -> tablebase_core::Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for mut job in jobs {
+        let stored = job.stored;
         let t = Instant::now();
         let partial = job.path.with_extension("tbz.partial");
         let file = File::create(&partial).map_err(|e| e.to_string())?;
@@ -1879,13 +1905,17 @@ fn solve_all(
     }
     let materials = all_materials(pieces)?;
     let (send, receive) = std::sync::mpsc::sync_channel::<Job>(2);
-    let download = gpu.stream.device().new_stream()?;
-    let writer = std::thread::spawn(move || write_jobs(receive, &download, level, threads));
+    let (send_downloaded, receive_downloaded) = std::sync::mpsc::sync_channel::<Download>(1);
+    let stream = gpu.stream.device().new_stream()?;
+    let downloader = std::thread::spawn(move || download_jobs(receive, &stream, &send_downloaded));
+    let writer = std::thread::spawn(move || write_jobs(receive_downloaded, level, threads));
     let mut resumed = Vec::new();
     let solved = solve_all_into(gpu, &materials, output, threads, &send, &mut resumed);
     drop(send);
     // Let the writer finish the tables it has before an error stops the process.
+    let downloaded = downloader.join().map_err(|_| "download thread panicked")?;
     let tables = writer.join().map_err(|_| "writer thread panicked")?;
+    downloaded?;
     solved?;
     Ok(json!({"materials": materials.len(), "resumed_verified_tables": resumed, "tables": tables?}))
 }
